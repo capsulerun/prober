@@ -1,0 +1,27 @@
+[workspace]
+resolver = "3"
+# Crates are added here as each phase lands.
+members = []
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/capsulerun/prober"
+
+[workspace.dependencies]
+prober-core = { path = "crates/core" }
+prober-vcs = { path = "crates/vcs" }
+prober-lang-typescript = { path = "crates/lang-typescript" }
+prober-lang-python = { path = "crates/lang-python" }
+prober-lang-rust = { path = "crates/lang-rust" }
+
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
