@@ -150,7 +150,7 @@ mod tests {
         let mut builder = GraphBuilder::default();
 
         for test_file in test_files {
-            builder.add_test_file(repo_path(test_file));
+            builder.add_test_file(repo_path(test_file), "typescript");
         }
 
         for &(dependent_path, kind, dependency_path) in edges {

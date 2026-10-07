@@ -1,6 +1,7 @@
 //! Repo-relative file paths and the interned ids the graph refers to them by.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use anyhow::{Result, bail};
 
@@ -25,6 +26,12 @@ impl RepoPath {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl fmt::Display for RepoPath {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 

@@ -18,9 +18,11 @@ prober-lang-rust = { path = "crates/lang-rust" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+globset = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
