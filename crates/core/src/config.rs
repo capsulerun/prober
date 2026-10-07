@@ -1,6 +1,6 @@
 //! The optional `prober.toml`: for now, the `always_all` files whose change runs every test.
 
-use anyhow::{Context, Result};
+use anyhow::{Result, anyhow};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use xxhash_rust::xxh3::xxh3_64;
@@ -29,11 +29,36 @@ pub struct Config {
 
 impl Config {
     pub fn parse(config_text: &str) -> Result<Self> {
-        let config_file: ConfigFile = toml::from_str(config_text).context("invalid prober.toml")?;
-        let always_all = AlwaysAll::new(config_file.always_all.files)?;
+        let config_file: ConfigFile = toml::from_str(config_text)
+            .map_err(|toml_error| anyhow!(describe_toml_error(config_text, &toml_error)))?;
+        let always_all = AlwaysAll::new(config_file.always_all.files)
+            .map_err(|pattern_error| anyhow!("invalid prober.toml: {pattern_error}"))?;
 
         Ok(Self { always_all })
     }
+}
+
+fn describe_toml_error(config_text: &str, toml_error: &toml::de::Error) -> String {
+    let Some(error_span) = toml_error.span() else {
+        return format!("invalid prober.toml: {}", toml_error.message());
+    };
+    let (line, column) = line_and_column(config_text, error_span.start);
+
+    format!(
+        "invalid prober.toml at line {line}, column {column}: {}",
+        toml_error.message()
+    )
+}
+
+fn line_and_column(text: &str, byte_offset: usize) -> (usize, usize) {
+    let text_before_offset = text.get(..byte_offset).unwrap_or(text);
+    let line = text_before_offset.matches('\n').count() + 1;
+    let line_start = text_before_offset
+        .rfind('\n')
+        .map_or(0, |newline_offset| newline_offset + 1);
+    let column = text_before_offset[line_start..].chars().count() + 1;
+
+    (line, column)
 }
 
 pub fn config_hash(config_text: &str) -> String {
@@ -54,14 +79,19 @@ impl AlwaysAll {
             let glob = GlobBuilder::new(pattern)
                 .literal_separator(true)
                 .build()
-                .with_context(|| format!("invalid always_all pattern {pattern:?}"))?;
+                .map_err(|glob_error| {
+                    anyhow!(
+                        "invalid always_all pattern {pattern:?}: {}",
+                        glob_error.kind()
+                    )
+                })?;
 
             matcher_builder.add(glob);
         }
 
         let matcher = matcher_builder
             .build()
-            .context("cannot compile always_all patterns")?;
+            .map_err(|glob_error| anyhow!("cannot compile always_all patterns: {glob_error}"))?;
 
         Ok(Self { patterns, matcher })
     }
@@ -202,25 +232,42 @@ mod tests {
     }
 
     #[test]
-    fn unknown_config_keys_are_rejected() {
-        let unsupported_configs = [
-            "presets = \"auto\"\n",
-            "[always_all]\ntests = [\"a.test.ts\"]\n",
+    fn every_config_error_is_one_line_with_its_position() {
+        let invalid_configs = [
+            (
+                "[always_all\nfiles = []\n",
+                "invalid prober.toml at line 1, column 12: unclosed table, expected `]`",
+            ),
+            (
+                "[always_all]\nfiles = \"ci/**\"\n",
+                "invalid prober.toml at line 2, column 9: invalid type: string \"ci/**\", expected a sequence",
+            ),
+            (
+                "presets = \"auto\"\n",
+                "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`",
+            ),
+            (
+                "[always_all]\ntests = [\"a.test.ts\"]\n",
+                "invalid prober.toml at line 2, column 1: unknown field `tests`, expected `files`",
+            ),
+            (
+                "[always_all]\nfiles = [\"ci/[unclosed\"]\n",
+                "invalid prober.toml: invalid always_all pattern \"ci/[unclosed\": unclosed character class; missing ']'",
+            ),
         ];
 
-        for unsupported_config in unsupported_configs {
-            assert!(
-                Config::parse(unsupported_config).is_err(),
-                "{unsupported_config:?} should be rejected"
-            );
+        for (invalid_config, expected_message) in invalid_configs {
+            let error = Config::parse(invalid_config).unwrap_err();
+
+            assert_eq!(error.to_string(), expected_message);
+            assert_eq!(format!("{error:#}"), expected_message);
         }
     }
 
     #[test]
-    fn invalid_glob_is_rejected() {
-        let error = Config::parse("[always_all]\nfiles = [\"ci/[unclosed\"]\n").unwrap_err();
-
-        assert!(error.to_string().contains("ci/[unclosed"));
+    fn column_counts_characters_not_bytes() {
+        assert_eq!(line_and_column("files = \"é\"", 11), (1, 11));
+        assert_eq!(line_and_column("a = 1\nbé = 2", 10), (2, 4));
     }
 
     #[test]

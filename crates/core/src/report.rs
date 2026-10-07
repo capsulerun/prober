@@ -46,6 +46,9 @@ pub enum ModeReason {
     NoImpact {
         changed_file_count: usize,
     },
+    Error {
+        message: String,
+    },
 }
 
 impl ModeReason {
@@ -53,6 +56,7 @@ impl ModeReason {
         match self {
             ModeReason::AlwaysAll { .. } => "always_all",
             ModeReason::NoImpact { .. } => "no_impact",
+            ModeReason::Error { .. } => "error",
         }
     }
 
@@ -70,6 +74,7 @@ impl ModeReason {
             ModeReason::NoImpact { changed_file_count } => {
                 format!("{changed_file_count} changed files reach no test file")
             }
+            ModeReason::Error { message } => message.clone(),
         }
     }
 }
@@ -308,7 +313,7 @@ impl<'a> JsonModeReason<'a> {
                 pattern,
                 ..
             } => (Some(matched_path.as_str()), Some(pattern.as_str())),
-            ModeReason::NoImpact { .. } => (None, None),
+            ModeReason::NoImpact { .. } | ModeReason::Error { .. } => (None, None),
         };
 
         Self {
@@ -692,6 +697,30 @@ mod tests {
         assert_eq!(
             none_report.summary_line(),
             "prober: none of 3 test files — 1 changed file reaches no test file"
+        );
+    }
+
+    #[test]
+    fn config_error_runs_all_tests_with_an_error_reason() {
+        let graph = polyglot_graph();
+        let config_error = Config::parse("presets = \"auto\"\n").unwrap_err();
+        let error_reason = ModeReason::Error {
+            message: config_error.to_string(),
+        };
+        let report = Report::all(&graph, vec![error_reason], CONFIG_HASH.to_owned());
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(json_report["mode"], "all");
+        assert_eq!(
+            json_report["mode_reasons"],
+            serde_json::json!([{
+                "kind": "error",
+                "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`",
+            }])
+        );
+        assert_eq!(
+            report.summary_line(),
+            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`"
         );
     }
 
