@@ -1,0 +1,20 @@
+[package]
+name = "prober"
+description = "Static test impact analysis for CI: given a diff, output the test files that need to run"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+prober-core.workspace = true
+prober-vcs.workspace = true
+prober-lang-typescript.workspace = true
+prober-lang-python.workspace = true
+prober-lang-rust.workspace = true
+
+[lints]
+workspace = true
