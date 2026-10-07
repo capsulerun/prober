@@ -1,0 +1,234 @@
+//! The optional `prober.toml`: for now, the `always_all` files whose change runs every test.
+
+use anyhow::{Context, Result};
+use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use serde::Deserialize;
+use xxhash_rust::xxh3::xxh3_64;
+
+use crate::changes::FileChange;
+use crate::files::RepoPath;
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfigFile {
+    #[serde(default)]
+    always_all: AlwaysAllSection,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AlwaysAllSection {
+    #[serde(default)]
+    files: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct Config {
+    pub always_all: AlwaysAll,
+}
+
+impl Config {
+    pub fn parse(config_text: &str) -> Result<Self> {
+        let config_file: ConfigFile = toml::from_str(config_text).context("invalid prober.toml")?;
+        let always_all = AlwaysAll::new(config_file.always_all.files)?;
+
+        Ok(Self { always_all })
+    }
+}
+
+pub fn config_hash(config_text: &str) -> String {
+    format!("{:016x}", xxh3_64(config_text.as_bytes()))
+}
+
+#[derive(Debug)]
+pub struct AlwaysAll {
+    patterns: Vec<String>,
+    matcher: GlobSet,
+}
+
+impl AlwaysAll {
+    pub fn new(patterns: Vec<String>) -> Result<Self> {
+        let mut matcher_builder = GlobSetBuilder::new();
+
+        for pattern in &patterns {
+            let glob = GlobBuilder::new(pattern)
+                .literal_separator(true)
+                .build()
+                .with_context(|| format!("invalid always_all pattern {pattern:?}"))?;
+
+            matcher_builder.add(glob);
+        }
+
+        let matcher = matcher_builder
+            .build()
+            .context("cannot compile always_all patterns")?;
+
+        Ok(Self { patterns, matcher })
+    }
+
+    pub fn matching_changes<'a>(&'a self, changes: &'a [FileChange]) -> Vec<AlwaysAllMatch<'a>> {
+        let mut always_all_matches: Vec<AlwaysAllMatch> = changes
+            .iter()
+            .filter_map(|change| self.first_match_of(change))
+            .collect();
+
+        always_all_matches.sort_by(|left, right| left.change.path.cmp(&right.change.path));
+
+        always_all_matches
+    }
+
+    fn first_match_of<'a>(&'a self, change: &'a FileChange) -> Option<AlwaysAllMatch<'a>> {
+        change.touched_paths().find_map(|touched_path| {
+            let first_matching_pattern = self
+                .matcher
+                .matches(touched_path.as_str())
+                .into_iter()
+                .min()?;
+
+            Some(AlwaysAllMatch {
+                change,
+                matched_path: touched_path,
+                pattern: &self.patterns[first_matching_pattern],
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AlwaysAllMatch<'a> {
+    pub change: &'a FileChange,
+    pub matched_path: &'a RepoPath,
+    pub pattern: &'a str,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::changes::ChangeKind;
+
+    fn repo_path(path: &str) -> RepoPath {
+        RepoPath::new(path).unwrap()
+    }
+
+    fn modified(path: &str) -> FileChange {
+        FileChange {
+            path: repo_path(path),
+            kind: ChangeKind::Modified,
+        }
+    }
+
+    fn always_all_config(patterns: &str) -> Config {
+        Config::parse(&format!("[always_all]\nfiles = {patterns}\n")).unwrap()
+    }
+
+    fn matched_paths<'a>(always_all_matches: &[AlwaysAllMatch<'a>]) -> Vec<&'a str> {
+        always_all_matches
+            .iter()
+            .map(|always_all_match| always_all_match.matched_path.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn missing_config_runs_nothing_globally() {
+        let config = Config::parse("").unwrap();
+
+        assert_eq!(
+            config
+                .always_all
+                .matching_changes(&[modified("ci/deploy.sh")]),
+            []
+        );
+    }
+
+    #[test]
+    fn change_matching_an_always_all_pattern_is_reported_with_the_pattern() {
+        let config = always_all_config(r#"["scripts/release/**", "ci/**"]"#);
+        let changes = [modified("src/a.ts"), modified("ci/nightly/deploy.sh")];
+        let always_all_matches = config.always_all.matching_changes(&changes);
+
+        assert_eq!(
+            always_all_matches,
+            [AlwaysAllMatch {
+                change: &changes[1],
+                matched_path: &changes[1].path,
+                pattern: "ci/**",
+            }]
+        );
+    }
+
+    #[test]
+    fn single_star_does_not_cross_directories() {
+        let config = always_all_config(r#"["scripts/*.sh"]"#);
+        let changes = [
+            modified("scripts/release/publish.sh"),
+            modified("scripts/publish.sh"),
+        ];
+
+        assert_eq!(
+            matched_paths(&config.always_all.matching_changes(&changes)),
+            ["scripts/publish.sh"]
+        );
+    }
+
+    #[test]
+    fn file_renamed_out_of_an_always_all_folder_matches_on_its_old_path() {
+        let config = always_all_config(r#"["ci/**"]"#);
+        let moved_out_of_ci = [FileChange {
+            path: repo_path("tools/deploy.sh"),
+            kind: ChangeKind::Renamed {
+                from: repo_path("ci/deploy.sh"),
+            },
+        }];
+
+        assert_eq!(
+            matched_paths(&config.always_all.matching_changes(&moved_out_of_ci)),
+            ["ci/deploy.sh"]
+        );
+    }
+
+    #[test]
+    fn every_matching_change_is_listed_by_path_whatever_the_change_order() {
+        let config = always_all_config(r#"["ci/**"]"#);
+        let changes = [
+            modified("ci/z.sh"),
+            modified("src/a.ts"),
+            modified("ci/a.sh"),
+        ];
+
+        assert_eq!(
+            matched_paths(&config.always_all.matching_changes(&changes)),
+            ["ci/a.sh", "ci/z.sh"]
+        );
+    }
+
+    #[test]
+    fn unknown_config_keys_are_rejected() {
+        let unsupported_configs = [
+            "presets = \"auto\"\n",
+            "[always_all]\ntests = [\"a.test.ts\"]\n",
+        ];
+
+        for unsupported_config in unsupported_configs {
+            assert!(
+                Config::parse(unsupported_config).is_err(),
+                "{unsupported_config:?} should be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_glob_is_rejected() {
+        let error = Config::parse("[always_all]\nfiles = [\"ci/[unclosed\"]\n").unwrap_err();
+
+        assert!(error.to_string().contains("ci/[unclosed"));
+    }
+
+    #[test]
+    fn config_hash_depends_only_on_the_config_text() {
+        let config_text = "[always_all]\nfiles = [\"ci/**\"]\n";
+
+        assert_eq!(config_hash(config_text), config_hash(config_text));
+        assert_ne!(config_hash(config_text), config_hash(""));
+        assert_eq!(config_hash(config_text).len(), 16);
+    }
+}

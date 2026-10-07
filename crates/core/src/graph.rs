@@ -1,6 +1,6 @@
 //! File-level dependency graph, stored as a reverse index from each file to the files that depend on it.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 
 use crate::files::{FileId, FileTable, RepoPath};
 
@@ -26,10 +26,16 @@ pub struct Edge {
     pub kind: EdgeKind,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TestFile {
+    pub file: FileId,
+    pub language: &'static str,
+}
+
 #[derive(Debug, Default)]
 pub struct GraphBuilder {
     files: FileTable,
-    test_files: HashSet<FileId>,
+    test_languages: HashMap<FileId, &'static str>,
     edges: Vec<Edge>,
 }
 
@@ -38,10 +44,10 @@ impl GraphBuilder {
         self.files.intern(path)
     }
 
-    pub fn add_test_file(&mut self, path: RepoPath) -> FileId {
+    pub fn add_test_file(&mut self, path: RepoPath, language: &'static str) -> FileId {
         let test_file = self.files.intern(path);
 
-        self.test_files.insert(test_file);
+        self.test_languages.insert(test_file, language);
 
         test_file
     }
@@ -69,7 +75,7 @@ impl GraphBuilder {
 
         Graph {
             files: self.files,
-            test_files: self.test_files,
+            test_languages: self.test_languages,
             dependents_by_file,
         }
     }
@@ -78,7 +84,7 @@ impl GraphBuilder {
 #[derive(Debug)]
 pub struct Graph {
     files: FileTable,
-    test_files: HashSet<FileId>,
+    test_languages: HashMap<FileId, &'static str>,
     dependents_by_file: Vec<Vec<Edge>>,
 }
 
@@ -92,7 +98,23 @@ impl Graph {
     }
 
     pub fn is_test(&self, file: FileId) -> bool {
-        self.test_files.contains(&file)
+        self.test_languages.contains_key(&file)
+    }
+
+    pub fn test_language(&self, file: FileId) -> Option<&'static str> {
+        self.test_languages.get(&file).copied()
+    }
+
+    pub fn test_files_by_path(&self) -> Vec<TestFile> {
+        let mut test_files: Vec<TestFile> = self
+            .test_languages
+            .iter()
+            .map(|(&file, &language)| TestFile { file, language })
+            .collect();
+
+        test_files.sort_by(|left, right| self.path(left.file).cmp(self.path(right.file)));
+
+        test_files
     }
 
     pub fn dependents(&self, file: FileId) -> &[Edge] {
@@ -167,11 +189,35 @@ mod tests {
     fn file_added_before_being_marked_as_test_keeps_one_id() {
         let mut builder = GraphBuilder::default();
         let imported_first = builder.add_file(repo_path("src/a.test.ts"));
-        let marked_as_test = builder.add_test_file(repo_path("src/a.test.ts"));
+        let marked_as_test = builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
         let graph = builder.build();
 
         assert_eq!(imported_first, marked_as_test);
         assert!(graph.is_test(imported_first));
+    }
+
+    #[test]
+    fn test_files_are_listed_by_path_with_their_language() {
+        let mut builder = GraphBuilder::default();
+
+        builder.add_test_file(repo_path("tests/test_api.py"), "python");
+        builder.add_file(repo_path("src/a.ts"));
+        builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
+
+        let graph = builder.build();
+        let test_files: Vec<(&str, &str)> = graph
+            .test_files_by_path()
+            .iter()
+            .map(|test_file| (graph.path(test_file.file).as_str(), test_file.language))
+            .collect();
+
+        assert_eq!(
+            test_files,
+            [
+                ("src/a.test.ts", "typescript"),
+                ("tests/test_api.py", "python")
+            ]
+        );
     }
 
     #[test]
