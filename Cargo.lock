@@ -1941,6 +1941,8 @@ dependencies = [
  "prober-lang-rust",
  "prober-lang-typescript",
  "prober-vcs",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]

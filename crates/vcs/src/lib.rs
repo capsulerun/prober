@@ -1,5 +1,3 @@
-//! Git access: the files changed between the merge base of two revisions and the head revision.
-
 use std::path::Path;
 
 use anyhow::{Context, Result, anyhow};
@@ -21,14 +19,50 @@ impl GitRepository {
         Ok(Self { repository })
     }
 
+    pub fn work_dir(&self) -> Result<&Path> {
+        self.repository
+            .workdir()
+            .ok_or_else(|| anyhow!("the repository has no working tree"))
+    }
+
+    pub fn is_checked_out(&self, revision: &str) -> Result<bool> {
+        let revision_commit = self.resolve_commit(revision)?;
+        let checked_out_commit = self.resolve_commit("HEAD")?;
+
+        Ok(revision_commit == checked_out_commit)
+    }
+
+    pub fn files_at(&self, revision: &str) -> Result<Vec<RepoPath>> {
+        let commit = self.resolve_commit(revision)?;
+        let tree = self.repository.find_commit(commit)?.tree()?;
+        let mut recorder = gix::traverse::tree::Recorder::default();
+
+        tree.traverse()
+            .breadthfirst(&mut recorder)
+            .with_context(|| format!("cannot list the files of {revision:?}"))?;
+
+        let mut files = recorder
+            .records
+            .into_iter()
+            .filter(|entry| entry.mode.is_blob_or_symlink())
+            .map(|entry| repo_path(entry.filepath.as_bstr()))
+            .collect::<Result<Vec<_>>>()?;
+
+        files.sort();
+
+        Ok(files)
+    }
+
     pub fn changes_between(&self, base: &str, head: &str) -> Result<Vec<FileChange>> {
         let base_commit = self.resolve_commit(base)?;
         let head_commit = self.resolve_commit(head)?;
         let merge_base = self
             .repository
             .merge_base(base_commit, head_commit)
-            .with_context(|| {
-                self.with_shallow_clone_hint(format!("no merge base between {base:?} and {head:?}"))
+            .map_err(|_| {
+                anyhow!(self.with_shallow_clone_hint(format!(
+                    "no merge base between {base:?} and {head:?}"
+                )))
             })?;
         let merge_base_tree = self.repository.find_commit(merge_base)?.tree()?;
         let head_tree = self.repository.find_commit(head_commit)?.tree()?;
@@ -52,8 +86,8 @@ impl GitRepository {
         let object = self
             .repository
             .rev_parse_single(revision)
-            .with_context(|| {
-                self.with_shallow_clone_hint(format!("unknown revision {revision:?}"))
+            .map_err(|_| {
+                anyhow!(self.with_shallow_clone_hint(format!("unknown revision {revision:?}")))
             })?
             .object()
             .with_context(|| format!("cannot read revision {revision:?}"))?;
