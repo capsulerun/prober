@@ -1,7 +1,6 @@
 [workspace]
 resolver = "3"
-# Crates are added here as each phase lands.
-members = []
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
