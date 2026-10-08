@@ -1,4 +1,4 @@
-//! What one module tells about dynamic loading: its functions, load and call sites, exports and import uses, as expressions independent of the syntax tree.
+//! What one module tells about dynamic loading and file access: its functions, load, call and file access sites, exports and import uses, as expressions independent of the syntax tree.
 
 pub(crate) type FunctionIndex = usize;
 
@@ -97,6 +97,13 @@ pub(crate) struct Effect {
     pub action: Action,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Access {
+    pub line: u32,
+    pub callee: Expr,
+    pub arguments: Vec<Expr>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UseKind {
     Call,
@@ -116,6 +123,7 @@ pub(crate) struct ImportUse {
 pub(crate) struct ModuleSummary {
     pub functions: Vec<FunctionSummary>,
     pub effects: Vec<Effect>,
+    pub accesses: Vec<Access>,
     pub exports: Vec<(String, Expr)>,
     pub star_exports: Vec<String>,
     pub import_uses: Vec<ImportUse>,

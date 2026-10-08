@@ -1,11 +1,14 @@
 mod conventions;
 mod dynamic;
+mod families;
+mod file_links;
 mod file_system;
 mod imports;
 mod linker;
 mod manifests;
 mod mocks;
 mod presets;
+mod repo_index;
 mod resolver;
 mod root_scope;
 mod test_links;

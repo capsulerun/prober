@@ -1,8 +1,8 @@
 //! Dynamic loading inference: which modules are analysed, what their loads reach, and which sites stay unresolved.
 
 pub(crate) mod evaluator;
-mod summarizer;
-mod summary;
+pub(crate) mod summarizer;
+pub(crate) mod summary;
 mod targets;
 pub(crate) mod value;
 
@@ -18,7 +18,7 @@ use rayon::prelude::*;
 
 use crate::conventions::{is_module_file, is_plugin_manifest, is_test_file};
 use crate::dynamic::evaluator::Evaluator;
-use crate::dynamic::summarizer::summarize_module;
+use crate::dynamic::summarizer::{SummaryScope, summarize_module};
 use crate::dynamic::targets::{GlobTarget, Target, match_globs, targets_of};
 use crate::resolver::{ModuleResolver, Resolution, missing_path_candidates};
 
@@ -95,10 +95,32 @@ pub(crate) struct DynamicLoading<'d> {
     pub settings: InferenceSettings,
 }
 
-impl DynamicLoading<'_> {
-    pub fn infer(&self, seeds: Vec<RepoPath>) -> Result<DynamicInference> {
+pub(crate) struct Analysis<'d> {
+    loading: &'d DynamicLoading<'d>,
+    evaluator: Evaluator<'d>,
+    analysed: Vec<RepoPath>,
+}
+
+impl<'d> DynamicLoading<'d> {
+    pub fn analyse(&'d self, seeds: Vec<RepoPath>) -> Analysis<'d> {
         let evaluator = Evaluator::new(self.repo_root, self.resolver, self.importers);
-        let analysed = self.analyse(&evaluator, seeds);
+        let analysed = self.analysed_modules(&evaluator, seeds);
+
+        Analysis {
+            loading: self,
+            evaluator,
+            analysed,
+        }
+    }
+}
+
+impl Analysis<'_> {
+    pub fn infer(self) -> Result<DynamicInference> {
+        let Analysis {
+            loading,
+            evaluator,
+            analysed,
+        } = self;
         let mut inference = DynamicInference::default();
         let mut pending_globs = Vec::new();
 
@@ -114,7 +136,7 @@ impl DynamicLoading<'_> {
                     expression: effect.expression.clone(),
                 };
 
-                if !self.settings.dynamic_imports {
+                if !loading.settings.dynamic_imports {
                     if evaluator.is_load(module, effect) {
                         inference.add_unresolved(&site, UnresolvedCause::InferenceDisabled);
                     }
@@ -131,12 +153,12 @@ impl DynamicLoading<'_> {
                         match target {
                             Target::Outside => {}
                             Target::RepoPath(path) => {
-                                self.link_repo_path(&site, &path, &mut inference)
+                                loading.link_repo_path(&site, &path, &mut inference)
                             }
                             Target::Bare {
                                 importer,
                                 specifier,
-                            } => self.link_bare_specifier(
+                            } => loading.link_bare_specifier(
                                 &site,
                                 importer,
                                 &specifier,
@@ -152,14 +174,16 @@ impl DynamicLoading<'_> {
             }
         }
 
-        self.link_globs(pending_globs, &mut inference)?;
+        loading.link_globs(pending_globs, &mut inference)?;
         inference.unresolved_sites.sort();
         inference.unresolved_sites.dedup();
 
         Ok(inference)
     }
+}
 
-    fn analyse(&self, evaluator: &Evaluator, mut seeds: Vec<RepoPath>) -> Vec<RepoPath> {
+impl DynamicLoading<'_> {
+    fn analysed_modules(&self, evaluator: &Evaluator, mut seeds: Vec<RepoPath>) -> Vec<RepoPath> {
         let mut analysed = BTreeSet::new();
 
         seeds.sort();
@@ -172,7 +196,11 @@ impl DynamicLoading<'_> {
                 .par_iter()
                 .filter_map(|module| {
                     let source_bytes = fs::read(self.repo_root.join(module.as_str())).ok()?;
-                    let summary = summarize_module(module, &String::from_utf8_lossy(&source_bytes));
+                    let summary = summarize_module(
+                        module,
+                        &String::from_utf8_lossy(&source_bytes),
+                        SummaryScope::Loads,
+                    );
 
                     Some((module.clone(), summary))
                 })

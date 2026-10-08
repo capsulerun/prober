@@ -5,7 +5,7 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use crate::files::{FileId, RepoPath};
-use crate::graph::{Graph, UnresolvedCause};
+use crate::graph::{ContentChange, Graph, UnresolvedCause};
 use crate::ratios::format_percentage;
 
 const SCHEMA_VERSION: u32 = 1;
@@ -387,7 +387,10 @@ fn tests_depending_on(graph: &Graph, files: impl IntoIterator<Item = FileId>) ->
 
     while let Some(file) = files_to_visit.pop_front() {
         for edge in graph.dependents(file) {
-            if edge.kind.selects_tests() && reached.insert(edge.dependent) {
+            let carries_the_change =
+                edge.kind.selects_tests() && edge.kind.follows(ContentChange::None);
+
+            if carries_the_change && reached.insert(edge.dependent) {
                 files_to_visit.push_back(edge.dependent);
             }
         }
@@ -400,17 +403,34 @@ fn tests_depending_on(graph: &Graph, files: impl IntoIterator<Item = FileId>) ->
 }
 
 fn unreachable_files(graph: &Graph, repo_files: &[RepoPath]) -> (Vec<RepoPath>, Vec<RepoPath>) {
-    let mut reached: HashSet<FileId> = HashSet::new();
+    let mut needed_content: HashMap<FileId, ContentChange> = HashMap::new();
     let mut files_to_visit = VecDeque::new();
 
     for test_file in graph.test_files_by_path() {
-        reached.insert(test_file.file);
+        needed_content.insert(test_file.file, ContentChange::None);
         files_to_visit.push_back(test_file.file);
     }
 
     while let Some(file) = files_to_visit.pop_front() {
+        let dependent_needs = needed_content[&file];
+
         for edge in graph.dependencies(file) {
-            if edge.kind.selects_tests() && reached.insert(edge.dependency) {
+            if !edge.kind.selects_tests() || edge.kind.dependent_content() < dependent_needs {
+                continue;
+            }
+
+            let Some(dependency_needs) = ContentChange::ALL
+                .into_iter()
+                .find(|&content| edge.kind.follows(content))
+            else {
+                continue;
+            };
+            let is_easier = needed_content
+                .get(&edge.dependency)
+                .is_none_or(|&needs| dependency_needs < needs);
+
+            if is_easier {
+                needed_content.insert(edge.dependency, dependency_needs);
                 files_to_visit.push_back(edge.dependency);
             }
         }
@@ -426,7 +446,7 @@ fn unreachable_files(graph: &Graph, repo_files: &[RepoPath]) -> (Vec<RepoPath>, 
     for path in sorted_files {
         let is_reached = graph
             .file_id(path)
-            .is_some_and(|file| reached.contains(&file));
+            .is_some_and(|file| needed_content.contains_key(&file));
 
         match (is_reached, graph.is_module(path)) {
             (true, _) => {}
@@ -665,6 +685,52 @@ Unreachable files: 3 (1 modules, 2 other files)
       1  src
 "
         );
+    }
+
+    #[test]
+    fn files_imported_behind_a_read_or_a_listing_reach_no_test() {
+        let mut builder = GraphBuilder::default();
+        let edges = [
+            ("src/prompts.test.ts", EdgeKind::Reads, "src/sample.ts"),
+            ("src/sample.ts", EdgeKind::Import, "src/helper.ts"),
+            ("src/prompts.test.ts", EdgeKind::Reads, "data/list.json"),
+            ("data/list.json", EdgeKind::Lists, "src/entry.ts"),
+            ("src/entry.ts", EdgeKind::Import, "src/transport.ts"),
+        ];
+
+        builder.add_test_file(repo_path("src/prompts.test.ts"), "typescript");
+        builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+
+        for (dependent_path, kind, dependency_path) in edges {
+            let dependent = builder.add_file(repo_path(dependent_path));
+            let dependency = builder.add_file(repo_path(dependency_path));
+
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        let graph = builder.build();
+        let repo_files: Vec<RepoPath> = [
+            "src/prompts.test.ts",
+            "src/sample.ts",
+            "src/helper.ts",
+            "data/list.json",
+            "src/entry.ts",
+            "src/transport.ts",
+        ]
+        .into_iter()
+        .map(repo_path)
+        .collect();
+        let scan_report = ScanReport::new(&graph, &repo_files, String::new());
+
+        assert_eq!(
+            scan_report.unreachable_modules,
+            [repo_path("src/helper.ts"), repo_path("src/transport.ts")]
+        );
+        assert_eq!(scan_report.unreachable_other_files, []);
     }
 
     #[test]

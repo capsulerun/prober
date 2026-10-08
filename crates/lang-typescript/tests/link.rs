@@ -255,7 +255,10 @@ fn test_files_are_registered_with_their_language() {
     assert_eq!(test_files, [("src/a.test.ts", "typescript")]);
     assert_eq!(
         dependents(&graph, "src/a.ts"),
-        [("src/a.test.ts", EdgeKind::Import)]
+        [
+            ("src/a.test.ts", EdgeKind::Import),
+            ("src/a.test.ts", EdgeKind::Family)
+        ]
     );
 }
 

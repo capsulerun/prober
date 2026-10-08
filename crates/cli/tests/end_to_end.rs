@@ -627,6 +627,51 @@ fn closed_mock_keeps_its_test_out_of_body_changes_until_the_exports_change() {
 }
 
 #[test]
+fn fixture_read_by_a_test_selects_it_when_changed_or_deleted_unless_switched_off() {
+    let repository = TestRepository::with_files_on_main(&[
+        (
+            "src/parser.test.ts",
+            r#"import { readFileSync } from "node:fs";
+const input = readFileSync(new URL("./fixtures/input.json", import.meta.url), "utf8");"#,
+        ),
+        ("src/fixtures/input.json", r#"{ "items": [] }"#),
+    ]);
+
+    repository.change_and_commit("src/fixtures/input.json", r#"{ "items": [1] }"#);
+
+    let changed = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    repository.git(&["rm", "--quiet", "src/fixtures/input.json"]);
+    repository.commit_all("delete the fixture");
+
+    let deleted = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    repository.write("prober.toml", "[inference]\nfiles = false\n");
+
+    let switched_off = repository.prober(&["--base", "main"]);
+
+    assert_eq!(
+        changed["reasons"]["src/parser.test.ts"],
+        json!([
+            "src/fixtures/input.json (modified)",
+            "-> read by src/parser.test.ts:2 (inferred file path ./fixtures/input.json)",
+        ])
+    );
+    assert_eq!(
+        deleted["reasons"]["src/parser.test.ts"],
+        json!([
+            "src/fixtures/input.json (deleted)",
+            "-> read by src/parser.test.ts:2 (inferred file path ./fixtures/input.json)",
+        ])
+    );
+    assert_eq!(switched_off.stdout, "");
+}
+
+#[test]
 fn manifests_switched_off_keep_package_json_global() {
     let repository = TestRepository::with_project_on_main();
 

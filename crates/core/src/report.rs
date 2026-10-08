@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::changes::{FileChange, ResolvedRevisions};
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
-use crate::graph::{EdgeKind, Graph, TestFile};
+use crate::graph::{Edge, EdgeKind, Graph, TestFile};
 use crate::ratios::{format_percentage, rounded_ratio};
 use crate::select::{Hop, Link, Reason, SelectedTest};
 
@@ -527,20 +527,33 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             ..
         } => format!("-> imported as an asset by {dependent}"),
         Link::Edge {
-            kind: EdgeKind::Reads,
+            kind: EdgeKind::Family,
             ..
-        } => format!("-> read by {dependent}"),
+        } => format!("-> paired by name with {dependent}"),
         Link::Edge {
-            kind: EdgeKind::Dynamic,
+            kind: kind @ (EdgeKind::Reads | EdgeKind::Lists | EdgeKind::Dynamic),
             dependency,
-        } => match graph.inference(hop.dependent, dependency) {
-            Some(inference) => format!(
-                "-> loaded by {dependent}:{} ({})",
-                inference.line,
-                inference.description()
-            ),
-            None => format!("-> loaded by {dependent}"),
-        },
+        } => {
+            let verb = match kind {
+                EdgeKind::Reads => "read",
+                EdgeKind::Lists => "listed",
+                _ => "loaded",
+            };
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind,
+            };
+
+            match graph.inference(&edge) {
+                Some(inference) => format!(
+                    "-> {verb} by {dependent}:{} ({})",
+                    inference.line,
+                    inference.description()
+                ),
+                None => format!("-> {verb} by {dependent}"),
+            }
+        }
         Link::ChangedPart(part_index) => {
             format!("-> {}", graph.changed_parts()[part_index].description)
         }
@@ -759,6 +772,72 @@ mod tests {
             ])
         );
         assert_eq!(json_report["distances"]["src/loader.test.ts"], 2);
+    }
+
+    #[test]
+    fn read_listed_and_named_hops_say_how_the_file_is_used() {
+        let mut builder = GraphBuilder::default();
+        let discovery_test =
+            builder.add_test_file(repo_path("src/discovery.test.ts"), "typescript");
+        let index_e2e_test =
+            builder.add_test_file(repo_path("extensions/a/index.e2e.test.ts"), "typescript");
+        let discovery = builder.add_file(repo_path("src/discovery.ts"));
+        let manifest = builder.add_file(repo_path("extensions/a/plugin.json"));
+        let index = builder.add_file(repo_path("extensions/a/index.ts"));
+        let inference = |line: u32, kind: &'static str, pattern: &str| Inference {
+            line,
+            kind,
+            pattern: pattern.to_owned(),
+            detail: None,
+        };
+
+        builder.add_edge(Edge {
+            dependent: discovery_test,
+            dependency: discovery,
+            kind: EdgeKind::Import,
+        });
+        builder.add_edge(Edge {
+            dependent: index_e2e_test,
+            dependency: index,
+            kind: EdgeKind::Family,
+        });
+        builder.add_inferred_edge(
+            Edge {
+                dependent: discovery,
+                dependency: manifest,
+                kind: EdgeKind::Reads,
+            },
+            inference(9, "file read", "extensions/*/plugin.json"),
+        );
+        builder.add_inferred_edge(
+            Edge {
+                dependent: manifest,
+                dependency: index,
+                kind: EdgeKind::Lists,
+            },
+            inference(1, "listed path", "./index.ts"),
+        );
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("extensions/a/index.ts")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["src/discovery.test.ts"],
+            serde_json::json!([
+                "extensions/a/index.ts (modified)",
+                "-> listed by extensions/a/plugin.json:1 (inferred listed path ./index.ts)",
+                "-> read by src/discovery.ts:9 (inferred file read extensions/*/plugin.json)",
+                "-> imported by src/discovery.test.ts",
+            ])
+        );
+        assert_eq!(
+            json_report["reasons"]["extensions/a/index.e2e.test.ts"],
+            serde_json::json!([
+                "extensions/a/index.ts (modified)",
+                "-> paired by name with extensions/a/index.e2e.test.ts",
+            ])
+        );
     }
 
     #[test]

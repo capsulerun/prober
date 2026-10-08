@@ -17,6 +17,7 @@ use crate::mocks::export_signature;
 use crate::presets::RunnerGroup;
 use crate::presets::config_diff::{ConfigDiff, config_diff};
 use crate::presets::patterns::{TestPattern, join_directory, relative_globs};
+use crate::repo_index::RepoIndex;
 use crate::workspaces::parent_directory;
 
 pub(crate) struct RootScopeEffects<'e> {
@@ -224,18 +225,16 @@ impl RootScopeEffects<'_> {
                 continue;
             };
 
-            if let Ok(named_path) = RepoPath::new(&joined)
-                && repo_index.files.contains(&named_path)
-            {
-                if !self.tests.contains(&named_path) {
+            if let Some(named_path) = repo_index.file(&joined) {
+                if !self.tests.contains(named_path) {
                     return None;
                 }
 
-                named.insert(named_path);
+                named.insert(named_path.clone());
                 is_path_like = true;
             }
 
-            if repo_index.directories.contains(joined.as_str()) {
+            if !joined.is_empty() && repo_index.is_directory(&joined) {
                 let directory_prefix = format!("{joined}/");
 
                 named.extend(
@@ -312,29 +311,6 @@ impl RootScopeEffects<'_> {
             Ok(text) => Ok(Some(text)),
             Err(error) if error.kind() == std::io::ErrorKind::InvalidData => Ok(None),
             Err(error) => Err(error).with_context(|| format!("cannot read {path}")),
-        }
-    }
-}
-
-struct RepoIndex<'r> {
-    files: HashSet<&'r RepoPath>,
-    directories: HashSet<&'r str>,
-}
-
-impl<'r> RepoIndex<'r> {
-    fn new(repo_files: &'r [RepoPath]) -> Self {
-        let directories = repo_files
-            .iter()
-            .flat_map(|path| {
-                path.as_str()
-                    .match_indices('/')
-                    .map(|(offset, _)| &path.as_str()[..offset])
-            })
-            .collect();
-
-        Self {
-            files: repo_files.iter().collect(),
-            directories,
         }
     }
 }
