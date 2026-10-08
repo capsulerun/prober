@@ -65,6 +65,46 @@ impl ReplayRecord {
             .get("selected_ratio")?
             .as_f64()
     }
+
+    pub fn tests_added_by_widening(&self) -> u64 {
+        self.stat("tests_added_by_widening").unwrap_or_default()
+    }
+
+    pub fn tests_selected(&self) -> u64 {
+        self.stat("tests_selected").unwrap_or_default()
+    }
+
+    pub fn selected_ratio_without_widening(&self) -> Option<f64> {
+        let selected_ratio = self.selected_ratio()?;
+        let tests_total = self.stat("tests_total").unwrap_or_default();
+
+        if tests_total == 0 {
+            return Some(selected_ratio);
+        }
+
+        let widened_ratio = self.tests_added_by_widening() as f64 / tests_total as f64;
+
+        Some((selected_ratio - widened_ratio).max(0.0))
+    }
+
+    pub fn widened_sites(&self) -> Vec<WidenedSiteRecord> {
+        self.selection
+            .as_ref()
+            .and_then(|selection| selection.get("widened"))
+            .and_then(|widened| serde_json::from_value(widened.clone()).ok())
+            .unwrap_or_default()
+    }
+
+    fn stat(&self, name: &str) -> Option<u64> {
+        self.selection.as_ref()?.get("stats")?.get(name)?.as_u64()
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct WidenedSiteRecord {
+    pub site: String,
+    pub cause: String,
+    pub added: u64,
 }
 
 #[derive(Deserialize)]

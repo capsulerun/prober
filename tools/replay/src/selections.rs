@@ -1,14 +1,17 @@
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Instant;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::changes::{Change, last_commits, read_changes};
 use crate::record::{RecordWriter, ReplayRecord, recorded_ids};
 use crate::worktree::Worktree;
+
+const PROBER_CONFIG_FILE_NAME: &str = "prober.toml";
 
 #[derive(Debug, Args)]
 pub struct SelectionsArguments {
@@ -59,6 +62,18 @@ pub struct SelectionsArguments {
         help = "Fetch heads missing from the repository from its origin remote"
     )]
     fetch: bool,
+
+    #[arg(
+        long,
+        help = "prober.toml placed in the worktree for every change, e.g. to switch an inference off"
+    )]
+    prober_config: Option<PathBuf>,
+}
+
+struct ReplaySettings<'a> {
+    prober: &'a Path,
+    prober_config: Option<String>,
+    fetch_missing_heads: bool,
 }
 
 pub fn run(arguments: &SelectionsArguments) -> Result<String> {
@@ -84,12 +99,25 @@ pub fn run(arguments: &SelectionsArguments) -> Result<String> {
         .worktree
         .clone()
         .unwrap_or_else(|| default_worktree_path(&arguments.repo));
+    let prober_config = arguments
+        .prober_config
+        .as_ref()
+        .map(|config_path| {
+            fs::read_to_string(config_path)
+                .with_context(|| format!("cannot read {}", config_path.display()))
+        })
+        .transpose()?;
+    let replay_settings = ReplaySettings {
+        prober: &arguments.prober,
+        prober_config,
+        fetch_missing_heads: arguments.fetch,
+    };
     let worktree = Worktree::open(&arguments.repo, &worktree_path, arguments.setup.as_deref())?;
     let mut record_writer = RecordWriter::append_to(&arguments.output)?;
     let mut records = Vec::new();
 
     for change in pending_changes {
-        let record = replay_change(&worktree, &arguments.prober, change, arguments.fetch);
+        let record = replay_change(&worktree, &replay_settings, change);
 
         record_writer.write(&record)?;
         records.push(record);
@@ -98,13 +126,8 @@ pub fn run(arguments: &SelectionsArguments) -> Result<String> {
     Ok(summary_line(&records, already_recorded_count))
 }
 
-fn replay_change(
-    worktree: &Worktree,
-    prober: &Path,
-    change: &Change,
-    fetch_missing_heads: bool,
-) -> ReplayRecord {
-    if fetch_missing_heads
+fn replay_change(worktree: &Worktree, settings: &ReplaySettings, change: &Change) -> ReplayRecord {
+    if settings.fetch_missing_heads
         && !worktree.has_commit(&change.head)
         && let Err(error) = worktree.fetch(&change.head)
     {
@@ -115,18 +138,40 @@ fn replay_change(
         return ReplayRecord::failed(change, format!("{error:#}"));
     }
 
+    let config_path = worktree.path().join(PROBER_CONFIG_FILE_NAME);
+
+    if let Some(prober_config) = &settings.prober_config {
+        if config_path.exists() {
+            return ReplayRecord::failed(
+                change,
+                "the repository has its own prober.toml, which --prober-config would replace"
+                    .to_owned(),
+            );
+        }
+
+        if let Err(error) = fs::write(&config_path, prober_config) {
+            return ReplayRecord::failed(change, format!("cannot write prober.toml: {error}"));
+        }
+    }
+
     let started = Instant::now();
-    let prober_output = Command::new(prober)
+    let prober_output = Command::new(settings.prober)
         .args(["--base", &change.base, "--format", "json"])
         .current_dir(worktree.path())
         .env_remove("GITHUB_STEP_SUMMARY")
         .output();
+    let elapsed = started.elapsed();
+
+    if settings.prober_config.is_some() {
+        let _ = fs::remove_file(&config_path);
+    }
 
     match prober_output {
-        Ok(prober_output) => ReplayRecord::completed(change, started.elapsed(), &prober_output),
-        Err(error) => {
-            ReplayRecord::failed(change, format!("cannot run {}: {error}", prober.display()))
-        }
+        Ok(prober_output) => ReplayRecord::completed(change, elapsed, &prober_output),
+        Err(error) => ReplayRecord::failed(
+            change,
+            format!("cannot run {}: {error}", settings.prober.display()),
+        ),
     }
 }
 

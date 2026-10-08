@@ -8,6 +8,7 @@ use crate::changes::ResolvedRevisions;
 use crate::files::RepoPath;
 use crate::outcomes::{TestFileOutcome, TestOutcomes, TestStatus};
 use crate::ratios::{format_percentage, rounded_ratio};
+use crate::report::WIDENED_HOP_PREFIX;
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -53,6 +54,7 @@ pub struct RecordedSelection {
     pub mode: SelectionMode,
     pub mode_reasons: Vec<ModeReasonRecord>,
     pub test_files: BTreeSet<RepoPath>,
+    pub widened_test_files: BTreeSet<RepoPath>,
     pub distances: BTreeMap<RepoPath, usize>,
 }
 
@@ -70,6 +72,9 @@ struct SelectionJson {
 
     #[serde(default)]
     targets: BTreeMap<String, Vec<String>>,
+
+    #[serde(default)]
+    reasons: BTreeMap<String, Vec<String>>,
 
     #[serde(default)]
     distances: BTreeMap<String, usize>,
@@ -93,6 +98,16 @@ impl RecordedSelection {
             .flatten()
             .map(RepoPath::new)
             .collect::<Result<BTreeSet<_>>>()?;
+        let widened_test_files = selection
+            .reasons
+            .into_iter()
+            .filter(|(_, reason)| {
+                reason
+                    .get(1)
+                    .is_some_and(|first_hop| first_hop.starts_with(WIDENED_HOP_PREFIX))
+            })
+            .map(|(path, _)| RepoPath::new(path))
+            .collect::<Result<BTreeSet<_>>>()?;
         let distances = selection
             .distances
             .into_iter()
@@ -104,6 +119,7 @@ impl RecordedSelection {
             mode: SelectionMode::parse(&selection.mode)?,
             mode_reasons: selection.mode_reasons.unwrap_or_default(),
             test_files,
+            widened_test_files,
             distances,
         })
     }
@@ -113,6 +129,7 @@ impl RecordedSelection {
 pub struct FailedTestFile {
     pub file: RepoPath,
     pub selected: bool,
+    pub widened: bool,
     pub distance: Option<usize>,
 }
 
@@ -125,8 +142,10 @@ pub struct ShadowResult {
     pub selected_test_files: usize,
     pub selected_but_not_reported: usize,
     pub skipped_test_files: usize,
+    pub widened_test_files: usize,
     pub reported_duration: Duration,
     pub skipped_duration: Duration,
+    pub widened_duration: Duration,
     pub failed_test_files: Vec<FailedTestFile>,
     pub flaky_test_files: Vec<RepoPath>,
     pub unattributed_failures: Vec<String>,
@@ -135,6 +154,7 @@ pub struct ShadowResult {
 impl ShadowResult {
     pub fn compare(selection: &RecordedSelection, outcomes: &TestOutcomes) -> Self {
         let is_selected = |file: &RepoPath| selection.test_files.contains(file);
+        let is_widened = |file: &RepoPath| selection.widened_test_files.contains(file);
         let reported_outcomes: Vec<&TestFileOutcome> = outcomes.files().collect();
         let skipped_outcomes: Vec<&TestFileOutcome> = reported_outcomes
             .iter()
@@ -147,8 +167,14 @@ impl ShadowResult {
             .map(|outcome| FailedTestFile {
                 file: outcome.file.clone(),
                 selected: is_selected(&outcome.file),
+                widened: is_widened(&outcome.file),
                 distance: selection.distances.get(&outcome.file).copied(),
             })
+            .collect();
+        let widened_outcomes: Vec<&TestFileOutcome> = reported_outcomes
+            .iter()
+            .copied()
+            .filter(|outcome| is_widened(&outcome.file))
             .collect();
         let flaky_test_files = reported_outcomes
             .iter()
@@ -174,11 +200,16 @@ impl ShadowResult {
                 .filter(|file| outcomes.outcome(file).is_none())
                 .count(),
             skipped_test_files: skipped_outcomes.len(),
+            widened_test_files: widened_outcomes.len(),
             reported_duration: reported_outcomes
                 .iter()
                 .map(|outcome| outcome.duration)
                 .sum(),
             skipped_duration: skipped_outcomes
+                .iter()
+                .map(|outcome| outcome.duration)
+                .sum(),
+            widened_duration: widened_outcomes
                 .iter()
                 .map(|outcome| outcome.duration)
                 .sum(),
@@ -192,6 +223,12 @@ impl ShadowResult {
         self.failed_test_files
             .iter()
             .filter(|failed_test_file| !failed_test_file.selected)
+    }
+
+    pub fn caught_by_widening(&self) -> impl Iterator<Item = &FailedTestFile> {
+        self.failed_test_files
+            .iter()
+            .filter(|failed_test_file| failed_test_file.selected && failed_test_file.widened)
     }
 
     pub fn to_json(&self) -> String {
@@ -217,6 +254,14 @@ impl ShadowResult {
                     self.reported_duration.as_secs_f64(),
                 ),
             },
+            widening: WideningJson {
+                test_files: self.widened_test_files,
+                seconds: rounded_seconds(self.widened_duration),
+                caught_failures: self
+                    .caught_by_widening()
+                    .map(|caught| caught.file.as_str())
+                    .collect(),
+            },
             misses: self.misses().map(|miss| miss.file.as_str()).collect(),
             failures: self
                 .failed_test_files
@@ -224,6 +269,7 @@ impl ShadowResult {
                 .map(|failed_test_file| FailureJson {
                     file: failed_test_file.file.as_str(),
                     selected: failed_test_file.selected,
+                    widened: failed_test_file.widened,
                     distance: failed_test_file.distance,
                 })
                 .collect(),
@@ -260,15 +306,26 @@ impl ShadowResult {
             ));
         }
 
+        if self.widened_test_files > 0 {
+            let caught_count = self.caught_by_widening().count();
+
+            markdown.push_str(&format!(
+                "\nWidening on unresolved dynamic imports added {} ({}); it caught {}.\n",
+                count_of(self.widened_test_files, "test file", "test files"),
+                format_seconds(self.widened_duration),
+                count_of(caught_count, "failure", "failures")
+            ));
+        }
+
         if !self.failed_test_files.is_empty() {
             markdown
                 .push_str("\n| Failed test file | Selected | Distance |\n| --- | --- | --- |\n");
 
             for failed_test_file in &self.failed_test_files {
-                let selected = if failed_test_file.selected {
-                    "yes"
-                } else {
-                    "**no, miss**"
+                let selected = match (failed_test_file.selected, failed_test_file.widened) {
+                    (true, true) => "yes, by widening",
+                    (true, false) => "yes",
+                    (false, _) => "**no, miss**",
                 };
                 let distance = failed_test_file
                     .distance
@@ -399,6 +456,7 @@ struct ShadowJson<'a> {
     mode_reasons: &'a [ModeReasonRecord],
     test_files: TestFilesJson,
     savings: SavingsJson,
+    widening: WideningJson<'a>,
     misses: Vec<&'a str>,
     failures: Vec<FailureJson<'a>>,
     flaky: Vec<&'a str>,
@@ -422,9 +480,17 @@ struct SavingsJson {
 }
 
 #[derive(Serialize)]
+struct WideningJson<'a> {
+    test_files: usize,
+    seconds: f64,
+    caught_failures: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
 struct FailureJson<'a> {
     file: &'a str,
     selected: bool,
+    widened: bool,
     distance: Option<usize>,
 }
 
@@ -527,6 +593,11 @@ mod tests {
     "seconds": 15.0,
     "seconds_ratio": 0.75
   },
+  "widening": {
+    "test_files": 0,
+    "seconds": 0.0,
+    "caught_failures": []
+  },
   "misses": [
     "src/c.test.ts"
   ],
@@ -534,11 +605,13 @@ mod tests {
     {
       "file": "src/a.test.ts",
       "selected": true,
+      "widened": false,
       "distance": 1
     },
     {
       "file": "src/c.test.ts",
       "selected": false,
+      "widened": false,
       "distance": null
     }
   ],
@@ -703,6 +776,56 @@ Selection mode `all`: ci/deploy.sh (modified) matches always_all \"ci/**\".
         assert_eq!(
             unknown_mode.to_string(),
             "invalid selection JSON: unknown mode \"some\""
+        );
+    }
+
+    #[test]
+    fn failures_caught_through_widening_are_counted_apart() {
+        let selection = RecordedSelection::parse(
+            r#"{
+              "schema_version": 1,
+              "mode": "selected",
+              "targets": { "typescript": ["src/a.test.ts", "src/worker.test.ts"] },
+              "reasons": {
+                "src/a.test.ts": ["src/a.ts (modified)", "-> imported by src/a.test.ts"],
+                "src/worker.test.ts": [
+                  "src/a.ts (modified)",
+                  "-> widened: unresolved dynamic import at src/worker.ts:3 (request.moduleUrl)",
+                  "-> imported by src/worker.test.ts"
+                ]
+              },
+              "distances": { "src/a.test.ts": 1, "src/worker.test.ts": 2 }
+            }"#,
+        )
+        .unwrap();
+        let outcomes = outcomes_of(&[
+            ("src/a.test.ts", TestStatus::Passed, 1),
+            ("src/worker.test.ts", TestStatus::Failed, 4),
+            ("src/other.test.ts", TestStatus::Passed, 5),
+        ]);
+        let shadow_result = ShadowResult::compare(&selection, &outcomes);
+        let shadow_json: serde_json::Value =
+            serde_json::from_str(&shadow_result.to_json()).unwrap();
+
+        assert_eq!(
+            selection.widened_test_files,
+            BTreeSet::from([repo_path("src/worker.test.ts")])
+        );
+        assert_eq!(
+            shadow_json["widening"],
+            serde_json::json!({
+                "test_files": 1,
+                "seconds": 4.0,
+                "caught_failures": ["src/worker.test.ts"],
+            })
+        );
+        assert!(shadow_result.to_markdown().contains(
+            "Widening on unresolved dynamic imports added 1 test file (4.0 s); it caught 1 failure.\n"
+        ));
+        assert!(
+            shadow_result
+                .to_markdown()
+                .contains("| `src/worker.test.ts` | yes, by widening | 2 |\n")
         );
     }
 

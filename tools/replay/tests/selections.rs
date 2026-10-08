@@ -15,6 +15,11 @@ printf '{"schema_version":1,"revisions":{"base":"%s","head":"%s"},"mode":"select
 echo "prober: selected 1/4 test files (25.0%)" >&2
 "#;
 
+const CONFIG_READING_PROBER: &str = r#"#!/bin/sh
+cat prober.toml >> "$PROBER_CALLS"
+printf '{"schema_version":1,"mode":"none","stats":{"selected_ratio":0.0}}\n'
+"#;
+
 const FAILING_PROBER: &str = r#"#!/bin/sh
 echo "prober: unknown revision \"$2\"" >&2
 exit 1
@@ -66,6 +71,7 @@ impl ReplayFixture {
 
         fixture.write_script("prober", STUB_PROBER);
         fixture.write_script("failing-prober", FAILING_PROBER);
+        fixture.write_script("config-reading-prober", CONFIG_READING_PROBER);
 
         Self { commits, ..fixture }
     }
@@ -309,6 +315,64 @@ fn unknown_head_commit_is_recorded_as_an_error() {
     );
     assert_eq!(records[1]["id"], "present");
     assert_eq!(records[1]["error"], Value::Null);
+}
+
+#[test]
+fn prober_config_is_placed_in_the_worktree_for_each_change_and_removed_after() {
+    let fixture = ReplayFixture::with_commits(3);
+    let config_path = fixture.path("inference-off.toml");
+
+    fs::write(&config_path, "[inference]\ndynamic_imports = false\n").unwrap();
+
+    let run = fixture.replay_with_prober(
+        "config-reading-prober",
+        &[
+            "--last",
+            "2",
+            "--prober-config",
+            config_path.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(run.exit_code, 0, "{}", run.stderr);
+    assert_eq!(
+        fs::read_to_string(fixture.path("prober-calls.txt")).unwrap(),
+        "[inference]\ndynamic_imports = false\n[inference]\ndynamic_imports = false\n"
+    );
+    assert!(!fixture.path("worktree").join("prober.toml").exists());
+    assert!(
+        fixture
+            .records()
+            .iter()
+            .all(|record| record["error"].is_null())
+    );
+}
+
+#[test]
+fn prober_config_never_replaces_a_tracked_one() {
+    let fixture = ReplayFixture::with_commits(1);
+    let config_path = fixture.path("inference-off.toml");
+
+    fs::write(fixture.repository().join("prober.toml"), "").unwrap();
+    fixture.git(&["add", "--all"]);
+    fixture.git(&["commit", "--quiet", "--message", "add prober.toml"]);
+    fs::write(&config_path, "[inference]\ndynamic_imports = false\n").unwrap();
+
+    fixture.replay_with_prober(
+        "config-reading-prober",
+        &[
+            "--last",
+            "1",
+            "--prober-config",
+            config_path.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(
+        fixture.records()[0]["error"],
+        "the repository has its own prober.toml, which --prober-config would replace"
+    );
+    assert_eq!(fixture.prober_calls(), 0);
 }
 
 #[test]
