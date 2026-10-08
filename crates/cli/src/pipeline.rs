@@ -1,4 +1,4 @@
-//! The selection pipeline: config, changes, global files, graph, selection, and the fallback to every test on error.
+//! The selection pipeline: config, changes, global files and manifests, graph, selection, and the fallback to every test on error.
 
 use std::fs;
 use std::io;
@@ -6,14 +6,17 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
-use prober_core::changes::FileChange;
+use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{AlwaysAll, Config, config_hash};
 use prober_core::files::RepoPath;
 use prober_core::graph::{Graph, GraphBuilder};
 use prober_core::report::{ModeReason, Report};
 use prober_core::scan::ScanReport;
 use prober_core::select::{Widening, select_tests};
-use prober_lang_typescript::{ALWAYS_ALL_DEFAULTS, LANGUAGE, TypeScriptLinker, is_test_file};
+use prober_lang_typescript::{
+    ALWAYS_ALL_DEFAULTS, LANGUAGE, MANIFEST_DEFAULTS, ManifestChanges, TypeScriptLinker,
+    is_test_file,
+};
 use prober_vcs::GitRepository;
 
 const CONFIG_FILE_NAME: &str = "prober.toml";
@@ -29,57 +32,36 @@ pub struct Revisions {
     pub head: String,
 }
 
-pub struct SelectionRun {
-    pub report: Report,
-    pub warnings: Vec<String>,
-}
-
-pub struct ScanRun {
-    pub report: ScanReport,
-    pub warnings: Vec<String>,
-}
-
-struct LinkedGraph {
-    graph: Graph,
-    warnings: Vec<String>,
-}
-
-pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<SelectionRun> {
+pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<Report> {
     let workspace = Workspace::open(directory, &revisions.head)?;
     let config_text = workspace.read_config();
     let config_hash = config_hash(config_text.as_deref().unwrap_or_default());
 
     match workspace.select(config_text, revisions, config_hash.clone()) {
-        Ok(selection_run) => Ok(selection_run),
+        Ok(report) => Ok(report),
         Err(error) if on_error == OnError::All => {
             let error_reason = ModeReason::Error {
                 message: format!("{error:#}"),
             };
 
-            Ok(SelectionRun {
-                report: workspace.run_all(vec![error_reason], config_hash),
-                warnings: Vec::new(),
-            })
+            Ok(workspace.run_all(vec![error_reason], config_hash))
         }
         Err(error) => Err(error),
     }
 }
 
-pub fn scan(directory: &Path) -> Result<ScanRun> {
+pub fn scan(directory: &Path) -> Result<ScanReport> {
     let workspace = Workspace::open(directory, "HEAD")?;
     let config_text = workspace.read_config()?;
     let config = Config::parse(&config_text)?;
-    let linked_graph = workspace.link(&config)?;
-    let report = ScanReport::new(
-        &linked_graph.graph,
+    let linker = workspace.linker(&config)?;
+    let graph = workspace.link(&linker, &ManifestChanges::default())?;
+
+    Ok(ScanReport::new(
+        &graph,
         &workspace.repo_files,
         config_hash(&config_text),
-    );
-
-    Ok(ScanRun {
-        report,
-        warnings: linked_graph.warnings,
-    })
+    ))
 }
 
 struct Workspace {
@@ -114,26 +96,46 @@ impl Workspace {
         config_text: Result<String>,
         revisions: &Revisions,
         config_hash: String,
-    ) -> Result<SelectionRun> {
+    ) -> Result<Report> {
         let config = Config::parse(&config_text?)?;
         let changes = self.changes(revisions)?;
         let resolved_revisions = self
             .repository
             .resolve_revisions(&revisions.base, &revisions.head)?;
-        let always_all_reasons = always_all_reasons(&config, &changes)?;
+        let mut global_reasons = always_all_reasons(&config, &changes)?;
+        let manifest_changes = if config.inference.manifests {
+            let merge_base = MergeBase {
+                repository: &self.repository,
+                commit: &resolved_revisions.merge_base,
+            };
 
-        if !always_all_reasons.is_empty() {
+            ManifestChanges::between(&self.repo_root, &self.repo_files, &changes, &merge_base)?
+        } else {
+            ManifestChanges::default()
+        };
+
+        global_reasons.extend_from_slice(manifest_changes.global_reasons());
+
+        if !global_reasons.is_empty() {
             let report = self
-                .run_all(always_all_reasons, config_hash)
+                .run_all(global_reasons, config_hash)
                 .with_revisions(resolved_revisions);
 
-            return Ok(SelectionRun {
-                report,
-                warnings: Vec::new(),
-            });
+            return Ok(report);
         }
 
-        let LinkedGraph { graph, warnings } = self.link(&config)?;
+        let linker = self.linker(&config)?;
+        let graph = self.link(&linker, &manifest_changes)?;
+        let test_runner_reasons =
+            linker.test_runner_reasons(&graph, &self.repo_files, &manifest_changes)?;
+
+        if !test_runner_reasons.is_empty() {
+            let report = Report::all(&graph, test_runner_reasons, config_hash)
+                .with_revisions(resolved_revisions);
+
+            return Ok(report);
+        }
+
         let widening = if config.inference.widening {
             Widening::Scoped
         } else {
@@ -143,7 +145,7 @@ impl Workspace {
         let report = Report::from_selection(&graph, &changes, &selected_tests, config_hash)
             .with_revisions(resolved_revisions);
 
-        Ok(SelectionRun { report, warnings })
+        Ok(report)
     }
 
     fn changes(&self, revisions: &Revisions) -> Result<Vec<FileChange>> {
@@ -158,16 +160,18 @@ impl Workspace {
             .changes_between(&revisions.base, &revisions.head)
     }
 
-    fn link(&self, config: &Config) -> Result<LinkedGraph> {
-        let linker = TypeScriptLinker::new(&self.repo_root)?.with_inference(config.inference);
+    fn linker(&self, config: &Config) -> Result<TypeScriptLinker> {
+        let linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?;
+
+        Ok(linker.with_inference(config.inference))
+    }
+
+    fn link(&self, linker: &TypeScriptLinker, manifest_changes: &ManifestChanges) -> Result<Graph> {
         let mut builder = GraphBuilder::default();
 
-        linker.link(&self.repo_files, &mut builder)?;
+        linker.link_changes(&self.repo_files, manifest_changes, &mut builder)?;
 
-        Ok(LinkedGraph {
-            graph: builder.build(),
-            warnings: linker.missing_dependencies_warning().into_iter().collect(),
-        })
+        Ok(builder.build())
     }
 
     fn run_all(&self, reasons: Vec<ModeReason>, config_hash: String) -> Report {
@@ -181,9 +185,26 @@ impl Workspace {
     }
 }
 
+struct MergeBase<'w> {
+    repository: &'w GitRepository,
+    commit: &'w str,
+}
+
+impl BaseRevision for MergeBase<'_> {
+    fn read_file(&self, path: &RepoPath) -> Result<Option<Vec<u8>>> {
+        self.repository.read_file(self.commit, path)
+    }
+}
+
 fn always_all_reasons(config: &Config, changes: &[FileChange]) -> Result<Vec<ModeReason>> {
+    let manifest_patterns = if config.inference.manifests {
+        &[][..]
+    } else {
+        MANIFEST_DEFAULTS
+    };
     let built_in_patterns = ALWAYS_ALL_DEFAULTS
         .iter()
+        .chain(manifest_patterns)
         .map(|&pattern| pattern.to_owned())
         .collect();
     let built_in_always_all = AlwaysAll::new(built_in_patterns)?;

@@ -10,7 +10,9 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use prober_core::report::ListSeparator;
 
-use crate::pipeline::{OnError, Revisions, SelectionRun};
+use prober_core::report::Report;
+
+use crate::pipeline::{OnError, Revisions};
 use crate::scan::ScanArguments;
 use crate::shadow::ShadowArguments;
 
@@ -105,15 +107,14 @@ fn select(arguments: &SelectionArguments) -> ExitCode {
             .expect("clap requires --base without a subcommand"),
         head: arguments.head.clone(),
     };
-    let selection_run =
-        env::current_dir()
-            .map_err(anyhow::Error::from)
-            .and_then(|current_directory| {
-                pipeline::run(&current_directory, &revisions, arguments.on_error)
-            });
+    let report = env::current_dir()
+        .map_err(anyhow::Error::from)
+        .and_then(|current_directory| {
+            pipeline::run(&current_directory, &revisions, arguments.on_error)
+        });
 
-    match selection_run {
-        Ok(selection_run) => print_selection(&selection_run, arguments),
+    match report {
+        Ok(report) => print_selection(&report, arguments),
         Err(error) => {
             eprintln!("prober: {error:#}");
 
@@ -122,17 +123,12 @@ fn select(arguments: &SelectionArguments) -> ExitCode {
     }
 }
 
-fn print_selection(selection_run: &SelectionRun, arguments: &SelectionArguments) -> ExitCode {
-    let report = &selection_run.report;
+fn print_selection(report: &Report, arguments: &SelectionArguments) -> ExitCode {
     let output = match arguments.format {
         Format::Json => report.to_json(),
         Format::List if arguments.nul_separated => report.to_list(ListSeparator::Nul),
         Format::List => report.to_list(ListSeparator::Newline),
     };
-
-    for warning in &selection_run.warnings {
-        eprintln!("prober: warning: {warning}");
-    }
 
     eprintln!("{}", report.summary_line());
 

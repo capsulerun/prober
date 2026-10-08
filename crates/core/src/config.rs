@@ -29,6 +29,7 @@ pub struct InferenceSettings {
     pub dynamic_imports: bool,
     pub plugin_folders: bool,
     pub widening: bool,
+    pub manifests: bool,
 }
 
 impl Default for InferenceSettings {
@@ -37,6 +38,7 @@ impl Default for InferenceSettings {
             dynamic_imports: true,
             plugin_folders: true,
             widening: true,
+            manifests: true,
         }
     }
 }
@@ -196,6 +198,7 @@ mod tests {
             config.inference.dynamic_imports
                 && config.inference.plugin_folders
                 && config.inference.widening
+                && config.inference.manifests
         );
     }
 
@@ -209,6 +212,7 @@ mod tests {
                 dynamic_imports: true,
                 plugin_folders: false,
                 widening: true,
+                manifests: true,
             }
         );
     }
@@ -291,7 +295,7 @@ mod tests {
             ),
             (
                 "[inference]\nanchors = false\n",
-                "invalid prober.toml at line 2, column 1: unknown field `anchors`, expected one of `dynamic_imports`, `plugin_folders`, `widening`",
+                "invalid prober.toml at line 2, column 1: unknown field `anchors`, expected one of `dynamic_imports`, `plugin_folders`, `widening`, `manifests`",
             ),
             (
                 "[always_all]\ntests = [\"a.test.ts\"]\n",

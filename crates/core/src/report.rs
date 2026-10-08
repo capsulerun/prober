@@ -47,6 +47,20 @@ pub enum ModeReason {
         matched_path: RepoPath,
         pattern: String,
     },
+    UnparsableManifest {
+        change: FileChange,
+        message: String,
+    },
+    GlobalField {
+        change: FileChange,
+        field: String,
+    },
+    TestRunner {
+        change: FileChange,
+        package: String,
+        detail: String,
+        other_packages: usize,
+    },
     NoImpact {
         changed_file_count: usize,
     },
@@ -59,6 +73,9 @@ impl ModeReason {
     pub fn kind(&self) -> &'static str {
         match self {
             ModeReason::AlwaysAll { .. } => "always_all",
+            ModeReason::UnparsableManifest { .. } => "unparsable_manifest",
+            ModeReason::GlobalField { .. } => "global_field",
+            ModeReason::TestRunner { .. } => "test_runner",
             ModeReason::NoImpact { .. } => "no_impact",
             ModeReason::Error { .. } => "error",
         }
@@ -69,6 +86,26 @@ impl ModeReason {
             ModeReason::AlwaysAll {
                 change, pattern, ..
             } => format!("{change} matches always_all {pattern:?}"),
+            ModeReason::UnparsableManifest { change, message } => {
+                format!("{change} cannot be diffed: {message}")
+            }
+            ModeReason::GlobalField { change, field } => {
+                format!("{change} changes {field:?}, which may affect every test")
+            }
+            ModeReason::TestRunner {
+                change,
+                package,
+                detail,
+                other_packages: 0,
+            } => format!("{change} changes test runner package {package} ({detail})"),
+            ModeReason::TestRunner {
+                change,
+                package,
+                detail,
+                other_packages,
+            } => format!(
+                "{change} changes test runner package {package} ({detail}) and {other_packages} more"
+            ),
             ModeReason::NoImpact {
                 changed_file_count: 0,
             } => "no file changed".to_owned(),
@@ -355,7 +392,7 @@ impl<'a> JsonWidenedSite<'a> {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct JsonModeReason<'a> {
     kind: &'static str,
 
@@ -365,25 +402,50 @@ struct JsonModeReason<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<&'a str>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    field: Option<&'a str>,
+
+    #[serde(skip_serializing_if = "Option::is_none")]
+    package: Option<&'a str>,
+
     message: String,
 }
 
 impl<'a> JsonModeReason<'a> {
     fn new(mode_reason: &'a ModeReason) -> Self {
-        let (file, pattern) = match mode_reason {
+        let json_mode_reason = Self {
+            kind: mode_reason.kind(),
+            message: mode_reason.message(),
+            ..Self::default()
+        };
+
+        match mode_reason {
             ModeReason::AlwaysAll {
                 matched_path,
                 pattern,
                 ..
-            } => (Some(matched_path.as_str()), Some(pattern.as_str())),
-            ModeReason::NoImpact { .. } | ModeReason::Error { .. } => (None, None),
-        };
-
-        Self {
-            kind: mode_reason.kind(),
-            file,
-            pattern,
-            message: mode_reason.message(),
+            } => Self {
+                file: Some(matched_path.as_str()),
+                pattern: Some(pattern),
+                ..json_mode_reason
+            },
+            ModeReason::UnparsableManifest { change, .. } => Self {
+                file: Some(change.path.as_str()),
+                ..json_mode_reason
+            },
+            ModeReason::GlobalField { change, field } => Self {
+                file: Some(change.path.as_str()),
+                field: Some(field),
+                ..json_mode_reason
+            },
+            ModeReason::TestRunner {
+                change, package, ..
+            } => Self {
+                file: Some(change.path.as_str()),
+                package: Some(package),
+                ..json_mode_reason
+            },
+            ModeReason::NoImpact { .. } | ModeReason::Error { .. } => json_mode_reason,
         }
     }
 }
@@ -458,6 +520,9 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             ),
             None => format!("-> loaded by {dependent}"),
         },
+        Link::ChangedPart(part_index) => {
+            format!("-> {}", graph.changed_parts()[part_index].description)
+        }
         Link::UnresolvedSite(site_index) => {
             let unresolved_site = &graph.unresolved_sites()[site_index];
 
@@ -673,6 +738,96 @@ mod tests {
             ])
         );
         assert_eq!(json_report["distances"]["src/loader.test.ts"], 2);
+    }
+
+    #[test]
+    fn changed_part_hop_says_what_changed_in_the_file() {
+        let mut builder = GraphBuilder::default();
+        let a_test = builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
+        let lodash = builder.add_file(repo_path("node_modules/lodash"));
+
+        builder.add_edge(Edge {
+            dependent: a_test,
+            dependency: lodash,
+            kind: EdgeKind::Import,
+        });
+        builder.add_changed_part(
+            repo_path("pnpm-lock.yaml"),
+            repo_path("node_modules/lodash"),
+            "package lodash changed (4.17.20 -> 4.17.21)".to_owned(),
+        );
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("pnpm-lock.yaml")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["src/a.test.ts"],
+            serde_json::json!([
+                "pnpm-lock.yaml (modified)",
+                "-> package lodash changed (4.17.20 -> 4.17.21)",
+                "-> imported by src/a.test.ts",
+            ])
+        );
+        assert_eq!(json_report["distances"]["src/a.test.ts"], 2);
+    }
+
+    #[test]
+    fn manifest_reasons_name_the_file_and_the_field_or_package_at_fault() {
+        let graph = polyglot_graph();
+        let manifest_reasons = vec![
+            ModeReason::UnparsableManifest {
+                change: modified("pnpm-lock.yaml"),
+                message: "lockfileVersion 5.4 is not supported".to_owned(),
+            },
+            ModeReason::GlobalField {
+                change: modified("tsconfig.json"),
+                field: "compilerOptions.target".to_owned(),
+            },
+            ModeReason::TestRunner {
+                change: modified("package.json"),
+                package: "vitest".to_owned(),
+                detail: "^3.2.0 -> ^3.2.1".to_owned(),
+                other_packages: 0,
+            },
+            ModeReason::TestRunner {
+                change: modified("yarn.lock"),
+                package: "vite".to_owned(),
+                detail: "5.0.0 -> 5.0.1".to_owned(),
+                other_packages: 2,
+            },
+        ];
+        let report = Report::all(&graph, manifest_reasons, CONFIG_HASH.to_owned());
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["mode_reasons"],
+            serde_json::json!([
+                {
+                    "kind": "unparsable_manifest",
+                    "file": "pnpm-lock.yaml",
+                    "message": "pnpm-lock.yaml (modified) cannot be diffed: lockfileVersion 5.4 is not supported",
+                },
+                {
+                    "kind": "global_field",
+                    "file": "tsconfig.json",
+                    "field": "compilerOptions.target",
+                    "message": "tsconfig.json (modified) changes \"compilerOptions.target\", which may affect every test",
+                },
+                {
+                    "kind": "test_runner",
+                    "file": "package.json",
+                    "package": "vitest",
+                    "message": "package.json (modified) changes test runner package vitest (^3.2.0 -> ^3.2.1)",
+                },
+                {
+                    "kind": "test_runner",
+                    "file": "yarn.lock",
+                    "package": "vite",
+                    "message": "yarn.lock (modified) changes test runner package vite (5.0.0 -> 5.0.1) and 2 more",
+                },
+            ])
+        );
     }
 
     #[test]

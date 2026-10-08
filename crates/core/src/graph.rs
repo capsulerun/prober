@@ -90,6 +90,13 @@ pub struct UnresolvedSite {
     pub language: &'static str,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChangedPart {
+    pub change_path: RepoPath,
+    pub node: FileId,
+    pub description: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Edge {
     pub dependent: FileId,
@@ -110,6 +117,7 @@ pub struct GraphBuilder {
     edges: Vec<Edge>,
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
+    changed_parts: Vec<ChangedPart>,
     module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
@@ -146,6 +154,16 @@ impl GraphBuilder {
 
     pub fn add_unresolved_site(&mut self, unresolved_site: UnresolvedSite) {
         self.unresolved_sites.push(unresolved_site);
+    }
+
+    pub fn add_changed_part(&mut self, change_path: RepoPath, node: RepoPath, description: String) {
+        let node = self.files.intern(node);
+
+        self.changed_parts.push(ChangedPart {
+            change_path,
+            node,
+            description,
+        });
     }
 
     pub fn add_language(&mut self, language: &'static str, loads: ModuleFilter) {
@@ -191,6 +209,16 @@ impl GraphBuilder {
                 .then(left.expression.cmp(&right.expression))
         });
         self.unresolved_sites.dedup();
+        self.changed_parts.sort_by(|left, right| {
+            let left_node = self.files.path(left.node);
+            let right_node = self.files.path(right.node);
+
+            left.change_path
+                .cmp(&right.change_path)
+                .then(left_node.cmp(right_node))
+                .then(left.description.cmp(&right.description))
+        });
+        self.changed_parts.dedup();
 
         Graph {
             files: self.files,
@@ -199,6 +227,7 @@ impl GraphBuilder {
             dependencies_by_file,
             inferences: self.inferences,
             unresolved_sites: self.unresolved_sites,
+            changed_parts: self.changed_parts,
             module_filters: self.module_filters,
         }
     }
@@ -212,6 +241,7 @@ pub struct Graph {
     dependencies_by_file: Vec<Vec<Edge>>,
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
+    changed_parts: Vec<ChangedPart>,
     module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
@@ -282,6 +312,10 @@ impl Graph {
 
     pub fn unresolved_sites(&self) -> &[UnresolvedSite] {
         &self.unresolved_sites
+    }
+
+    pub fn changed_parts(&self) -> &[ChangedPart] {
+        &self.changed_parts
     }
 }
 
@@ -462,6 +496,58 @@ mod tests {
         assert!(graph.can_load("python", &repo_path("docs/a.md")));
         assert!(graph.is_module(&repo_path("src/a.ts")));
         assert!(!graph.is_module(&repo_path("docs/a.md")));
+    }
+
+    #[test]
+    fn changed_parts_are_listed_by_change_and_node_without_duplicates() {
+        let mut builder = GraphBuilder::default();
+        let lodash_change = "package lodash changed (4.17.20 -> 4.17.21)".to_owned();
+        let resolution_change = "src/a.ts resolves \"@acme/lib\" differently".to_owned();
+
+        builder.add_changed_part(
+            repo_path("pnpm-lock.yaml"),
+            repo_path("node_modules/lodash"),
+            lodash_change.clone(),
+        );
+        builder.add_changed_part(
+            repo_path("packages/lib/package.json"),
+            repo_path("src/a.ts"),
+            resolution_change.clone(),
+        );
+        builder.add_changed_part(
+            repo_path("pnpm-lock.yaml"),
+            repo_path("node_modules/lodash"),
+            lodash_change.clone(),
+        );
+
+        let graph = builder.build();
+        let listed_parts: Vec<(&str, &str, &str)> = graph
+            .changed_parts()
+            .iter()
+            .map(|part| {
+                (
+                    part.change_path.as_str(),
+                    graph.path(part.node).as_str(),
+                    part.description.as_str(),
+                )
+            })
+            .collect();
+
+        assert_eq!(
+            listed_parts,
+            [
+                (
+                    "packages/lib/package.json",
+                    "src/a.ts",
+                    resolution_change.as_str()
+                ),
+                (
+                    "pnpm-lock.yaml",
+                    "node_modules/lodash",
+                    lodash_change.as_str()
+                ),
+            ]
+        );
     }
 
     #[test]

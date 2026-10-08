@@ -411,9 +411,12 @@ fn cause_of(mode_reason: &Value) -> String {
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("unknown");
+    let detail = ["pattern", "field", "package", "file"]
+        .iter()
+        .find_map(|key| mode_reason.get(*key)?.as_str());
 
-    match mode_reason.get("pattern").and_then(Value::as_str) {
-        Some(pattern) => format!("`{kind}` `{pattern}`"),
+    match detail {
+        Some(detail) => format!("`{kind}` `{detail}`"),
         None => format!("`{kind}`"),
     }
 }
@@ -740,4 +743,38 @@ fn change_count(count: usize) -> String {
 
 fn short_commit(change: &str) -> &str {
     &change[..change.len().min(SHORT_COMMIT_LENGTH)]
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn full_run_cause_names_the_pattern_field_package_or_file_at_fault() {
+        let causes = [
+            (
+                json!({ "kind": "always_all", "file": "ci/a.sh", "pattern": "ci/**" }),
+                "`always_all` `ci/**`",
+            ),
+            (
+                json!({ "kind": "global_field", "file": "tsconfig.json", "field": "compilerOptions.target" }),
+                "`global_field` `compilerOptions.target`",
+            ),
+            (
+                json!({ "kind": "test_runner", "file": "pnpm-lock.yaml", "package": "vitest" }),
+                "`test_runner` `vitest`",
+            ),
+            (
+                json!({ "kind": "unparsable_manifest", "file": "yarn.lock" }),
+                "`unparsable_manifest` `yarn.lock`",
+            ),
+            (json!({ "kind": "error", "message": "boom" }), "`error`"),
+        ];
+
+        for (mode_reason, expected_cause) in causes {
+            assert_eq!(cause_of(&mode_reason), expected_cause);
+        }
+    }
 }

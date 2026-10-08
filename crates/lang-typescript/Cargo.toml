@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow.workspace = true
 globset.workspace = true
+json-strip-comments.workspace = true
 oxc_allocator.workspace = true
 oxc_ast.workspace = true
 oxc_ast_visit.workspace = true
@@ -19,6 +20,8 @@ oxc_semantic.workspace = true
 oxc_span.workspace = true
 prober-core.workspace = true
 rayon.workspace = true
+serde_json.workspace = true
+yaml-rust2.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,5 +1,6 @@
 use std::fmt;
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 use crate::files::RepoPath;
@@ -34,6 +35,10 @@ impl FileChange {
 
         std::iter::once(&self.path).chain(renamed_from)
     }
+}
+
+pub trait BaseRevision {
+    fn read_file(&self, path: &RepoPath) -> Result<Option<Vec<u8>>>;
 }
 
 impl fmt::Display for FileChange {
