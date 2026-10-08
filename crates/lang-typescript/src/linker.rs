@@ -3,6 +3,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use oxc_allocator::Allocator;
+use oxc_parser::Parser;
+use oxc_span::SourceType;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
@@ -12,9 +15,14 @@ use rayon::prelude::*;
 
 use crate::conventions::{LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file};
 use crate::dynamic::evaluator::Evaluator;
+use crate::dynamic::summarizer::{SummaryScope, summarize_program};
+use crate::dynamic::summary::ModuleSummary;
 use crate::dynamic::{DynamicInference, DynamicLoading};
+use crate::families::naming_families;
+use crate::file_links::listed::document_strings;
+use crate::file_links::{FileLinks, FileReading};
 use crate::file_system::RepoFileSystem;
-use crate::imports::{GlobImport, MockRequest, parse_imports, string_literals};
+use crate::imports::{GlobImport, MockRequest, PathLiteral, collect_imports, string_literals};
 use crate::manifests::ManifestChanges;
 use crate::manifests::documents::{parse_jsonc, parse_yaml};
 use crate::presets::patterns::join_directory;
@@ -61,9 +69,11 @@ pub(crate) struct LinkedFile {
     pub is_test: bool,
     pub dependencies: Vec<Dependency>,
     pub has_dynamic_sites: bool,
+    pub access_summary: Option<ModuleSummary>,
     pub resolution_change: Option<String>,
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
+    pub path_literals: Vec<PathLiteral>,
 }
 
 impl TypeScriptLinker {
@@ -142,13 +152,57 @@ impl TypeScriptLinker {
         let base_resolver = manifest_changes
             .resolution_change()
             .map(|_| self.base_resolver(repo_files, manifest_changes));
-        let linked_files = repo_files
+        let mut linked_files = repo_files
             .par_iter()
             .filter(|path| is_source_file(path))
             .map(|path| self.link_file(path, base_resolver.as_ref()))
             .collect::<Result<Vec<LinkedFile>>>()?;
-        let dynamic_inference = self.infer_dynamic_links(repo_files, &linked_files)?;
-        let groups = self.runner_groups(repo_files, &linked_files, &dynamic_inference);
+        let access_summaries: Vec<(usize, ModuleSummary)> = linked_files
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(file_index, linked_file)| {
+                Some((file_index, linked_file.access_summary.take()?))
+            })
+            .collect();
+        let package_directories = package_directories(repo_files);
+        let changes = link_changes.changes;
+        let importers = importers(&linked_files);
+        let dynamic_loading = DynamicLoading {
+            repo_root: &self.repo_root,
+            resolver: &self.resolver,
+            repo_files,
+            importers: &importers,
+            settings: self.inference,
+        };
+        let analysis = dynamic_loading.analyse(dynamic_seeds(&linked_files));
+        let (dynamic_inference, file_links) = std::thread::scope(|scope| {
+            let linked_files = &linked_files;
+            let package_directories = &package_directories;
+            let file_links = scope.spawn(move || {
+                self.infer_file_links(
+                    repo_files,
+                    linked_files,
+                    access_summaries,
+                    package_directories,
+                    changes,
+                )
+            });
+            let dynamic_inference = analysis.infer();
+
+            (
+                dynamic_inference,
+                file_links
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+            )
+        });
+        let (dynamic_inference, file_links) = (dynamic_inference?, file_links?);
+        let groups = self.runner_groups(
+            repo_files,
+            &linked_files,
+            &dynamic_inference,
+            &package_directories,
+        );
         let tests: BTreeSet<RepoPath> = linked_files
             .iter()
             .filter(|linked_file| linked_file.is_test)
@@ -170,7 +224,12 @@ impl TypeScriptLinker {
         .add_to(graph);
 
         add_dynamic_inference(dynamic_inference, graph);
+        add_file_links(file_links, graph);
         add_manifest_changes(manifest_changes, graph);
+
+        if self.inference.naming_families {
+            add_naming_families(repo_files, &tests, graph);
+        }
 
         RootScopeEffects {
             repo_root: &self.repo_root,
@@ -230,6 +289,7 @@ impl TypeScriptLinker {
         repo_files: &[RepoPath],
         linked_files: &[LinkedFile],
         dynamic_inference: &DynamicInference,
+        package_directories: &BTreeSet<String>,
     ) -> Vec<RunnerGroup> {
         if self.presets.runner_configs().is_empty() && self.presets.jest_manifests().is_empty() {
             return Vec::new();
@@ -269,11 +329,6 @@ impl TypeScriptLinker {
             .filter(|linked_file| linked_file.is_test)
             .map(|linked_file| &linked_file.path)
             .collect();
-        let package_directories: BTreeSet<String> = repo_files
-            .iter()
-            .filter(|path| path.as_str().rsplit('/').next() == Some(PACKAGE_MANIFEST))
-            .map(|path| parent_directory(path).to_owned())
-            .collect();
         let literal_references = |file: &RepoPath| self.literal_references(file, &repo_file_set);
         let manifest_setups: Vec<(RepoPath, Vec<RepoPath>)> = self
             .presets
@@ -289,7 +344,7 @@ impl TypeScriptLinker {
         runner_groups(&ScopeInputs {
             runner_configs: self.presets.runner_configs(),
             manifest_setups: &manifest_setups,
-            package_directories: &package_directories,
+            package_directories,
             tests: &tests,
             dependencies: &dependencies,
             literal_references: &literal_references,
@@ -389,42 +444,27 @@ impl TypeScriptLinker {
         ModuleResolver::new(&self.repo_root, file_system, packages.into_keys().collect())
     }
 
-    fn infer_dynamic_links(
+    fn infer_file_links(
         &self,
         repo_files: &[RepoPath],
         linked_files: &[LinkedFile],
-    ) -> Result<DynamicInference> {
-        let mut importers: HashMap<RepoPath, Vec<RepoPath>> = HashMap::new();
-        let seeds = linked_files
-            .iter()
-            .filter(|linked_file| linked_file.has_dynamic_sites)
-            .map(|linked_file| linked_file.path.clone())
-            .collect();
-
-        for linked_file in linked_files {
-            for dependency in &linked_file.dependencies {
-                if dependency.kind == EdgeKind::Import {
-                    importers
-                        .entry(dependency.path.clone())
-                        .or_default()
-                        .push(linked_file.path.clone());
-                }
-            }
+        access_summaries: Vec<(usize, ModuleSummary)>,
+        package_directories: &BTreeSet<String>,
+        changes: &[FileChange],
+    ) -> Result<FileLinks> {
+        if !self.inference.files {
+            return Ok(FileLinks::default());
         }
 
-        for module_importers in importers.values_mut() {
-            module_importers.sort();
-            module_importers.dedup();
-        }
-
-        DynamicLoading {
+        FileReading {
             repo_root: &self.repo_root,
-            resolver: &self.resolver,
             repo_files,
-            importers: &importers,
-            settings: self.inference,
+            linked_files,
+            resolver: &self.resolver,
+            package_directories,
+            changes,
         }
-        .infer(seeds)
+        .infer(access_summaries)
     }
 
     fn link_file(
@@ -435,7 +475,13 @@ impl TypeScriptLinker {
         let source_bytes = fs::read(self.repo_root.join(path.as_str()))
             .with_context(|| format!("cannot read {path}"))?;
         let source_text = String::from_utf8_lossy(&source_bytes);
-        let parsed_imports = parse_imports(path, &source_text);
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
+        let parsed = Parser::new(&allocator, &source_text, source_type).parse();
+        let parsed_imports = collect_imports(&parsed.program, &source_text);
+        let access_summary = (self.inference.files && parsed_imports.has_file_accesses)
+            .then(|| summarize_program(&parsed.program, &source_text, SummaryScope::Accesses))
+            .filter(|summary| !summary.accesses.is_empty());
         let imports_node_test = parsed_imports
             .import_requests
             .iter()
@@ -478,22 +524,51 @@ impl TypeScriptLinker {
             is_test: self.presets.is_test(path, imports_node_test),
             dependencies,
             has_dynamic_sites: parsed_imports.has_dynamic_sites,
+            access_summary,
             resolution_change,
             mocks: parsed_imports.mocks,
             glob_imports: parsed_imports.glob_imports,
+            path_literals: parsed_imports.path_literals,
         })
     }
 }
 
-fn document_strings(document: &serde_json::Value) -> Vec<String> {
-    match document {
-        serde_json::Value::String(text) => vec![text.clone()],
-        serde_json::Value::Array(items) => items.iter().flat_map(document_strings).collect(),
-        serde_json::Value::Object(properties) => {
-            properties.values().flat_map(document_strings).collect()
+fn dynamic_seeds(linked_files: &[LinkedFile]) -> Vec<RepoPath> {
+    linked_files
+        .iter()
+        .filter(|linked_file| linked_file.has_dynamic_sites)
+        .map(|linked_file| linked_file.path.clone())
+        .collect()
+}
+
+fn importers(linked_files: &[LinkedFile]) -> HashMap<RepoPath, Vec<RepoPath>> {
+    let mut importers: HashMap<RepoPath, Vec<RepoPath>> = HashMap::new();
+
+    for linked_file in linked_files {
+        for dependency in &linked_file.dependencies {
+            if dependency.kind == EdgeKind::Import {
+                importers
+                    .entry(dependency.path.clone())
+                    .or_default()
+                    .push(linked_file.path.clone());
+            }
         }
-        _ => Vec::new(),
     }
+
+    for module_importers in importers.values_mut() {
+        module_importers.sort();
+        module_importers.dedup();
+    }
+
+    importers
+}
+
+fn package_directories(repo_files: &[RepoPath]) -> BTreeSet<String> {
+    repo_files
+        .iter()
+        .filter(|path| path.as_str().rsplit('/').next() == Some(PACKAGE_MANIFEST))
+        .map(|path| parent_directory(path).to_owned())
+        .collect()
 }
 
 fn package_links(repo_root: &Path, packages: &BTreeMap<String, String>) -> Vec<(String, PathBuf)> {
@@ -522,6 +597,45 @@ fn add_manifest_changes(manifest_changes: &ManifestChanges, graph: &mut GraphBui
             affected_file.change_path.clone(),
             affected_file.file.clone(),
             description,
+        );
+    }
+}
+
+fn add_naming_families(
+    repo_files: &[RepoPath],
+    tests: &BTreeSet<RepoPath>,
+    graph: &mut GraphBuilder,
+) {
+    for (test, file) in naming_families(repo_files, tests) {
+        let test = graph.add_file(test.clone());
+        let file = graph.add_file(file.clone());
+
+        graph.add_edge(Edge {
+            dependent: test,
+            dependency: file,
+            kind: EdgeKind::Family,
+        });
+    }
+}
+
+fn add_file_links(file_links: FileLinks, graph: &mut GraphBuilder) {
+    for file_link in file_links.links {
+        let reader = graph.add_file(file_link.reader);
+        let file = graph.add_file(file_link.file);
+        let read_edge = Edge {
+            dependent: reader,
+            dependency: file,
+            kind: file_link.kind,
+        };
+
+        graph.add_inferred_edge(read_edge, file_link.inference);
+    }
+
+    for reader_change in file_links.reader_changes {
+        graph.add_changed_part(
+            reader_change.change_path,
+            reader_change.reader,
+            reader_change.description,
         );
     }
 }

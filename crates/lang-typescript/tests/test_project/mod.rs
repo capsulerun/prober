@@ -70,6 +70,10 @@ impl TestProject {
         fs::write(file_path, content).unwrap();
     }
 
+    pub fn remove(&self, path: &str) {
+        fs::remove_file(self.root().join(path)).unwrap();
+    }
+
     #[cfg(unix)]
     pub fn symlink(&self, link: &str, target: &str) {
         let link_path = self.root().join(link);

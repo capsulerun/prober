@@ -293,6 +293,14 @@ pub(crate) enum PathFunction {
     Normalize,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum AccessKind {
+    Read,
+    List,
+    Copy,
+    Glob,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Builtin {
     PathModule,
@@ -310,6 +318,11 @@ pub(crate) enum Builtin {
     ObjectValues,
     DefineConfig,
     MergeConfig,
+    FsModule,
+    GlobModule,
+    FileAccess(AccessKind),
+    Process,
+    ProcessCwd,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -564,7 +577,7 @@ pub(crate) fn path_join(values: &[Value]) -> Value {
     map_patterns(&concatenation(&separated), Pattern::normalized)
 }
 
-pub(crate) fn path_resolve(values: &[Value]) -> Value {
+pub(crate) fn path_resolve(values: &[Value], working_directory: &Value) -> Value {
     let last_absolute = values.iter().rposition(|value| {
         let patterns = value.patterns();
 
@@ -574,7 +587,7 @@ pub(crate) fn path_resolve(values: &[Value]) -> Value {
     match last_absolute {
         Some(position) => path_join(&values[position..]),
         None => {
-            let mut from_working_directory = vec![Value::runtime_value()];
+            let mut from_working_directory = vec![working_directory.clone()];
 
             from_working_directory.extend_from_slice(values);
 
@@ -745,12 +758,18 @@ mod tests {
 
     #[test]
     fn resolve_restarts_from_the_last_absolute_path_or_the_working_directory() {
-        let from_module =
-            path_resolve(&[Value::text("ignored"), module("src"), Value::text("a.ts")]);
-        let from_working_directory = path_resolve(&[Value::text("dist/index.js")]);
+        let unknown_directory = Value::runtime_value();
+        let from_module = path_resolve(
+            &[Value::text("ignored"), module("src"), Value::text("a.ts")],
+            &unknown_directory,
+        );
+        let from_working_directory =
+            path_resolve(&[Value::text("dist/index.js")], &unknown_directory);
+        let from_repository_root = path_resolve(&[Value::text("dist/index.js")], &module(""));
 
         assert_eq!(display(&from_module), ["<repo>/src/a.ts"]);
         assert_eq!(display(&from_working_directory), ["*/dist/index.js"]);
+        assert_eq!(display(&from_repository_root), ["<repo>/dist/index.js"]);
     }
 
     #[test]

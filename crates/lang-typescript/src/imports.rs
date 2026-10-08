@@ -3,8 +3,8 @@ use std::collections::HashSet;
 
 use oxc_ast::ast::{
     Argument, ArrayExpressionElement, CallExpression, ExportAllDeclaration, ExportFromDeclaration,
-    Expression, ImportDeclaration, ImportExpression, ImportOrExportKind, NewExpression, Statement,
-    StringLiteral, TSImportEqualsDeclaration, TSModuleReference, TemplateLiteral,
+    Expression, ImportDeclaration, ImportExpression, ImportOrExportKind, NewExpression, Program,
+    Statement, StringLiteral, TSImportEqualsDeclaration, TSModuleReference, TemplateLiteral,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -44,6 +44,23 @@ const ORIGINAL_MODULE_LOADERS: [&str; 5] = [
 
 const GLOB_IMPORT_METHODS: [&str; 2] = ["glob", "globEager"];
 
+const FILE_ACCESS_MODULES: [&str; 10] = [
+    "fs",
+    "node:fs",
+    "fs/promises",
+    "node:fs/promises",
+    "fs-extra",
+    "graceful-fs",
+    "glob",
+    "fast-glob",
+    "tinyglobby",
+    "globby",
+];
+
+const MAX_PATH_LITERAL_LENGTH: usize = 255;
+
+const MAX_EXTENSION_LENGTH: usize = 10;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImportRequest {
     pub specifier: String,
@@ -63,20 +80,24 @@ pub struct GlobImport {
     pub patterns: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathLiteral {
+    pub line: u32,
+    pub text: String,
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ParsedImports {
     pub import_requests: Vec<ImportRequest>,
     pub has_dynamic_sites: bool,
+    pub has_file_accesses: bool,
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
+    pub path_literals: Vec<PathLiteral>,
 }
 
-pub fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
-    let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-    let parsed = Parser::new(&allocator, source_text, source_type).parse();
-    let top_level_calls = parsed
-        .program
+pub(crate) fn collect_imports(program: &Program, source_text: &str) -> ParsedImports {
+    let top_level_calls = program
         .body
         .iter()
         .filter_map(|statement| match statement {
@@ -88,11 +109,12 @@ pub fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
         .collect();
     let mut import_collector = ImportCollector {
         source_text,
+        line_starts: line_starts(source_text),
         top_level_calls,
         parsed_imports: ParsedImports::default(),
     };
 
-    import_collector.visit_program(&parsed.program);
+    import_collector.visit_program(program);
 
     import_collector.parsed_imports
 }
@@ -134,16 +156,42 @@ impl<'a> Visit<'a> for LiteralCollector {
 
 struct ImportCollector<'s> {
     source_text: &'s str,
+    line_starts: Vec<usize>,
     top_level_calls: HashSet<u32>,
     parsed_imports: ParsedImports,
 }
 
 impl ImportCollector<'_> {
     fn record(&mut self, specifier: &str, kind: EdgeKind) {
+        if FILE_ACCESS_MODULES.contains(&specifier) {
+            self.parsed_imports.has_file_accesses = true;
+        }
+
         self.parsed_imports.import_requests.push(ImportRequest {
             specifier: specifier.to_owned(),
             kind,
         });
+    }
+
+    fn record_path_literal(&mut self, text: &str, offset: u32) {
+        if !is_path_like(text) {
+            return;
+        }
+
+        let line = self.line_of(offset);
+
+        self.parsed_imports.path_literals.push(PathLiteral {
+            line,
+            text: text.to_owned(),
+        });
+    }
+
+    fn line_of(&self, offset: u32) -> u32 {
+        let line_index = self
+            .line_starts
+            .partition_point(|&line_start| line_start <= offset as usize);
+
+        u32::try_from(line_index).unwrap_or(u32::MAX)
     }
 
     fn record_mock(&mut self, call: &CallExpression, mocking_method: &str) {
@@ -195,7 +243,7 @@ impl ImportCollector<'_> {
 
         match patterns {
             Some(patterns) => {
-                let line = line_of(self.source_text, call.span.start);
+                let line = self.line_of(call.span.start);
 
                 self.parsed_imports
                     .glob_imports
@@ -280,6 +328,23 @@ impl<'a> Visit<'a> for ImportCollector<'_> {
         walk::walk_call_expression(self, call);
     }
 
+    fn visit_string_literal(&mut self, string_literal: &StringLiteral<'a>) {
+        self.record_path_literal(&string_literal.value, string_literal.span.start);
+    }
+
+    fn visit_template_literal(&mut self, template_literal: &TemplateLiteral<'a>) {
+        if template_literal.expressions.is_empty()
+            && let Some(text) = template_literal
+                .quasis
+                .first()
+                .and_then(|quasi| quasi.value.cooked.as_deref())
+        {
+            self.record_path_literal(text, template_literal.span.start);
+        }
+
+        walk::walk_template_literal(self, template_literal);
+    }
+
     fn visit_new_expression(&mut self, new_expression: &NewExpression<'a>) {
         if let Expression::Identifier(constructor) = new_expression.callee.get_inner_expression()
             && WORKER_CONSTRUCTORS.contains(&constructor.name.as_str())
@@ -347,10 +412,34 @@ fn is_glob_import(callee: &Expression) -> bool {
         && GLOB_IMPORT_METHODS.contains(&method.property.name.as_str())
 }
 
-fn line_of(source_text: &str, offset: u32) -> u32 {
-    let text_before = source_text.get(..offset as usize).unwrap_or(source_text);
+pub(crate) fn is_path_like(text: &str) -> bool {
+    let has_path_characters = !text.is_empty()
+        && text.len() <= MAX_PATH_LITERAL_LENGTH
+        && !text.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || "*?{}[]<>|:\\$#\"'`".contains(character)
+        });
+    let file_name = text.rsplit('/').next().unwrap_or(text);
+    let has_extension = file_name.rsplit_once('.').is_some_and(|(_, extension)| {
+        !extension.is_empty()
+            && extension.len() <= MAX_EXTENSION_LENGTH
+            && extension
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric())
+    });
 
-    u32::try_from(text_before.matches('\n').count() + 1).unwrap_or(u32::MAX)
+    has_path_characters && (text.contains('/') || has_extension)
+}
+
+fn line_starts(source_text: &str) -> Vec<usize> {
+    std::iter::once(0)
+        .chain(
+            source_text
+                .match_indices('\n')
+                .map(|(newline_offset, _)| newline_offset + 1),
+        )
+        .collect()
 }
 
 fn is_require(callee: &Expression) -> bool {
@@ -380,6 +469,14 @@ fn loads_module(callee: &Expression) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
+        let allocator = Allocator::default();
+        let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
+        let parsed = Parser::new(&allocator, source_text, source_type).parse();
+
+        collect_imports(&parsed.program, source_text)
+    }
 
     fn imports_of(path: &str, source_text: &str) -> Vec<(String, EdgeKind)> {
         parse_imports(&RepoPath::new(path).unwrap(), source_text)
@@ -624,6 +721,48 @@ mod tests {
             ]
         );
         assert!(parsed.has_dynamic_sites);
+    }
+
+    #[test]
+    fn path_like_literals_are_kept_with_their_line() {
+        let source_text = r#"
+            const prompt = readFileSync("prompts/system.md", "utf8");
+            const fixture = `./fixtures/legacy.json`;
+            const label = "Hello world";
+            const pattern = "src/**/*.ts";
+            const url = "https://example.com/a.json";
+            const name = `${prefix}.json`;
+            const manifest = "package.json";
+        "#;
+        let literals: Vec<(u32, String)> =
+            parse_imports(&RepoPath::new("src/a.ts").unwrap(), source_text)
+                .path_literals
+                .into_iter()
+                .map(|path_literal| (path_literal.line, path_literal.text))
+                .collect();
+
+        assert_eq!(
+            literals,
+            [
+                (2, "prompts/system.md".to_owned()),
+                (3, "./fixtures/legacy.json".to_owned()),
+                (8, "package.json".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn importing_the_file_system_or_a_glob_library_marks_file_accesses() {
+        let has_file_accesses = |source_text: &str| {
+            parse_imports(&RepoPath::new("src/a.ts").unwrap(), source_text).has_file_accesses
+        };
+
+        assert!(has_file_accesses(
+            r#"import { readFileSync } from "node:fs";"#
+        ));
+        assert!(has_file_accesses(r#"import fs from "fs/promises";"#));
+        assert!(has_file_accesses(r#"const fg = require("fast-glob");"#));
+        assert!(!has_file_accesses(r#"import { join } from "node:path";"#));
     }
 
     #[test]

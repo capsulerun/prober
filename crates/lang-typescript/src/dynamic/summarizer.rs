@@ -1,6 +1,6 @@
 //! Builds a module summary from the syntax tree, resolving every name through oxc_semantic.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
@@ -9,7 +9,7 @@ use oxc_ast::ast::{
     BinaryOperator, BindingPattern, CallExpression, ChainElement, Declaration,
     ExportDefaultDeclarationKind, Expression, FormalParameter, IdentifierReference,
     ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, NewExpression,
-    ObjectExpression, ObjectPattern, ObjectPropertyKind, PropertyKind, Statement,
+    ObjectExpression, ObjectPattern, ObjectPropertyKind, Program, PropertyKind, Statement,
     StaticMemberExpression, TemplateLiteral, VariableDeclarator,
 };
 use oxc_parser::Parser;
@@ -18,8 +18,8 @@ use oxc_span::{GetSpan, SourceType, Span};
 use prober_core::files::RepoPath;
 
 use crate::dynamic::summary::{
-    Action, Comparison, Effect, Expr, FunctionIndex, FunctionSummary, ImportUse, ImportedName,
-    ModuleSummary, Reach, UseKind,
+    Access, Action, Comparison, Effect, Expr, FunctionIndex, FunctionSummary, ImportUse,
+    ImportedName, ModuleSummary, Reach, UseKind,
 };
 
 const ARRAY_ITERATION_METHODS: [&str; 9] = [
@@ -36,25 +36,80 @@ const ARRAY_ITERATION_METHODS: [&str; 9] = [
 
 const WORKER_CONSTRUCTORS: [&str; 2] = ["Worker", "SharedWorker"];
 
+const FILE_ACCESS_FUNCTIONS: &[&str] = &[
+    "access",
+    "accessSync",
+    "copy",
+    "copyFile",
+    "copyFileSync",
+    "copySync",
+    "cp",
+    "cpSync",
+    "createReadStream",
+    "exists",
+    "existsSync",
+    "fastGlob",
+    "fg",
+    "glob",
+    "globSync",
+    "globby",
+    "globbySync",
+    "lstat",
+    "lstatSync",
+    "opendir",
+    "opendirSync",
+    "readFile",
+    "readFileSync",
+    "readJSON",
+    "readJSONSync",
+    "readJson",
+    "readJsonSync",
+    "readdir",
+    "readdirSync",
+    "stat",
+    "statSync",
+    "sync",
+];
+
 const MAX_EXPRESSION_DEPTH: usize = 64;
 
 const MAX_EXPRESSION_TEXT_LENGTH: usize = 120;
 
-pub(crate) fn summarize_module(path: &RepoPath, source_text: &str) -> ModuleSummary {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryScope {
+    Loads,
+    Accesses,
+}
+
+pub(crate) fn summarize_module(
+    path: &RepoPath,
+    source_text: &str,
+    scope: SummaryScope,
+) -> ModuleSummary {
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
     let parsed = Parser::new(&allocator, source_text, source_type).parse();
+
+    summarize_program(&parsed.program, source_text, scope)
+}
+
+pub(crate) fn summarize_program<'a>(
+    program: &'a Program<'a>,
+    source_text: &'a str,
+    scope: SummaryScope,
+) -> ModuleSummary {
     let semantic = SemanticBuilder::new()
         .with_build_nodes(true)
-        .build(&parsed.program)
+        .build(program)
         .semantic;
 
-    Summarizer::new(&semantic, source_text).summarize(&parsed.program.body)
+    Summarizer::new(&semantic, source_text, scope).summarize(&program.body)
 }
 
 struct Summarizer<'s, 'a> {
     semantic: &'s Semantic<'a>,
     source_text: &'a str,
+    scope: SummaryScope,
     line_starts: Vec<usize>,
     function_indices: HashMap<NodeId, FunctionIndex>,
     function_parents: Vec<Option<FunctionIndex>>,
@@ -64,7 +119,7 @@ struct Summarizer<'s, 'a> {
 }
 
 impl<'s, 'a> Summarizer<'s, 'a> {
-    fn new(semantic: &'s Semantic<'a>, source_text: &'a str) -> Self {
+    fn new(semantic: &'s Semantic<'a>, source_text: &'a str, scope: SummaryScope) -> Self {
         let line_starts = std::iter::once(0)
             .chain(
                 source_text
@@ -76,6 +131,7 @@ impl<'s, 'a> Summarizer<'s, 'a> {
         Self {
             semantic,
             source_text,
+            scope,
             line_starts,
             function_indices: HashMap::new(),
             function_parents: Vec::new(),
@@ -111,7 +167,88 @@ impl<'s, 'a> Summarizer<'s, 'a> {
             self.record_module_statement(statement, &mut summary);
         }
 
+        if self.scope == SummaryScope::Accesses {
+            self.record_reachable_returns(&function_nodes, &mut summary);
+        }
+
         summary
+    }
+
+    fn record_reachable_returns(&mut self, function_nodes: &[NodeId], summary: &mut ModuleSummary) {
+        let mut return_statements: HashMap<FunctionIndex, Vec<NodeId>> = HashMap::new();
+
+        for node in self.nodes().iter() {
+            if let AstKind::ReturnStatement(_) = node.kind()
+                && let Some(function) = self.enclosing_function(node.id())
+            {
+                return_statements
+                    .entry(function)
+                    .or_default()
+                    .push(node.id());
+            }
+        }
+
+        let mut pending = Vec::new();
+        let mut recorded = HashSet::new();
+
+        for access in &summary.accesses {
+            referenced_functions(&access.callee, &mut pending);
+
+            for argument in &access.arguments {
+                referenced_functions(argument, &mut pending);
+            }
+        }
+
+        for (_, exported) in &summary.exports {
+            referenced_functions(exported, &mut pending);
+        }
+
+        while let Some(function) = pending.pop() {
+            if !recorded.insert(function) {
+                continue;
+            }
+
+            let returns = self.returns_of(function_nodes[function], &return_statements, function);
+
+            for returned in returns.iter().chain(
+                summary.functions[function]
+                    .parameter_defaults
+                    .iter()
+                    .flatten(),
+            ) {
+                referenced_functions(returned, &mut pending);
+            }
+
+            summary.functions[function].returns = returns;
+        }
+    }
+
+    fn returns_of(
+        &mut self,
+        function_node: NodeId,
+        return_statements: &HashMap<FunctionIndex, Vec<NodeId>>,
+        function: FunctionIndex,
+    ) -> Vec<Expr> {
+        if let AstKind::ArrowFunctionExpression(arrow) = self.nodes().kind(function_node)
+            && let Some(expression_body) = match &arrow.body {
+                ArrowFunctionBody::FunctionBody(_) => None,
+                expression_body => expression_body.as_expression(),
+            }
+        {
+            return vec![self.expression(expression_body)];
+        }
+
+        let mut returns = Vec::new();
+
+        for &statement_id in return_statements.get(&function).into_iter().flatten() {
+            if let AstKind::ReturnStatement(return_statement) = self.nodes().kind(statement_id)
+                && let Some(argument) = &return_statement.argument
+            {
+                returns.push(self.expression(argument));
+            }
+        }
+
+        returns
     }
 
     fn index_functions(&mut self) -> Vec<NodeId> {
@@ -162,6 +299,15 @@ impl<'s, 'a> Summarizer<'s, 'a> {
                     .map(|initializer| self.expression(initializer))
             })
             .collect();
+        if self.scope == SummaryScope::Accesses {
+            return FunctionSummary {
+                parent: self.function_parents[index],
+                parameter_defaults,
+                returns: Vec::new(),
+                reach: Reach::Nested,
+            };
+        }
+
         let returns = expression_body
             .map(|expression| self.expression(expression))
             .into_iter()
@@ -357,6 +503,14 @@ impl<'s, 'a> Summarizer<'s, 'a> {
     }
 
     fn record_node(&mut self, node: &AstNode<'a>, summary: &mut ModuleSummary) {
+        if self.scope == SummaryScope::Accesses {
+            if let AstKind::CallExpression(call) = node.kind() {
+                self.record_access(call, summary);
+            }
+
+            return;
+        }
+
         match node.kind() {
             AstKind::ReturnStatement(return_statement) => {
                 let Some(argument) = &return_statement.argument else {
@@ -428,6 +582,20 @@ impl<'s, 'a> Summarizer<'s, 'a> {
         };
 
         self.record_effect(summary, node_id, call.span, action);
+    }
+
+    fn record_access(&mut self, call: &'a CallExpression<'a>, summary: &mut ModuleSummary) {
+        if call.arguments.is_empty() || !may_access_files(call.callee.get_inner_expression()) {
+            return;
+        }
+
+        let access = Access {
+            line: self.line_of(call.span.start),
+            callee: self.expression(&call.callee),
+            arguments: self.arguments(&call.arguments),
+        };
+
+        summary.accesses.push(access);
     }
 
     fn may_load_through(&self, callee: &Expression<'a>) -> bool {
@@ -555,7 +723,9 @@ impl<'s, 'a> Summarizer<'s, 'a> {
     ) {
         match statement {
             Statement::ImportDeclaration(import_declaration) => {
-                if import_declaration.import_kind == ImportOrExportKind::Type {
+                if import_declaration.import_kind == ImportOrExportKind::Type
+                    || self.scope == SummaryScope::Accesses
+                {
                     return;
                 }
 
@@ -1197,6 +1367,58 @@ impl<'s, 'a> Summarizer<'s, 'a> {
 
         format!("{truncated}…")
     }
+}
+
+fn referenced_functions(expr: &Expr, functions: &mut Vec<FunctionIndex>) {
+    match expr {
+        Expr::Function(function) => functions.push(*function),
+        Expr::Concat(exprs) | Expr::Choice(exprs) | Expr::Array(exprs) | Expr::Merge(exprs) => {
+            for expr in exprs {
+                referenced_functions(expr, functions);
+            }
+        }
+        Expr::Conditional {
+            consequent,
+            alternate,
+            ..
+        } => {
+            referenced_functions(consequent, functions);
+            referenced_functions(alternate, functions);
+        }
+        Expr::Spread(expr) | Expr::ElementOf(expr) => referenced_functions(expr, functions),
+        Expr::Object(properties) => {
+            for (_, expr) in properties {
+                referenced_functions(expr, functions);
+            }
+        }
+        Expr::Member { object, .. } => referenced_functions(object, functions),
+        Expr::Call { callee, arguments } | Expr::New { callee, arguments } => {
+            referenced_functions(callee, functions);
+
+            for argument in arguments {
+                referenced_functions(argument, functions);
+            }
+        }
+        Expr::Text(_)
+        | Expr::Parameter { .. }
+        | Expr::Boolean(_)
+        | Expr::ModuleFile
+        | Expr::ModuleDirectory
+        | Expr::ModuleResolve
+        | Expr::Imported { .. }
+        | Expr::Global(_)
+        | Expr::Unknown => {}
+    }
+}
+
+fn may_access_files(callee: &Expression) -> bool {
+    let function_name = match callee {
+        Expression::Identifier(reference) => reference.name.as_str(),
+        Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+        _ => return false,
+    };
+
+    FILE_ACCESS_FUNCTIONS.contains(&function_name)
 }
 
 fn is_module_exports(target: &AssignmentTarget) -> bool {

@@ -1,4 +1,4 @@
-//! Partial evaluation across modules: the value of a summarized expression, the loads a call reaches, and whether every call of a loader is visible.
+//! Partial evaluation across modules: the value of a summarized expression, the loads a call reaches, the files a file access reaches, and whether every call of a loader is visible.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
@@ -9,14 +9,15 @@ use std::rc::Rc;
 use prober_core::files::RepoPath;
 
 use crate::conventions::is_source_file;
-use crate::dynamic::summarizer::summarize_module;
+use crate::dynamic::summarizer::{SummaryScope, summarize_module};
 use crate::dynamic::summary::{
-    Action, Comparison, Effect, Expr, FunctionIndex, ImportedName, ModuleSummary, Reach, UseKind,
+    Access, Action, Comparison, Effect, Expr, FunctionIndex, ImportedName, ModuleSummary, Reach,
+    UseKind,
 };
 use crate::dynamic::value::{
-    Builtin, FunctionRef, Part, PathFunction, Pattern, Unknown, Value, alternatives, concatenation,
-    file_url_to_path, is_open_object, merge_config, merge_objects, path_dirname, path_join,
-    path_resolve, require_resolve, url,
+    AccessKind, Builtin, FunctionRef, Part, PathFunction, Pattern, Unknown, Value, alternatives,
+    concatenation, file_url_to_path, is_open_object, merge_config, merge_objects, path_dirname,
+    path_join, path_resolve, require_resolve, url,
 };
 use crate::presets::{VITEST_DEFAULT_EXCLUDE, VITEST_DEFAULT_INCLUDE};
 use crate::resolver::{ModuleResolver, Resolution};
@@ -29,6 +30,8 @@ const MAX_REEXPORT_DEPTH: usize = 4;
 
 const MAX_EVALUATION_STEPS: usize = 20_000;
 
+const MAX_ACCESS_STEPS: usize = 2_000;
+
 pub(crate) struct Load {
     pub specifier: Value,
     pub base: LoadBase,
@@ -38,6 +41,12 @@ pub(crate) enum LoadBase {
     Module(RepoPath),
     Require(Vec<Pattern>),
     WorkingDirectory,
+}
+
+pub(crate) struct FileAccess {
+    pub kind: AccessKind,
+    pub path: Value,
+    pub options: Value,
 }
 
 #[derive(Clone)]
@@ -99,6 +108,9 @@ pub(crate) struct Evaluator<'e> {
     nesting: Cell<usize>,
     steps: Cell<usize>,
     evaluates_spreads: Cell<bool>,
+    step_limit: Cell<usize>,
+    working_directory: RefCell<Value>,
+    summary_scope: SummaryScope,
 }
 
 impl<'e> Evaluator<'e> {
@@ -120,14 +132,28 @@ impl<'e> Evaluator<'e> {
             nesting: Cell::new(0),
             steps: Cell::new(0),
             evaluates_spreads: Cell::new(false),
+            step_limit: Cell::new(MAX_EVALUATION_STEPS),
+            working_directory: RefCell::new(Value::runtime_value()),
+            summary_scope: SummaryScope::Loads,
+        }
+    }
+
+    pub fn with_summary_scope(self, summary_scope: SummaryScope) -> Self {
+        Self {
+            summary_scope,
+            ..self
         }
     }
 
     pub fn add_analysed(&self, module: RepoPath, summary: ModuleSummary) {
+        self.add_summary(module.clone(), summary);
+        self.analysed.borrow_mut().insert(module);
+    }
+
+    pub fn add_summary(&self, module: RepoPath, summary: ModuleSummary) {
         self.summaries
             .borrow_mut()
-            .insert(module.clone(), Some(Rc::new(summary)));
-        self.analysed.borrow_mut().insert(module);
+            .insert(module, Some(Rc::new(summary)));
     }
 
     pub fn is_analysed(&self, module: &RepoPath) -> bool {
@@ -146,6 +172,7 @@ impl<'e> Evaluator<'e> {
                 Rc::new(summarize_module(
                     module,
                     &String::from_utf8_lossy(&source_bytes),
+                    self.summary_scope,
                 ))
             });
 
@@ -171,6 +198,39 @@ impl<'e> Evaluator<'e> {
                 vec![config],
             ),
         }
+    }
+
+    pub fn file_access(
+        &self,
+        module: &RepoPath,
+        access: &Access,
+        working_directory: Value,
+    ) -> Option<FileAccess> {
+        self.steps.set(0);
+
+        let context = Context::top(module);
+        let kind = match self.evaluate_callee(&context, &access.callee) {
+            Value::Builtin(Builtin::FileAccess(kind)) => kind,
+            Value::Builtin(Builtin::GlobModule) => AccessKind::Glob,
+            _ => return None,
+        };
+        let outer_directory = self.working_directory.replace(working_directory);
+        let outer_limit = self.step_limit.replace(MAX_ACCESS_STEPS);
+        let mut arguments = access
+            .arguments
+            .iter()
+            .map(|argument| self.evaluate(&context, argument));
+        let path = arguments.next().unwrap_or_else(Value::runtime_value);
+        let options = arguments.next().unwrap_or_else(Value::runtime_value);
+
+        self.step_limit.set(outer_limit);
+        self.working_directory.replace(outer_directory);
+
+        Some(FileAccess {
+            kind,
+            path,
+            options,
+        })
     }
 
     pub fn resolve(&self, importer: &RepoPath, specifier: &str) -> Resolution {
@@ -482,7 +542,7 @@ impl<'e> Evaluator<'e> {
     }
 
     fn evaluate(&self, context: &Context, expr: &Expr) -> Value {
-        if self.steps.get() >= MAX_EVALUATION_STEPS {
+        if self.steps.get() >= self.step_limit.get() {
             return Value::runtime_value();
         }
 
@@ -689,6 +749,11 @@ impl<'e> Evaluator<'e> {
             Value::Builtin(Builtin::PathModule) => path_member(property),
             Value::Builtin(Builtin::UrlModule) => url_member(property),
             Value::Builtin(Builtin::ModuleModule) => module_member(property),
+            Value::Builtin(Builtin::FsModule) => fs_member(property),
+            Value::Builtin(Builtin::GlobModule) => glob_member(property),
+            Value::Builtin(Builtin::Process) if property == "cwd" => {
+                Value::Builtin(Builtin::ProcessCwd)
+            }
             Value::Builtin(Builtin::ObjectConstructor) => match property {
                 "keys" => Value::Builtin(Builtin::ObjectKeys),
                 "values" => Value::Builtin(Builtin::ObjectValues),
@@ -725,7 +790,10 @@ impl<'e> Evaluator<'e> {
 
         match callee {
             Value::Builtin(Builtin::Path(PathFunction::Join)) => path_join(&arguments),
-            Value::Builtin(Builtin::Path(PathFunction::Resolve)) => path_resolve(&arguments),
+            Value::Builtin(Builtin::Path(PathFunction::Resolve)) => {
+                path_resolve(&arguments, &self.working_directory.borrow())
+            }
+            Value::Builtin(Builtin::ProcessCwd) => self.working_directory.borrow().clone(),
             Value::Builtin(Builtin::Path(PathFunction::Dirname)) => path_dirname(&first_argument),
             Value::Builtin(Builtin::Path(PathFunction::Normalize)) => path_join(&[first_argument]),
             Value::Builtin(Builtin::PathToFileUrl | Builtin::StringFunction) => first_argument,
@@ -846,6 +914,13 @@ impl<'e> Evaluator<'e> {
     }
 
     fn required_module(&self, bases: &[Pattern], specifier: &Value) -> Value {
+        if let Some(builtin) = specifier
+            .single_literal()
+            .and_then(|specifier| builtin_import(&specifier, &ImportedName::Namespace))
+        {
+            return builtin;
+        }
+
         let base_module = match bases {
             [base] => repo_module(base),
             _ => None,
@@ -924,6 +999,7 @@ fn global(name: &str, module: &RepoPath) -> Value {
         "require" => Value::Require(module_file(module).patterns()),
         "String" => Value::Builtin(Builtin::StringFunction),
         "Object" => Value::Builtin(Builtin::ObjectConstructor),
+        "process" => Value::Builtin(Builtin::Process),
         _ => Value::runtime_value(),
     }
 }
@@ -942,6 +1018,16 @@ fn builtin_import(specifier: &str, name: &ImportedName) -> Option<Value> {
         ("url", Some(member)) => Some(url_member(member)),
         ("module", None) => Some(Value::Builtin(Builtin::ModuleModule)),
         ("module", Some(member)) => Some(module_member(member)),
+        ("fs" | "fs/promises" | "fs-extra" | "graceful-fs", None) => {
+            Some(Value::Builtin(Builtin::FsModule))
+        }
+        ("fs" | "fs/promises" | "fs-extra" | "graceful-fs", Some(member)) => {
+            Some(fs_member(member))
+        }
+        ("glob" | "fast-glob" | "tinyglobby" | "globby", None) => {
+            Some(Value::Builtin(Builtin::GlobModule))
+        }
+        ("glob" | "fast-glob" | "tinyglobby" | "globby", Some(member)) => Some(glob_member(member)),
         (
             "vitest/config" | "vitest" | "vite" | "vitest/node" | "@playwright/test" | "cypress",
             Some(member),
@@ -984,6 +1070,30 @@ fn url_member(member: &str) -> Value {
         "pathToFileURL" => Value::Builtin(Builtin::PathToFileUrl),
         "fileURLToPath" => Value::Builtin(Builtin::FileUrlToPath),
         "URL" => Value::Builtin(Builtin::UrlConstructor),
+        _ => Value::runtime_value(),
+    }
+}
+
+fn fs_member(member: &str) -> Value {
+    let kind = match member {
+        "promises" | "default" => return Value::Builtin(Builtin::FsModule),
+        "readFile" | "readFileSync" | "readJson" | "readJsonSync" | "readJSON" | "readJSONSync"
+        | "createReadStream" | "exists" | "existsSync" | "stat" | "statSync" | "lstat"
+        | "lstatSync" | "access" | "accessSync" | "copyFile" | "copyFileSync" => AccessKind::Read,
+        "readdir" | "readdirSync" | "opendir" | "opendirSync" => AccessKind::List,
+        "cp" | "cpSync" | "copy" | "copySync" => AccessKind::Copy,
+        "glob" | "globSync" => AccessKind::Glob,
+        _ => return Value::runtime_value(),
+    };
+
+    Value::Builtin(Builtin::FileAccess(kind))
+}
+
+fn glob_member(member: &str) -> Value {
+    match member {
+        "default" => Value::Builtin(Builtin::GlobModule),
+        "glob" | "globSync" | "sync" | "async" | "globby" | "globbySync" | "globStream"
+        | "stream" => Value::Builtin(Builtin::FileAccess(AccessKind::Glob)),
         _ => Value::runtime_value(),
     }
 }

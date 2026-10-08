@@ -11,6 +11,8 @@ pub enum EdgeKind {
     Contains,
     Asset,
     Reads,
+    Lists,
+    Family,
 }
 
 impl EdgeKind {
@@ -20,10 +22,43 @@ impl EdgeKind {
             | EdgeKind::Dynamic
             | EdgeKind::Contains
             | EdgeKind::Asset
-            | EdgeKind::Reads => true,
+            | EdgeKind::Reads
+            | EdgeKind::Lists
+            | EdgeKind::Family => true,
             EdgeKind::TypeOnly => false,
         }
     }
+
+    pub fn follows(self, dependency_content: ContentChange) -> bool {
+        match self {
+            EdgeKind::Reads | EdgeKind::Family => dependency_content != ContentChange::None,
+            EdgeKind::Lists => dependency_content == ContentChange::Direct,
+            _ => true,
+        }
+    }
+
+    pub fn dependent_content(self) -> ContentChange {
+        if self == EdgeKind::Lists {
+            ContentChange::Listed
+        } else {
+            ContentChange::None
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ContentChange {
+    None,
+    Listed,
+    Direct,
+}
+
+impl ContentChange {
+    pub const ALL: [ContentChange; 3] = [
+        ContentChange::None,
+        ContentChange::Listed,
+        ContentChange::Direct,
+    ];
 }
 
 pub type ModuleFilter = fn(&RepoPath) -> bool;
@@ -121,7 +156,7 @@ pub struct GraphBuilder {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
     edges: Vec<Edge>,
-    inferences: HashMap<(FileId, FileId), Inference>,
+    inferences: HashMap<(FileId, FileId, EdgeKind), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
     changed_parts: Vec<ChangedPart>,
     mocked_modules: HashMap<FileId, Vec<FileId>>,
@@ -148,7 +183,10 @@ impl GraphBuilder {
     }
 
     pub fn add_inferred_edge(&mut self, edge: Edge, inference: Inference) {
-        match self.inferences.entry((edge.dependent, edge.dependency)) {
+        match self
+            .inferences
+            .entry((edge.dependent, edge.dependency, edge.kind))
+        {
             Entry::Occupied(mut entry) if inference < *entry.get() => {
                 entry.insert(inference);
             }
@@ -271,7 +309,7 @@ pub struct Graph {
     test_languages: HashMap<FileId, &'static str>,
     dependents_by_file: Vec<Vec<Edge>>,
     dependencies_by_file: Vec<Vec<Edge>>,
-    inferences: HashMap<(FileId, FileId), Inference>,
+    inferences: HashMap<(FileId, FileId, EdgeKind), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
     changed_parts: Vec<ChangedPart>,
     mocked_modules: HashMap<FileId, Vec<FileId>>,
@@ -317,18 +355,19 @@ impl Graph {
         &self.dependencies_by_file[file.index()]
     }
 
-    pub fn inference(&self, dependent: FileId, dependency: FileId) -> Option<&Inference> {
-        self.inferences.get(&(dependent, dependency))
+    pub fn inference(&self, edge: &Edge) -> Option<&Inference> {
+        self.inferences
+            .get(&(edge.dependent, edge.dependency, edge.kind))
     }
 
     pub fn inferred_edges(&self) -> impl Iterator<Item = (Edge, &Inference)> {
         self.inferences
             .iter()
-            .map(|(&(dependent, dependency), inference)| {
+            .map(|(&(dependent, dependency, kind), inference)| {
                 let inferred_edge = Edge {
                     dependent,
                     dependency,
-                    kind: EdgeKind::Dynamic,
+                    kind,
                 };
 
                 (inferred_edge, inference)
@@ -477,7 +516,27 @@ mod tests {
         assert!(EdgeKind::Contains.selects_tests());
         assert!(EdgeKind::Asset.selects_tests());
         assert!(EdgeKind::Reads.selects_tests());
+        assert!(EdgeKind::Lists.selects_tests());
+        assert!(EdgeKind::Family.selects_tests());
         assert!(!EdgeKind::TypeOnly.selects_tests());
+    }
+
+    #[test]
+    fn reads_and_naming_families_follow_content_and_listings_pass_it_one_hop() {
+        for content in ContentChange::ALL {
+            assert!(EdgeKind::Import.follows(content));
+            assert!(EdgeKind::Dynamic.follows(content));
+            assert!(EdgeKind::Asset.follows(content));
+        }
+
+        assert!(!EdgeKind::Reads.follows(ContentChange::None));
+        assert!(EdgeKind::Reads.follows(ContentChange::Listed));
+        assert!(!EdgeKind::Family.follows(ContentChange::None));
+        assert!(EdgeKind::Family.follows(ContentChange::Direct));
+        assert!(!EdgeKind::Lists.follows(ContentChange::Listed));
+        assert!(EdgeKind::Lists.follows(ContentChange::Direct));
+        assert_eq!(EdgeKind::Lists.dependent_content(), ContentChange::Listed);
+        assert_eq!(EdgeKind::Reads.dependent_content(), ContentChange::None);
     }
 
     #[test]
@@ -532,13 +591,17 @@ mod tests {
         builder.add_inferred_edge(dynamic_edge, inference_at(30));
 
         let graph = builder.build();
+        let read_edge = Edge {
+            kind: EdgeKind::Reads,
+            ..dynamic_edge
+        };
 
         assert_eq!(
             dependent_paths(&graph, "src/plugins/a.ts"),
             [("src/loader.ts".to_owned(), EdgeKind::Dynamic)]
         );
-        assert_eq!(graph.inference(loader, plugin), Some(&inference_at(4)));
-        assert_eq!(graph.inference(plugin, loader), None);
+        assert_eq!(graph.inference(&dynamic_edge), Some(&inference_at(4)));
+        assert_eq!(graph.inference(&read_edge), None);
         assert_eq!(
             graph.dependencies(loader),
             [Edge {

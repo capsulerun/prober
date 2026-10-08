@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::changes::FileChange;
 use crate::files::FileId;
-use crate::graph::{EdgeKind, Graph};
+use crate::graph::{ContentChange, EdgeKind, Graph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Widening {
@@ -55,6 +55,7 @@ impl SelectedTest {
 struct Discovery<'a> {
     change: &'a FileChange,
     reached_via: Option<Link>,
+    content: ContentChange,
 }
 
 pub fn select_tests(
@@ -140,9 +141,12 @@ fn reason_past_mocks(
 
         for edge in test_selecting_edges {
             let dependency = edge.dependency;
+            let carries_the_change = discoveries
+                .get(&dependency)
+                .is_some_and(|discovery| edge.kind.follows(discovery.content));
             let is_unexplored = dependency != test_file
                 && !dependents_on_path.contains_key(&dependency)
-                && discoveries.contains_key(&dependency)
+                && carries_the_change
                 && !is_mocked(dependency);
 
             if !is_unexplored {
@@ -220,8 +224,11 @@ fn discover_dependents<'a>(
             &mut discoveries,
             &mut files_to_visit,
             changed_file,
-            change,
-            None,
+            Discovery {
+                change,
+                reached_via: None,
+                content: ContentChange::Direct,
+            },
         );
     }
 
@@ -237,8 +244,11 @@ fn discover_dependents<'a>(
             &mut discoveries,
             &mut files_to_visit,
             changed_part.node,
-            change,
-            Some(Link::ChangedPart(part_index)),
+            Discovery {
+                change,
+                reached_via: Some(Link::ChangedPart(part_index)),
+                content: ContentChange::None,
+            },
         );
     }
 
@@ -262,14 +272,15 @@ fn discover_dependents<'a>(
         });
 
         if let Some(&change) = loadable_change {
-            let widening = Some(Link::UnresolvedSite(site_index));
-
             discover(
                 &mut discoveries,
                 &mut files_to_visit,
                 unresolved_site.file,
-                change,
-                widening,
+                Discovery {
+                    change,
+                    reached_via: Some(Link::UnresolvedSite(site_index)),
+                    content: ContentChange::None,
+                },
             );
         }
     }
@@ -283,15 +294,18 @@ fn discover<'a>(
     discoveries: &mut HashMap<FileId, Discovery<'a>>,
     files_to_visit: &mut VecDeque<FileId>,
     file: FileId,
-    change: &'a FileChange,
-    reached_via: Option<Link>,
+    discovery: Discovery<'a>,
 ) {
-    if let Entry::Vacant(entry) = discoveries.entry(file) {
-        entry.insert(Discovery {
-            change,
-            reached_via,
-        });
-        files_to_visit.push_back(file);
+    match discoveries.entry(file) {
+        Entry::Vacant(entry) => {
+            entry.insert(discovery);
+            files_to_visit.push_back(file);
+        }
+        Entry::Occupied(mut entry) if discovery.content > entry.get().content => {
+            entry.insert(discovery);
+            files_to_visit.push_back(file);
+        }
+        Entry::Occupied(_) => {}
     }
 }
 
@@ -301,11 +315,11 @@ fn visit_dependents<'a>(
     files_to_visit: &mut VecDeque<FileId>,
 ) {
     while let Some(file) = files_to_visit.pop_front() {
-        let change = discoveries[&file].change;
+        let discovery = discoveries[&file];
         let test_selecting_edges = graph
             .dependents(file)
             .iter()
-            .filter(|edge| edge.kind.selects_tests());
+            .filter(|edge| edge.kind.selects_tests() && edge.kind.follows(discovery.content));
 
         for edge in test_selecting_edges {
             let reached_via = Link::Edge {
@@ -317,8 +331,11 @@ fn visit_dependents<'a>(
                 discoveries,
                 files_to_visit,
                 edge.dependent,
-                change,
-                Some(reached_via),
+                Discovery {
+                    change: discovery.change,
+                    reached_via: Some(reached_via),
+                    content: edge.kind.dependent_content(),
+                },
             );
         }
     }
@@ -353,7 +370,7 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::files::RepoPath;
-    use crate::graph::EdgeKind::{Asset, Import, TypeOnly};
+    use crate::graph::EdgeKind::{Asset, Family, Import, Lists, Reads, TypeOnly};
     use crate::graph::{Edge, GraphBuilder, UnresolvedCause, UnresolvedSite};
 
     fn repo_path(path: &str) -> RepoPath {
@@ -1068,5 +1085,96 @@ mod tests {
         );
 
         assert_eq!(selected_tests[0].reason.change, modified("src/a.ts"));
+    }
+
+    #[test]
+    fn a_read_selects_through_the_content_of_the_file_it_reads_not_through_its_imports() {
+        let graph = build_graph(
+            &["src/agent.test.ts"],
+            &[
+                ("src/agent.test.ts", Import, "src/prompts.ts"),
+                ("src/prompts.ts", Reads, "src/sample.ts"),
+                ("src/sample.ts", Import, "src/helper.ts"),
+            ],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/sample.ts")]),
+            [("src/agent.test.ts", 2)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/helper.ts")]),
+            []
+        );
+    }
+
+    #[test]
+    fn a_listing_passes_the_changes_of_the_listed_files_on_to_its_readers() {
+        let graph = build_graph(
+            &["src/discovery.test.ts"],
+            &[
+                ("src/discovery.test.ts", Import, "src/discovery.ts"),
+                ("src/discovery.ts", Reads, "extensions/a/plugin.json"),
+                ("extensions/a/plugin.json", Lists, "extensions/a/index.ts"),
+                ("extensions/a/index.ts", Import, "extensions/a/send.ts"),
+            ],
+        );
+        let selected_tests = select_tests(
+            &graph,
+            &[modified("extensions/a/index.ts")],
+            Widening::Scoped,
+        );
+
+        assert_eq!(
+            reason_files(&graph, &selected_tests[0]),
+            [
+                "extensions/a/index.ts",
+                "extensions/a/plugin.json",
+                "src/discovery.ts",
+                "src/discovery.test.ts"
+            ]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("extensions/a/send.ts")]),
+            []
+        );
+    }
+
+    #[test]
+    fn a_file_reached_first_through_behaviour_is_revisited_when_a_listing_reaches_it() {
+        let graph = build_graph(
+            &["src/reader.test.ts"],
+            &[
+                ("src/reader.test.ts", Import, "src/reader.ts"),
+                ("src/reader.ts", Reads, "data/list.json"),
+                ("data/list.json", Import, "data/a.ts"),
+                ("data/list.json", Lists, "data/z.ts"),
+            ],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("data/a.ts"), modified("data/z.ts")]),
+            [("src/reader.test.ts", 3)]
+        );
+    }
+
+    #[test]
+    fn a_naming_family_selects_its_test_only_when_the_named_file_changes() {
+        let graph = build_graph(
+            &["src/channel.e2e.test.ts"],
+            &[
+                ("src/channel.e2e.test.ts", Family, "src/channel.ts"),
+                ("src/channel.ts", Import, "src/transport.ts"),
+            ],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/channel.ts")]),
+            [("src/channel.e2e.test.ts", 1)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/transport.ts")]),
+            []
+        );
     }
 }

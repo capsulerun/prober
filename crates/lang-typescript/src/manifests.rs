@@ -539,6 +539,10 @@ fn ancestor_directories(directory: &str) -> impl Iterator<Item = &str> {
     })
 }
 
+pub(crate) fn is_manifest(path: &RepoPath) -> bool {
+    manifest_kind(path).is_some()
+}
+
 fn manifest_kind(path: &RepoPath) -> Option<ManifestKind> {
     let file_name = file_name(path);
 
