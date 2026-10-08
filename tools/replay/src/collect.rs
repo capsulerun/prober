@@ -46,9 +46,15 @@ pub fn run(arguments: &CollectArguments) -> Result<String> {
         .collect();
     let mut downloaded_log_count = 0;
     let mut unavailable_log_count = 0;
+    let mut skipped_run_count = 0;
 
     for new_run in &new_runs {
-        let failed_test_jobs = failed_jobs(&config, new_run)?
+        let Ok(failed_jobs) = failed_jobs(&config, new_run) else {
+            skipped_run_count += 1;
+
+            continue;
+        };
+        let failed_test_jobs = failed_jobs
             .into_iter()
             .filter(|failed_job| test_jobs.matches(&failed_job.name));
 
@@ -80,9 +86,9 @@ pub fn run(arguments: &CollectArguments) -> Result<String> {
     }
 
     Ok(format!(
-        "prober-replay: {} failed runs in the snapshot, {} new; {downloaded_log_count} failed test job logs downloaded, {unavailable_log_count} unavailable (expired or not found)",
+        "prober-replay: {} failed runs in the snapshot, {} new; {downloaded_log_count} failed test job logs downloaded, {unavailable_log_count} unavailable (expired or not found); {skipped_run_count} runs skipped after an error, rerun to retry them",
         runs.len(),
-        new_runs.len()
+        new_runs.len() - skipped_run_count
     ))
 }
 

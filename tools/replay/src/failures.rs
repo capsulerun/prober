@@ -11,6 +11,7 @@ use serde::Serialize;
 
 use crate::config::HarnessConfig;
 use crate::logs::failed_test_file_paths;
+use crate::repository_files::RepositoryFiles;
 use crate::snapshot::{CiRun, Snapshot};
 
 const SECONDS_PER_HOUR: i64 = 3_600;
@@ -22,6 +23,12 @@ pub struct FailuresArguments {
 
     #[arg(long, help = "Snapshot directory written by collect")]
     snapshot: PathBuf,
+
+    #[arg(
+        long,
+        help = "Clone of the benchmarked repository: a reported path missing from it is matched to the only file ending with it (runners started in a package directory)"
+    )]
+    repo: Option<PathBuf>,
 }
 
 #[derive(Serialize)]
@@ -37,6 +44,7 @@ struct FailureRecord<'a> {
     file: &'a str,
     runs: Vec<u64>,
     pre_existing: bool,
+    in_repository: bool,
 }
 
 struct RunFailures<'a> {
@@ -58,8 +66,14 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
         .clone()
         .map(RepoPath::new)
         .transpose()?;
+    let repository_files = arguments
+        .repo
+        .as_deref()
+        .map(|repository| RepositoryFiles::read(repository, &config.base_branch))
+        .transpose()?;
     let extractor = FailureExtractor {
         snapshot: &snapshot,
+        repository_files: repository_files.as_ref(),
         report_paths: ReportPaths::new(&config.ci_workspace(), runner_directory),
     };
     let run_failures = runs
@@ -106,6 +120,9 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
                 file: file.as_str(),
                 runs: failed_runs.iter().map(|run| run.database_id).collect(),
                 pre_existing,
+                in_repository: repository_files
+                    .as_ref()
+                    .is_none_or(|repository_files| repository_files.contains(file)),
             };
 
             failures_lines.push_str(&(serde_json::to_string(&failure_record)? + "\n"));
@@ -129,6 +146,7 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
 struct FailureExtractor<'a> {
     snapshot: &'a Snapshot,
     report_paths: ReportPaths,
+    repository_files: Option<&'a RepositoryFiles>,
 }
 
 impl FailureExtractor<'_> {
@@ -142,7 +160,8 @@ impl FailureExtractor<'_> {
             failed_files.extend(
                 reported_paths
                     .iter()
-                    .filter_map(|reported_path| self.report_paths.resolve(reported_path)),
+                    .filter_map(|reported_path| self.report_paths.resolve(reported_path))
+                    .map(|file| self.located(file)),
             );
         }
 
@@ -159,10 +178,19 @@ impl FailureExtractor<'_> {
             outcomes
                 .files()
                 .filter(|outcome| outcome.status == TestStatus::Failed)
-                .map(|outcome| outcome.file.clone()),
+                .map(|outcome| self.located(outcome.file.clone())),
         );
 
         Ok(RunFailures { run, failed_files })
+    }
+}
+
+impl FailureExtractor<'_> {
+    fn located(&self, file: RepoPath) -> RepoPath {
+        match self.repository_files {
+            Some(repository_files) => repository_files.locate(file),
+            None => file,
+        }
     }
 }
 

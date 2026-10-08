@@ -109,9 +109,76 @@ fn failed_pull_request_runs_become_changes_with_their_failed_test_files() {
     assert_eq!(
         failures,
         concat!(
-            "{\"change\":\"aaa\",\"file\":\"src/a.test.ts\",\"runs\":[101,102],\"pre_existing\":false}\n",
-            "{\"change\":\"bbb\",\"file\":\"src/b.test.ts\",\"runs\":[103],\"pre_existing\":true}\n",
-            "{\"change\":\"bbb\",\"file\":\"src/c.test.ts\",\"runs\":[103],\"pre_existing\":false}\n",
+            "{\"change\":\"aaa\",\"file\":\"src/a.test.ts\",\"runs\":[101,102],\"pre_existing\":false,\"in_repository\":true}\n",
+            "{\"change\":\"bbb\",\"file\":\"src/b.test.ts\",\"runs\":[103],\"pre_existing\":true,\"in_repository\":true}\n",
+            "{\"change\":\"bbb\",\"file\":\"src/c.test.ts\",\"runs\":[103],\"pre_existing\":false,\"in_repository\":true}\n",
+        )
+    );
+}
+
+fn git(directory: &Path, arguments: &[&str]) {
+    let output = Command::new("git")
+        .args(arguments)
+        .current_dir(directory)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "Prober Tests")
+        .env("GIT_AUTHOR_EMAIL", "tests@prober.invalid")
+        .env("GIT_COMMITTER_NAME", "Prober Tests")
+        .env("GIT_COMMITTER_EMAIL", "tests@prober.invalid")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "git {arguments:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn paths_reported_from_a_package_directory_are_matched_to_repository_files() {
+    let directory = TempDir::new().unwrap();
+    let repository = directory.path().join("repo");
+
+    for file in [
+        "src/a.test.ts",
+        "ui/src/pages/chat.test.ts",
+        "packages/one/src/index.test.ts",
+        "packages/two/src/index.test.ts",
+    ] {
+        write(&repository.join(file), "export {};");
+    }
+
+    git(&repository, &["init", "--quiet", "--initial-branch=main"]);
+    git(&repository, &["add", "--all"]);
+    git(&repository, &["commit", "--quiet", "--message", "files"]);
+    write(&directory.path().join("config.toml"), CONFIG);
+    write(
+        &directory.path().join("snapshot/runs.jsonl"),
+        "{\"databaseId\":201,\"event\":\"pull_request\",\"headSha\":\"aaa\",\"headBranch\":\"fix/ui\",\"createdAt\":\"2026-10-08T10:00:00Z\",\"url\":\"https://github.com/acme/app/actions/runs/201\"}\n",
+    );
+    write(
+        &directory.path().join("snapshot/logs/201/1.log"),
+        "2026-10-08T10:05:00Z FAIL src/a.test.ts\n2026-10-08T10:05:01Z FAIL src/pages/chat.test.ts\n2026-10-08T10:05:02Z FAIL src/index.test.ts\n",
+    );
+
+    Command::new(env!("CARGO_BIN_EXE_prober-replay"))
+        .args(["failures", "--config"])
+        .arg(directory.path().join("config.toml"))
+        .arg("--snapshot")
+        .arg(directory.path().join("snapshot"))
+        .arg("--repo")
+        .arg(&repository)
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        fs::read_to_string(directory.path().join("snapshot/failures.jsonl")).unwrap(),
+        concat!(
+            "{\"change\":\"aaa\",\"file\":\"src/a.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}\n",
+            "{\"change\":\"aaa\",\"file\":\"src/index.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":false}\n",
+            "{\"change\":\"aaa\",\"file\":\"ui/src/pages/chat.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}\n",
         )
     );
 }

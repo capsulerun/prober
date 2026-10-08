@@ -11,7 +11,7 @@ use serde_json::Value;
 
 use crate::changes::Change;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReplayRecord {
     pub id: String,
     pub base: String,
