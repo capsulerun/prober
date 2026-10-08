@@ -309,10 +309,13 @@ struct JsonReport<'a> {
 #[derive(Serialize)]
 struct JsonModeReason<'a> {
     kind: &'static str,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     file: Option<&'a str>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pattern: Option<&'a str>,
+
     message: String,
 }
 

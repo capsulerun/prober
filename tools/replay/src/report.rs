@@ -58,6 +58,7 @@ struct RecordedFailure {
     change: String,
     file: String,
     pre_existing: bool,
+
     #[serde(default = "in_repository_when_unknown")]
     in_repository: bool,
 }

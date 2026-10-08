@@ -136,49 +136,142 @@ fn git(directory: &Path, arguments: &[&str]) {
     );
 }
 
-#[test]
-fn paths_reported_from_a_package_directory_are_matched_to_repository_files() {
-    let directory = TempDir::new().unwrap();
-    let repository = directory.path().join("repo");
-
-    for file in [
-        "src/a.test.ts",
-        "ui/src/pages/chat.test.ts",
-        "packages/one/src/index.test.ts",
-        "packages/two/src/index.test.ts",
-    ] {
+fn commit_files(repository: &Path, files: &[&str], message: &str) -> String {
+    for file in files {
         write(&repository.join(file), "export {};");
     }
 
-    git(&repository, &["init", "--quiet", "--initial-branch=main"]);
-    git(&repository, &["add", "--all"]);
-    git(&repository, &["commit", "--quiet", "--message", "files"]);
-    write(&directory.path().join("config.toml"), CONFIG);
+    git(repository, &["add", "--all"]);
+    git(repository, &["commit", "--quiet", "--message", message]);
+
+    let output = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(repository)
+        .output()
+        .unwrap();
+
+    String::from_utf8(output.stdout).unwrap().trim().to_owned()
+}
+
+fn run_line(run_id: u64, head_sha: &str) -> String {
+    format!(
+        "{{\"databaseId\":{run_id},\"event\":\"pull_request\",\"headSha\":\"{head_sha}\",\"headBranch\":\"fix/{run_id}\",\"createdAt\":\"2026-10-08T10:00:00Z\",\"url\":\"https://github.com/acme/app/actions/runs/{run_id}\"}}\n"
+    )
+}
+
+fn run_failures_with_repo(directory: &Path, config: &str) {
+    write(&directory.join("config.toml"), config);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_prober-replay"))
+        .args(["failures", "--config"])
+        .arg(directory.join("config.toml"))
+        .arg("--snapshot")
+        .arg(directory.join("snapshot"))
+        .arg("--repo")
+        .arg(directory.join("clone"))
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn paths_reported_from_a_package_directory_are_matched_to_repository_files() {
+    let directory = TempDir::new().unwrap();
+    let origin = directory.path().join("origin");
+
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+
+    let head = commit_files(
+        &origin,
+        &[
+            "src/a.test.ts",
+            "ui/src/pages/chat.test.ts",
+            "packages/one/src/index.test.ts",
+            "packages/two/src/index.test.ts",
+        ],
+        "files",
+    );
+
+    git(directory.path(), &["clone", "--quiet", "origin", "clone"]);
     write(
         &directory.path().join("snapshot/runs.jsonl"),
-        "{\"databaseId\":201,\"event\":\"pull_request\",\"headSha\":\"aaa\",\"headBranch\":\"fix/ui\",\"createdAt\":\"2026-10-08T10:00:00Z\",\"url\":\"https://github.com/acme/app/actions/runs/201\"}\n",
+        &run_line(201, &head),
     );
     write(
         &directory.path().join("snapshot/logs/201/1.log"),
         "2026-10-08T10:05:00Z FAIL src/a.test.ts\n2026-10-08T10:05:01Z FAIL src/pages/chat.test.ts\n2026-10-08T10:05:02Z FAIL src/index.test.ts\n",
     );
-
-    Command::new(env!("CARGO_BIN_EXE_prober-replay"))
-        .args(["failures", "--config"])
-        .arg(directory.path().join("config.toml"))
-        .arg("--snapshot")
-        .arg(directory.path().join("snapshot"))
-        .arg("--repo")
-        .arg(&repository)
-        .output()
-        .unwrap();
+    run_failures_with_repo(directory.path(), CONFIG);
 
     assert_eq!(
         fs::read_to_string(directory.path().join("snapshot/failures.jsonl")).unwrap(),
-        concat!(
-            "{\"change\":\"aaa\",\"file\":\"src/a.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}\n",
-            "{\"change\":\"aaa\",\"file\":\"src/index.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":false}\n",
-            "{\"change\":\"aaa\",\"file\":\"ui/src/pages/chat.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}\n",
+        format!(
+            "{{\"change\":\"{head}\",\"file\":\"src/a.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}}\n{{\"change\":\"{head}\",\"file\":\"src/index.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":false}}\n{{\"change\":\"{head}\",\"file\":\"ui/src/pages/chat.test.ts\",\"runs\":[201],\"pre_existing\":false,\"in_repository\":true}}\n"
+        )
+    );
+}
+
+#[test]
+fn each_change_is_based_on_its_nearest_base_branch() {
+    let directory = TempDir::new().unwrap();
+    let origin = directory.path().join("origin");
+
+    fs::create_dir_all(&origin).unwrap();
+    git(&origin, &["init", "--quiet", "--initial-branch=main"]);
+    commit_files(&origin, &["src/a.test.ts"], "base");
+    git(&origin, &["switch", "--quiet", "--create", "minor"]);
+
+    for minor_commit in 1..=3 {
+        commit_files(
+            &origin,
+            &[&format!("src/minor-{minor_commit}.ts")],
+            "minor work",
+        );
+    }
+
+    git(&origin, &["switch", "--quiet", "--create", "fix/minor"]);
+
+    let head_on_minor = commit_files(&origin, &["src/fix-minor.ts"], "fix on minor");
+
+    git(&origin, &["switch", "--quiet", "main"]);
+    git(&origin, &["switch", "--quiet", "--create", "fix/main"]);
+
+    let head_on_main = commit_files(&origin, &["src/fix-main.ts"], "fix on main");
+
+    git(&origin, &["switch", "--quiet", "main"]);
+    git(
+        directory.path(),
+        &["clone", "--quiet", "--single-branch", "origin", "clone"],
+    );
+    write(
+        &directory.path().join("snapshot/runs.jsonl"),
+        &(run_line(301, &head_on_minor) + &run_line(302, &head_on_main)),
+    );
+
+    for run_id in [301, 302] {
+        write(
+            &directory
+                .path()
+                .join(format!("snapshot/logs/{run_id}/1.log")),
+            "2026-10-08T10:05:00Z FAIL src/a.test.ts\n",
+        );
+    }
+
+    run_failures_with_repo(
+        directory.path(),
+        &format!("{CONFIG}extra_base_branches = [\"minor\"]\n"),
+    );
+
+    assert_eq!(
+        fs::read_to_string(directory.path().join("snapshot/changes.jsonl")).unwrap(),
+        format!(
+            "{{\"id\":\"{head_on_minor}\",\"base\":\"origin/minor\",\"head\":\"{head_on_minor}\"}}\n{{\"id\":\"{head_on_main}\",\"base\":\"origin/main\",\"head\":\"{head_on_main}\"}}\n"
         )
     );
 }

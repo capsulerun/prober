@@ -9,6 +9,7 @@ use prober_core::junit::{ReportPaths, read_junit_report};
 use prober_core::outcomes::{TestOutcomes, TestStatus};
 use serde::Serialize;
 
+use crate::base_branches::BaseBranches;
 use crate::config::HarnessConfig;
 use crate::logs::failed_test_file_paths;
 use crate::repository_files::RepositoryFiles;
@@ -26,7 +27,7 @@ pub struct FailuresArguments {
 
     #[arg(
         long,
-        help = "Clone of the benchmarked repository: a reported path missing from it is matched to the only file ending with it (runners started in a package directory)"
+        help = "Clone of the benchmarked repository: a reported path missing from it is matched to the only file ending with it (runners started in a package directory), and each change is based on its nearest base branch"
     )]
     repo: Option<PathBuf>,
 }
@@ -34,7 +35,7 @@ pub struct FailuresArguments {
 #[derive(Serialize)]
 struct ChangeRecord<'a> {
     id: &'a str,
-    base: &'a str,
+    base: String,
     head: &'a str,
 }
 
@@ -66,6 +67,12 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
         .clone()
         .map(RepoPath::new)
         .transpose()?;
+    let base_branch_names = config.base_branches();
+    let base_branches = arguments
+        .repo
+        .as_deref()
+        .map(|repository| BaseBranches::fetch(repository, &base_branch_names))
+        .transpose()?;
     let repository_files = arguments
         .repo
         .as_deref()
@@ -85,7 +92,7 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
         .partition(|run_failures| run_failures.run.is_pull_request());
     let base_branch_failures: Vec<RunFailures> = other_failures
         .into_iter()
-        .filter(|run_failures| run_failures.run.head_branch == config.base_branch)
+        .filter(|run_failures| base_branch_names.contains(&run_failures.run.head_branch))
         .collect();
     let runs_without_failed_test_file = pull_request_failures
         .iter()
@@ -102,7 +109,10 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
     for change in &change_failures {
         let change_record = ChangeRecord {
             id: change.head,
-            base: &config.base_branch,
+            base: base_branches.as_ref().map_or_else(
+                || config.base_branch.clone(),
+                |base_branches| base_branches.nearest_to(change.head),
+            ),
             head: change.head,
         };
 

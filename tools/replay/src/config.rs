@@ -13,14 +13,22 @@ pub struct HarnessConfig {
     pub repository: String,
     pub workflow: String,
     pub base_branch: String,
+
+    #[serde(default)]
+    pub extra_base_branches: Vec<String>,
+
     #[serde(default)]
     pub test_jobs: Vec<String>,
+
     #[serde(default)]
     pub junit_artifacts: Vec<String>,
+
     #[serde(default)]
     pub runner_directory: Option<String>,
+
     #[serde(default)]
     pub ci_workspace: Option<PathBuf>,
+
     #[serde(default = "default_pre_existing_window_hours")]
     pub pre_existing_window_hours: u64,
 }
@@ -32,6 +40,12 @@ impl HarnessConfig {
 
         toml::from_str(&config_text)
             .map_err(|error| anyhow!("invalid {}: {}", config_path.display(), error.message()))
+    }
+
+    pub fn base_branches(&self) -> Vec<String> {
+        std::iter::once(self.base_branch.clone())
+            .chain(self.extra_base_branches.iter().cloned())
+            .collect()
     }
 
     pub fn test_job_matcher(&self) -> Result<NameMatcher> {
