@@ -7,6 +7,8 @@ use crate::dynamic::summary::FunctionIndex;
 
 pub(crate) const MAX_ALTERNATIVES: usize = 64;
 
+pub(crate) const OPEN_OBJECT: &str = "\u{0}open";
+
 const EXTERNAL_SCHEMES: [&str; 5] = ["data:", "node:", "http:", "https:", "blob:"];
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -306,11 +308,14 @@ pub(crate) enum Builtin {
     ObjectConstructor,
     ObjectKeys,
     ObjectValues,
+    DefineConfig,
+    MergeConfig,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Value {
     Strings(Vec<Pattern>),
+    Boolean(bool),
     Function(FunctionRef),
     Module(RepoPath),
     Builtin(Builtin),
@@ -370,6 +375,119 @@ impl Value {
             },
             _ => None,
         }
+    }
+}
+
+pub(crate) fn merge_objects(values: Vec<Value>) -> Value {
+    let mut properties = Vec::new();
+
+    for value in values {
+        match value {
+            Value::Object(spread_properties) => {
+                for (key, value) in spread_properties {
+                    set_property(&mut properties, key, value);
+                }
+            }
+            Value::Alternatives(choices)
+                if choices
+                    .iter()
+                    .all(|choice| matches!(choice, Value::Object(_))) =>
+            {
+                let mut keys: Vec<String> = Vec::new();
+
+                for choice in &choices {
+                    if let Value::Object(choice_properties) = choice {
+                        for (key, _) in choice_properties {
+                            if !keys.contains(key) {
+                                keys.push(key.clone());
+                            }
+                        }
+                    }
+                }
+
+                for key in keys {
+                    let values = choices
+                        .iter()
+                        .map(|choice| property(choice, &key))
+                        .collect::<Option<Vec<Value>>>();
+                    let value = values.map_or_else(Value::runtime_value, alternatives);
+
+                    set_property(&mut properties, key, value);
+                }
+            }
+            _ => {
+                for (_, value) in &mut properties {
+                    *value = Value::runtime_value();
+                }
+
+                set_property(
+                    &mut properties,
+                    OPEN_OBJECT.to_owned(),
+                    Value::runtime_value(),
+                );
+            }
+        }
+    }
+
+    Value::Object(properties)
+}
+
+pub(crate) fn merge_config(defaults: Value, overrides: Value) -> Value {
+    match (defaults, overrides) {
+        (Value::Object(mut properties), Value::Object(override_properties)) => {
+            for (key, value) in override_properties {
+                let merged = match property(&Value::Object(properties.clone()), &key) {
+                    Some(existing) if key != OPEN_OBJECT => merge_config(existing, value),
+                    _ => value,
+                };
+
+                set_property(&mut properties, key, merged);
+            }
+
+            Value::Object(properties)
+        }
+        (Value::Array(mut items), Value::Array(more_items)) => {
+            items.extend(more_items);
+
+            Value::Array(items)
+        }
+        (Value::Array(mut items), item @ Value::Strings(_)) => {
+            items.push(item);
+
+            Value::Array(items)
+        }
+        (item @ Value::Strings(_), Value::Array(more_items)) => {
+            let mut items = vec![item];
+
+            items.extend(more_items);
+
+            Value::Array(items)
+        }
+        (_, overrides) => overrides,
+    }
+}
+
+pub(crate) fn property(object: &Value, key: &str) -> Option<Value> {
+    match object {
+        Value::Object(properties) => properties
+            .iter()
+            .find(|(property_key, _)| property_key == key)
+            .map(|(_, value)| value.clone()),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_open_object(object: &Value) -> bool {
+    property(object, OPEN_OBJECT).is_some()
+}
+
+fn set_property(properties: &mut Vec<(String, Value)>, key: String, value: Value) {
+    match properties
+        .iter_mut()
+        .find(|(property_key, _)| *property_key == key)
+    {
+        Some((_, existing)) => *existing = value,
+        None => properties.push((key, value)),
     }
 }
 

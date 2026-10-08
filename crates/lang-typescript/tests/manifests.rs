@@ -2,100 +2,9 @@
 
 mod test_project;
 
-use std::collections::HashMap;
+use prober_core::changes::ChangeKind;
 
-use anyhow::Result;
-use prober_core::changes::{BaseRevision, ChangeKind, FileChange};
-use prober_core::files::RepoPath;
-use prober_core::graph::GraphBuilder;
-use prober_core::report::{ModeReason, Report};
-use prober_core::select::{Widening, select_tests};
-use prober_lang_typescript::{ManifestChanges, TypeScriptLinker};
-
-use crate::test_project::{TestProject, change, repo_path};
-
-struct BaseFiles(HashMap<RepoPath, Vec<u8>>);
-
-impl BaseRevision for BaseFiles {
-    fn read_file(&self, path: &RepoPath) -> Result<Option<Vec<u8>>> {
-        Ok(self.0.get(path).cloned())
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum Outcome {
-    All(Vec<String>),
-    Selected(Vec<(String, Vec<String>)>),
-}
-
-fn outcome_of(
-    project: &TestProject,
-    base_files: &[(&str, &str)],
-    changes: &[FileChange],
-) -> Outcome {
-    let repo_files = project.repo_files();
-    let base_files = BaseFiles(
-        base_files
-            .iter()
-            .map(|&(path, content)| (repo_path(path), content.as_bytes().to_vec()))
-            .collect(),
-    );
-    let manifest_changes =
-        ManifestChanges::between(project.root(), &repo_files, changes, &base_files).unwrap();
-    let global_reasons = manifest_changes.global_reasons();
-
-    if !global_reasons.is_empty() {
-        return Outcome::All(global_reasons.iter().map(ModeReason::message).collect());
-    }
-
-    let linker = TypeScriptLinker::new(project.root(), &repo_files).unwrap();
-    let mut builder = GraphBuilder::default();
-
-    linker
-        .link_changes(&repo_files, &manifest_changes, &mut builder)
-        .unwrap();
-
-    let graph = builder.build();
-    let root_scope_reasons = linker
-        .root_scope_reasons(&graph, &repo_files, &manifest_changes)
-        .unwrap();
-
-    if !root_scope_reasons.is_empty() {
-        return Outcome::All(root_scope_reasons.iter().map(ModeReason::message).collect());
-    }
-
-    let selected_tests = select_tests(&graph, changes, Widening::Scoped);
-    let report = Report::from_selection(&graph, changes, &selected_tests, String::new());
-
-    Outcome::Selected(
-        report
-            .targets
-            .into_iter()
-            .map(|target| (target.path.to_string(), target.impact.unwrap().reason))
-            .collect(),
-    )
-}
-
-fn modified(path: &str) -> FileChange {
-    change(path, ChangeKind::Modified)
-}
-
-fn selected(tests: &[(&str, &[&str])]) -> Outcome {
-    Outcome::Selected(
-        tests
-            .iter()
-            .map(|(test, reason)| {
-                let reason = reason.iter().map(|&hop| hop.to_owned()).collect();
-
-                ((*test).to_owned(), reason)
-            })
-            .collect(),
-    )
-}
-
-fn all(messages: &[&str]) -> Outcome {
-    Outcome::All(messages.iter().map(|&message| message.to_owned()).collect())
-}
+use crate::test_project::{Outcome, TestProject, all, change, modified, selected};
 
 const PNPM_LOCK: &str = "lockfileVersion: '9.0'
 
@@ -144,8 +53,7 @@ fn metadata_change_selects_only_the_tests_that_import_the_manifest() {
     let base_manifest = r#"{ "version": "1.0.0", "scripts": { "build": "tsc" } }"#;
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("package.json", base_manifest)],
             &[modified("package.json")]
         ),
@@ -168,8 +76,7 @@ fn lockfile_bump_selects_the_importers_of_the_package_and_of_its_dependents() {
     let project = server_project("{}", &head_lock);
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("pnpm-lock.yaml", PNPM_LOCK)],
             &[modified("pnpm-lock.yaml")]
         ),
@@ -202,8 +109,7 @@ fn dependency_bump_without_a_lockfile_change_selects_the_package_its_dependents_
     let base_manifest = r#"{ "dependencies": { "debug": "^4.3.4" } }"#;
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("package.json", base_manifest)],
             &[modified("package.json")]
         ),
@@ -247,8 +153,7 @@ fn patch_change_selects_the_importers_of_the_patched_package() {
     );
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[],
             &[change("patches/lodash@4.17.21.patch", ChangeKind::Added)]
         ),
@@ -299,8 +204,7 @@ fn exports_change_selects_the_files_whose_imports_resolve_differently() {
     let project = workspace_project(&LIB_MANIFEST.replace("./src/utils.ts", "./src/utils-v2.ts"));
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("packages/lib/package.json", LIB_MANIFEST)],
             &[modified("packages/lib/package.json")]
         ),
@@ -319,8 +223,7 @@ fn exports_change_selects_the_files_whose_imports_resolve_differently() {
 fn type_change_selects_the_tests_of_every_module_of_the_package() {
     let project =
         workspace_project(&LIB_MANIFEST.replace("\"name\"", "\"type\": \"module\", \"name\""));
-    let outcome = outcome_of(
-        &project,
+    let outcome = project.outcome_of(
         &[("packages/lib/package.json", LIB_MANIFEST)],
         &[modified("packages/lib/package.json")],
     );
@@ -353,8 +256,7 @@ fn type_change_selects_the_tests_of_every_module_of_the_package() {
 fn renamed_workspace_package_changes_the_resolution_of_its_importers() {
     let project = workspace_project(&LIB_MANIFEST.replace("@acme/lib", "@acme/core"));
 
-    let outcome = outcome_of(
-        &project,
+    let outcome = project.outcome_of(
         &[("packages/lib/package.json", LIB_MANIFEST)],
         &[modified("packages/lib/package.json")],
     );
@@ -389,8 +291,7 @@ fn tsconfig_paths_change_selects_the_files_whose_aliases_resolve_differently() {
     ]);
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("tsconfig.json", base_tsconfig)],
             &[modified("tsconfig.json")]
         ),
@@ -432,8 +333,7 @@ packages:
 
         project.write("pnpm-lock.yaml", &head_lock);
 
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("pnpm-lock.yaml", base_lock)],
             &[modified("pnpm-lock.yaml")],
         )
@@ -496,7 +396,7 @@ fn unknown_fields_global_compiler_options_and_unparsable_files_run_every_test() 
     ];
 
     assert_eq!(
-        outcome_of(&project, &base_files, &changes),
+        project.outcome_of(&base_files, &changes),
         all(&[
             "package.json (modified) changes \"browserslist\", which may affect every test",
             "pnpm-lock.yaml (modified) cannot be diffed: lockfileVersion 5.4 is not supported",
@@ -515,8 +415,7 @@ fn added_and_deleted_manifests_are_diffed_against_an_empty_one() {
     );
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[("packages/old/package.json", r#"{ "name": "@acme/old" }"#)],
             &[
                 change("packages/new/package.json", ChangeKind::Added),
@@ -539,8 +438,7 @@ fn workspace_dependencies_and_template_manifests_change_no_installed_package() {
     project.write("packages/web/template/package.json", template_manifest);
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[
                 (
                     "packages/web/package.json",
@@ -597,8 +495,7 @@ snapshots:
     ]);
 
     assert_eq!(
-        outcome_of(
-            &project,
+        project.outcome_of(
             &[
                 (
                     "package.json",

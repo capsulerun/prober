@@ -1,5 +1,5 @@
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{HashMap, HashSet};
 
 use crate::files::{FileId, FileTable, RepoPath};
 
@@ -9,12 +9,18 @@ pub enum EdgeKind {
     TypeOnly,
     Dynamic,
     Contains,
+    Asset,
+    Reads,
 }
 
 impl EdgeKind {
     pub fn selects_tests(self) -> bool {
         match self {
-            EdgeKind::Import | EdgeKind::Dynamic | EdgeKind::Contains => true,
+            EdgeKind::Import
+            | EdgeKind::Dynamic
+            | EdgeKind::Contains
+            | EdgeKind::Asset
+            | EdgeKind::Reads => true,
             EdgeKind::TypeOnly => false,
         }
     }
@@ -118,6 +124,9 @@ pub struct GraphBuilder {
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
     changed_parts: Vec<ChangedPart>,
+    mocked_modules: HashMap<FileId, Vec<FileId>>,
+    changed_contracts: HashSet<FileId>,
+    asset_blind_tests: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
@@ -164,6 +173,21 @@ impl GraphBuilder {
             node,
             description,
         });
+    }
+
+    pub fn add_mock(&mut self, test: FileId, mocked_module: FileId) {
+        self.mocked_modules
+            .entry(test)
+            .or_default()
+            .push(mocked_module);
+    }
+
+    pub fn mark_changed_contract(&mut self, module: FileId) {
+        self.changed_contracts.insert(module);
+    }
+
+    pub fn mark_asset_blind(&mut self, test: FileId) {
+        self.asset_blind_tests.insert(test);
     }
 
     pub fn add_language(&mut self, language: &'static str, loads: ModuleFilter) {
@@ -220,6 +244,11 @@ impl GraphBuilder {
         });
         self.changed_parts.dedup();
 
+        for mocked_modules in self.mocked_modules.values_mut() {
+            mocked_modules.sort();
+            mocked_modules.dedup();
+        }
+
         Graph {
             files: self.files,
             test_languages: self.test_languages,
@@ -228,6 +257,9 @@ impl GraphBuilder {
             inferences: self.inferences,
             unresolved_sites: self.unresolved_sites,
             changed_parts: self.changed_parts,
+            mocked_modules: self.mocked_modules,
+            changed_contracts: self.changed_contracts,
+            asset_blind_tests: self.asset_blind_tests,
             module_filters: self.module_filters,
         }
     }
@@ -242,6 +274,9 @@ pub struct Graph {
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
     changed_parts: Vec<ChangedPart>,
+    mocked_modules: HashMap<FileId, Vec<FileId>>,
+    changed_contracts: HashSet<FileId>,
+    asset_blind_tests: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
@@ -316,6 +351,24 @@ impl Graph {
 
     pub fn changed_parts(&self) -> &[ChangedPart] {
         &self.changed_parts
+    }
+
+    pub fn mocked_modules(&self, test: FileId) -> &[FileId] {
+        self.mocked_modules.get(&test).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn has_changed_contract(&self, module: FileId) -> bool {
+        self.changed_contracts.contains(&module)
+    }
+
+    pub fn is_asset_blind(&self, test: FileId) -> bool {
+        self.asset_blind_tests.contains(&test)
+    }
+
+    pub fn is_asset(&self, file: FileId) -> bool {
+        let dependents = self.dependents(file);
+
+        !dependents.is_empty() && dependents.iter().all(|edge| edge.kind == EdgeKind::Asset)
     }
 }
 
@@ -422,7 +475,39 @@ mod tests {
         assert!(EdgeKind::Import.selects_tests());
         assert!(EdgeKind::Dynamic.selects_tests());
         assert!(EdgeKind::Contains.selects_tests());
+        assert!(EdgeKind::Asset.selects_tests());
+        assert!(EdgeKind::Reads.selects_tests());
         assert!(!EdgeKind::TypeOnly.selects_tests());
+    }
+
+    #[test]
+    fn asset_is_a_file_only_imported_as_an_asset() {
+        let mut builder = GraphBuilder::default();
+        let button = builder.add_file(repo_path("src/button.ts"));
+        let styles = builder.add_file(repo_path("src/button.css"));
+        let shared = builder.add_file(repo_path("src/shared.css"));
+        let theme = builder.add_file(repo_path("src/theme.ts"));
+        let unused = builder.add_file(repo_path("src/unused.css"));
+        let asset_edges = [
+            (button, styles, EdgeKind::Asset),
+            (button, shared, EdgeKind::Asset),
+        ];
+        let other_edges = [(theme, shared, EdgeKind::Import)];
+
+        for (dependent, dependency, kind) in asset_edges.into_iter().chain(other_edges) {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        let graph = builder.build();
+
+        assert!(graph.is_asset(styles));
+        assert!(!graph.is_asset(shared));
+        assert!(!graph.is_asset(unused));
+        assert!(!graph.is_asset(button));
     }
 
     #[test]

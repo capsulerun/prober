@@ -499,6 +499,133 @@ fn exports_change_selects_the_tests_whose_imports_resolve_elsewhere() {
     );
 }
 
+fn repository_with_vitest() -> TestRepository {
+    TestRepository::with_files_on_main(&[
+        (
+            "package.json",
+            r#"{ "name": "app", "devDependencies": { "vitest": "^3.2.0" } }"#,
+        ),
+        (
+            "vitest.config.ts",
+            r#"
+                import { defineConfig } from "vitest/config";
+                import { slowTests } from "./test/slow-tests.mjs";
+
+                export default defineConfig({
+                    test: { setupFiles: ["test/setup.ts"], exclude: [...slowTests, "**/node_modules/**"] },
+                });
+            "#,
+        ),
+        (
+            "test/slow-tests.mjs",
+            r#"export const slowTests = ["src/a.test.ts"];"#,
+        ),
+        ("test/setup.ts", "globalThis.ready = true;"),
+    ])
+}
+
+#[test]
+fn setup_file_change_runs_every_test_with_a_root_scope_reason() {
+    let repository = repository_with_vitest();
+
+    repository.change_and_commit("test/setup.ts", "globalThis.ready = false;");
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(report["mode"], "all");
+    assert_eq!(
+        report["mode_reasons"],
+        json!([{
+            "kind": "root_scope",
+            "file": "test/setup.ts",
+            "message": "test/setup.ts (modified) is loaded before every test",
+        }])
+    );
+}
+
+#[test]
+fn test_list_edit_in_a_runner_config_selects_the_tests_it_moves() {
+    let repository = repository_with_vitest();
+
+    repository.change_and_commit(
+        "test/slow-tests.mjs",
+        r#"export const slowTests = ["src/b.test.ts"];"#,
+    );
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["targets"],
+        json!({ "typescript": ["src/a.test.ts", "src/b.test.ts"] })
+    );
+    assert_eq!(
+        report["reasons"]["src/b.test.ts"],
+        json!([
+            "test/slow-tests.mjs (modified)",
+            "-> src/b.test.ts matches \"src/b.test.ts\", which changed",
+        ])
+    );
+}
+
+#[test]
+fn runner_config_change_is_root_scope_with_presets_and_global_without() {
+    let with_presets = repository_with_vitest();
+    let without_presets = repository_with_vitest();
+
+    without_presets.write("prober.toml", "presets = []\n");
+
+    for repository in [&with_presets, &without_presets] {
+        let config = fs::read_to_string(repository.path().join("vitest.config.ts")).unwrap();
+
+        repository.change_and_commit(
+            "vitest.config.ts",
+            &config.replace("setupFiles", "isolate: false, setupFiles"),
+        );
+    }
+
+    assert_eq!(
+        with_presets.prober(&["--base", "main"]).stderr,
+        "prober: all 2 test files — vitest.config.ts (modified) configures the test runner of every test\n"
+    );
+    assert_eq!(
+        without_presets.prober(&["--base", "main"]).stderr,
+        "prober: all 2 test files — vitest.config.ts (modified) matches always_all \"**/vitest.*\"\n"
+    );
+}
+
+#[test]
+fn closed_mock_keeps_its_test_out_of_body_changes_until_the_exports_change() {
+    let repository = TestRepository::with_files_on_main(&[
+        ("src/db.ts", "export function query() { return 1; }"),
+        (
+            "src/a.ts",
+            r#"import { query } from "./db"; export const a = query();"#,
+        ),
+        (
+            "src/a.test.ts",
+            r#"vi.mock("./db", () => ({ query: () => 0 })); import { a } from "./a";"#,
+        ),
+    ]);
+
+    repository.change_and_commit("src/db.ts", "export function query() { return 2; }");
+
+    let body_change = repository.prober(&["--base", "main"]);
+
+    repository.change_and_commit(
+        "src/db.ts",
+        "export function query() { return 2; }\nexport function close() {}",
+    );
+
+    let export_change = repository.prober(&["--base", "main"]);
+
+    assert_eq!(body_change.stdout, "src/b.test.ts\n");
+    assert_eq!(export_change.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+}
+
 #[test]
 fn manifests_switched_off_keep_package_json_global() {
     let repository = TestRepository::with_project_on_main();
@@ -534,7 +661,7 @@ fn configured_global_file_change_runs_every_test() {
 fn invalid_config_runs_every_test_with_an_error_reason() {
     let repository = TestRepository::with_project_on_main();
 
-    repository.change_and_commit("prober.toml", "presets = \"auto\"\n");
+    repository.change_and_commit("prober.toml", "anchors = true\n");
 
     let report = repository
         .prober(&["--base", "main", "--format", "json"])
@@ -545,7 +672,7 @@ fn invalid_config_runs_every_test_with_an_error_reason() {
         report["mode_reasons"],
         json!([{
             "kind": "error",
-            "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
+            "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
         }])
     );
     assert_eq!(report["stats"]["tests_selected"], 2);
@@ -555,7 +682,7 @@ fn invalid_config_runs_every_test_with_an_error_reason() {
 fn on_error_fail_exits_with_the_error() {
     let repository = TestRepository::with_project_on_main();
 
-    repository.change_and_commit("prober.toml", "presets = \"auto\"\n");
+    repository.change_and_commit("prober.toml", "anchors = true\n");
 
     let run = repository.prober(&["--base", "main", "--on-error", "fail"]);
 
@@ -563,7 +690,7 @@ fn on_error_fail_exits_with_the_error() {
     assert_eq!(run.stdout, "");
     assert_eq!(
         run.stderr,
-        "prober: invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`\n"
+        "prober: invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`\n"
     );
 }
 

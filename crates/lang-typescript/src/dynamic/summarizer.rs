@@ -5,12 +5,12 @@ use std::collections::HashMap;
 use oxc_allocator::Allocator;
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
-    Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionBody, BinaryOperator,
-    BindingPattern, CallExpression, ChainElement, Declaration, ExportDefaultDeclarationKind,
-    Expression, FormalParameter, IdentifierReference, ImportDeclarationSpecifier,
-    ImportOrExportKind, ModuleExportName, NewExpression, ObjectExpression, ObjectPattern,
-    ObjectPropertyKind, PropertyKind, Statement, StaticMemberExpression, TemplateLiteral,
-    VariableDeclarator,
+    Argument, ArrayExpression, ArrayExpressionElement, ArrowFunctionBody, AssignmentTarget,
+    BinaryOperator, BindingPattern, CallExpression, ChainElement, Declaration,
+    ExportDefaultDeclarationKind, Expression, FormalParameter, IdentifierReference,
+    ImportDeclarationSpecifier, ImportOrExportKind, ModuleExportName, NewExpression,
+    ObjectExpression, ObjectPattern, ObjectPropertyKind, PropertyKind, Statement,
+    StaticMemberExpression, TemplateLiteral, VariableDeclarator,
 };
 use oxc_parser::Parser;
 use oxc_semantic::{AstNode, AstNodes, NodeId, Scoping, Semantic, SemanticBuilder, SymbolId};
@@ -636,6 +636,21 @@ impl<'s, 'a> Summarizer<'s, 'a> {
                     }
                 }
             }
+            Statement::ExpressionStatement(expression_statement) => {
+                if let Expression::AssignmentExpression(assignment) =
+                    &expression_statement.expression
+                    && is_module_exports(&assignment.left)
+                {
+                    let value = self.expression(&assignment.right);
+
+                    summary.exports.push(("default".to_owned(), value));
+                }
+            }
+            Statement::TSExportAssignment(export_assignment) => {
+                let value = self.expression(&export_assignment.expression);
+
+                summary.exports.push(("default".to_owned(), value));
+            }
             Statement::ExportDefaultDeclaration(export_declaration) => {
                 let value = match &export_declaration.declaration {
                     ExportDefaultDeclarationKind::FunctionDeclaration(function) => {
@@ -739,6 +754,7 @@ impl<'s, 'a> Summarizer<'s, 'a> {
     fn expression_value(&mut self, expression: &'a Expression<'a>) -> Expr {
         match expression.get_inner_expression() {
             Expression::StringLiteral(literal) => Expr::Text(literal.value.to_string()),
+            Expression::BooleanLiteral(literal) => Expr::Boolean(literal.value),
             Expression::TemplateLiteral(template) => self.template(template),
             Expression::BinaryExpression(binary) if binary.operator == BinaryOperator::Addition => {
                 Expr::Concat(vec![
@@ -881,11 +897,21 @@ impl<'s, 'a> Summarizer<'s, 'a> {
     }
 
     fn object(&mut self, object: &'a ObjectExpression<'a>) -> Expr {
+        let mut parts = Vec::new();
         let mut properties = Vec::new();
 
         for property in &object.properties {
-            let ObjectPropertyKind::ObjectProperty(property) = property else {
-                return Expr::Unknown;
+            let property = match property {
+                ObjectPropertyKind::ObjectProperty(property) => property,
+                ObjectPropertyKind::SpreadProperty(spread) => {
+                    if !properties.is_empty() {
+                        parts.push(Expr::Object(std::mem::take(&mut properties)));
+                    }
+
+                    parts.push(self.expression(&spread.argument));
+
+                    continue;
+                }
             };
 
             if property.kind != PropertyKind::Init {
@@ -900,7 +926,15 @@ impl<'s, 'a> Summarizer<'s, 'a> {
             properties.push((key.to_string(), value));
         }
 
-        Expr::Object(properties)
+        if parts.is_empty() {
+            return Expr::Object(properties);
+        }
+
+        if !properties.is_empty() {
+            parts.push(Expr::Object(properties));
+        }
+
+        Expr::Merge(parts)
     }
 
     fn function_at(&self, node_id: NodeId) -> Expr {
@@ -1163,6 +1197,15 @@ impl<'s, 'a> Summarizer<'s, 'a> {
 
         format!("{truncated}…")
     }
+}
+
+fn is_module_exports(target: &AssignmentTarget) -> bool {
+    let AssignmentTarget::StaticMemberExpression(member) = target else {
+        return false;
+    };
+
+    member.property.name == "exports"
+        && matches!(&member.object, Expression::Identifier(object) if object.name == "module")
 }
 
 fn is_function_node(kind: AstKind) -> bool {

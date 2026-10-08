@@ -1,4 +1,4 @@
-use anyhow::{Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
 use xxhash_rust::xxh3::xxh3_64;
@@ -10,10 +10,26 @@ use crate::files::RepoPath;
 #[serde(deny_unknown_fields)]
 struct ConfigFile {
     #[serde(default)]
+    presets: PresetsField,
+
+    #[serde(default)]
     always_all: AlwaysAllSection,
 
     #[serde(default)]
     inference: InferenceSettings,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum PresetsField {
+    Choice(String),
+    List(Vec<String>),
+}
+
+impl Default for PresetsField {
+    fn default() -> Self {
+        PresetsField::Choice(AUTO_PRESETS.to_owned())
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -43,8 +59,47 @@ impl Default for InferenceSettings {
     }
 }
 
+pub const PRESETS: &[&str] = &[
+    "cypress",
+    "jest",
+    "mocha",
+    "node-test",
+    "playwright",
+    "vite",
+    "vitest",
+];
+
+const AUTO_PRESETS: &str = "auto";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Presets {
+    #[default]
+    Auto,
+    Only(Vec<String>),
+}
+
+impl Presets {
+    fn from_field(field: PresetsField) -> Result<Self> {
+        let names = match field {
+            PresetsField::Choice(choice) if choice == AUTO_PRESETS => return Ok(Presets::Auto),
+            PresetsField::Choice(name) => vec![name],
+            PresetsField::List(names) => names,
+        };
+
+        if let Some(unknown) = names.iter().find(|name| !PRESETS.contains(&name.as_str())) {
+            bail!(
+                "invalid prober.toml: unknown preset {unknown:?}, expected \"auto\" or some of {}",
+                PRESETS.join(", ")
+            );
+        }
+
+        Ok(Presets::Only(names))
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
+    pub presets: Presets,
     pub always_all: AlwaysAll,
     pub inference: InferenceSettings,
 }
@@ -57,6 +112,7 @@ impl Config {
             .map_err(|pattern_error| anyhow!("invalid prober.toml: {pattern_error}"))?;
 
         Ok(Self {
+            presets: Presets::from_field(config_file.presets)?,
             always_all,
             inference: config_file.inference,
         })
@@ -203,6 +259,25 @@ mod tests {
     }
 
     #[test]
+    fn presets_are_auto_detected_unless_listed() {
+        assert_eq!(Config::parse("").unwrap().presets, Presets::Auto);
+        assert_eq!(
+            Config::parse("presets = \"auto\"\n").unwrap().presets,
+            Presets::Auto
+        );
+        assert_eq!(
+            Config::parse("presets = [\"vitest\", \"jest\"]\n")
+                .unwrap()
+                .presets,
+            Presets::Only(vec!["vitest".to_owned(), "jest".to_owned()])
+        );
+        assert_eq!(
+            Config::parse("presets = []\n").unwrap().presets,
+            Presets::Only(Vec::new())
+        );
+    }
+
+    #[test]
     fn each_inference_switches_off_on_its_own() {
         let config = Config::parse("[inference]\nplugin_folders = false\n").unwrap();
 
@@ -290,8 +365,16 @@ mod tests {
                 "invalid prober.toml at line 2, column 9: invalid type: string \"ci/**\", expected a sequence",
             ),
             (
-                "presets = \"auto\"\n",
-                "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
+                "anchors = true\n",
+                "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
+            ),
+            (
+                "presets = [\"vitest\", \"pytest\"]\n",
+                "invalid prober.toml: unknown preset \"pytest\", expected \"auto\" or some of cypress, jest, mocha, node-test, playwright, vite, vitest",
+            ),
+            (
+                "presets = 3\n",
+                "invalid prober.toml at line 1, column 11: data did not match any variant of untagged enum PresetsField",
             ),
             (
                 "[inference]\nanchors = false\n",

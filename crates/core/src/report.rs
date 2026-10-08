@@ -55,6 +55,10 @@ pub enum ModeReason {
         change: FileChange,
         field: String,
     },
+    RootScope {
+        change: FileChange,
+        configures: bool,
+    },
     RootScopePackage {
         change: FileChange,
         package: String,
@@ -75,7 +79,7 @@ impl ModeReason {
             ModeReason::AlwaysAll { .. } => "always_all",
             ModeReason::UnparsableManifest { .. } => "unparsable_manifest",
             ModeReason::GlobalField { .. } => "global_field",
-            ModeReason::RootScopePackage { .. } => "root_scope",
+            ModeReason::RootScope { .. } | ModeReason::RootScopePackage { .. } => "root_scope",
             ModeReason::NoImpact { .. } => "no_impact",
             ModeReason::Error { .. } => "error",
         }
@@ -92,6 +96,14 @@ impl ModeReason {
             ModeReason::GlobalField { change, field } => {
                 format!("{change} changes {field:?}, which may affect every test")
             }
+            ModeReason::RootScope {
+                change,
+                configures: true,
+            } => format!("{change} configures the test runner of every test"),
+            ModeReason::RootScope {
+                change,
+                configures: false,
+            } => format!("{change} is loaded before every test"),
             ModeReason::RootScopePackage {
                 change,
                 package,
@@ -429,7 +441,8 @@ impl<'a> JsonModeReason<'a> {
                 pattern: Some(pattern),
                 ..json_mode_reason
             },
-            ModeReason::UnparsableManifest { change, .. } => Self {
+            ModeReason::UnparsableManifest { change, .. }
+            | ModeReason::RootScope { change, .. } => Self {
                 file: Some(change.path.as_str()),
                 ..json_mode_reason
             },
@@ -509,6 +522,14 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             kind: EdgeKind::Contains,
             ..
         } => format!("-> in folder {dependent}/"),
+        Link::Edge {
+            kind: EdgeKind::Asset,
+            ..
+        } => format!("-> imported as an asset by {dependent}"),
+        Link::Edge {
+            kind: EdgeKind::Reads,
+            ..
+        } => format!("-> read by {dependent}"),
         Link::Edge {
             kind: EdgeKind::Dynamic,
             dependency,
@@ -773,6 +794,39 @@ mod tests {
     }
 
     #[test]
+    fn asset_hop_says_the_file_is_imported_as_an_asset() {
+        let mut builder = GraphBuilder::default();
+        let styles = builder.add_file(repo_path("src/button.css"));
+        let button = builder.add_file(repo_path("src/button.ts"));
+        let button_test = builder.add_test_file(repo_path("src/button.test.ts"), "typescript");
+        let edges = [
+            (button, styles, EdgeKind::Asset),
+            (button_test, button, EdgeKind::Import),
+        ];
+
+        for (dependent, dependency, kind) in edges {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("src/button.css")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["src/button.test.ts"],
+            serde_json::json!([
+                "src/button.css (modified)",
+                "-> imported as an asset by src/button.ts",
+                "-> imported by src/button.test.ts",
+            ])
+        );
+    }
+
+    #[test]
     fn manifest_reasons_name_the_file_and_the_field_or_package_at_fault() {
         let graph = polyglot_graph();
         let manifest_reasons = vec![
@@ -783,6 +837,14 @@ mod tests {
             ModeReason::GlobalField {
                 change: modified("tsconfig.json"),
                 field: "compilerOptions.target".to_owned(),
+            },
+            ModeReason::RootScope {
+                change: modified("test/setup.ts"),
+                configures: false,
+            },
+            ModeReason::RootScope {
+                change: modified("vitest.config.ts"),
+                configures: true,
             },
             ModeReason::RootScopePackage {
                 change: modified("package.json"),
@@ -813,6 +875,16 @@ mod tests {
                     "file": "tsconfig.json",
                     "field": "compilerOptions.target",
                     "message": "tsconfig.json (modified) changes \"compilerOptions.target\", which may affect every test",
+                },
+                {
+                    "kind": "root_scope",
+                    "file": "test/setup.ts",
+                    "message": "test/setup.ts (modified) is loaded before every test",
+                },
+                {
+                    "kind": "root_scope",
+                    "file": "vitest.config.ts",
+                    "message": "vitest.config.ts (modified) configures the test runner of every test",
                 },
                 {
                     "kind": "root_scope",
@@ -1072,7 +1144,7 @@ mod tests {
     #[test]
     fn config_error_runs_all_tests_with_an_error_reason() {
         let graph = polyglot_graph();
-        let config_error = Config::parse("presets = \"auto\"\n").unwrap_err();
+        let config_error = Config::parse("anchors = true\n").unwrap_err();
         let error_reason = ModeReason::Error {
             message: config_error.to_string(),
         };
@@ -1084,12 +1156,12 @@ mod tests {
             json_report["mode_reasons"],
             serde_json::json!([{
                 "kind": "error",
-                "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
+                "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
             }])
         );
         assert_eq!(
             report.summary_line(),
-            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`"
+            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`"
         );
     }
 }

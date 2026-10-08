@@ -1,10 +1,10 @@
 //! Dynamic loading inference: which modules are analysed, what their loads reach, and which sites stay unresolved.
 
-mod evaluator;
+pub(crate) mod evaluator;
 mod summarizer;
 mod summary;
 mod targets;
-mod value;
+pub(crate) mod value;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
