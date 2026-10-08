@@ -1,5 +1,3 @@
-//! The result of a run (mode, ordered targets, reasons, stats) and its JSON, list and summary renderings.
-
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -8,6 +6,7 @@ use crate::changes::FileChange;
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{EdgeKind, Graph, TestFile};
+use crate::ratios::{format_percentage, rounded_ratio};
 use crate::select::{Hop, Reason, SelectedTest};
 
 const SCHEMA_VERSION: u32 = 1;
@@ -234,7 +233,7 @@ impl Report {
         match &self.mode {
             Mode::Selected => format!(
                 "prober: selected {selected_count}/{test_count} test files ({})",
-                format_percentage(selected_count, test_count)
+                format_percentage(selected_count as f64, test_count as f64)
             ),
             Mode::All { reasons } => format!(
                 "prober: all {test_count} test files — {}",
@@ -267,7 +266,7 @@ impl Report {
                 let language_stats = JsonLanguageStats {
                     total,
                     selected,
-                    ratio: rounded_ratio(selected, total),
+                    ratio: rounded_ratio(selected as f64, total as f64),
                 };
 
                 (language, language_stats)
@@ -277,7 +276,7 @@ impl Report {
         JsonStats {
             tests_total: self.test_count(),
             tests_selected: self.targets.len(),
-            selected_ratio: rounded_ratio(self.targets.len(), self.test_count()),
+            selected_ratio: rounded_ratio(self.targets.len() as f64, self.test_count() as f64),
             by_language,
             config_hash: &self.config_hash,
         }
@@ -380,26 +379,6 @@ fn join_messages(mode_reasons: &[ModeReason]) -> String {
     let messages: Vec<String> = mode_reasons.iter().map(ModeReason::message).collect();
 
     messages.join("; ")
-}
-
-fn rounded_ratio(selected: usize, total: usize) -> f64 {
-    if total == 0 {
-        return 0.0;
-    }
-
-    let exact_ratio = selected as f64 / total as f64;
-
-    (exact_ratio * 10_000.0).round() / 10_000.0
-}
-
-fn format_percentage(selected: usize, total: usize) -> String {
-    let percentage = if total == 0 {
-        0.0
-    } else {
-        selected as f64 * 100.0 / total as f64
-    };
-
-    format!("{percentage:.1}%")
 }
 
 #[cfg(test)]
@@ -722,11 +701,5 @@ mod tests {
             report.summary_line(),
             "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`"
         );
-    }
-
-    #[test]
-    fn ratios_are_rounded_to_four_decimals_and_zero_without_tests() {
-        assert_eq!(rounded_ratio(246, 19_104), 0.0129);
-        assert_eq!(rounded_ratio(0, 0), 0.0);
     }
 }
