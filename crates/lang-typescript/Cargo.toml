@@ -20,6 +20,7 @@ oxc_semantic.workspace = true
 oxc_span.workspace = true
 prober-core.workspace = true
 rayon.workspace = true
+regex.workspace = true
 serde_json.workspace = true
 yaml-rust2.workspace = true
 

@@ -15,8 +15,10 @@ use crate::dynamic::summary::{
 };
 use crate::dynamic::value::{
     Builtin, FunctionRef, Part, PathFunction, Pattern, Unknown, Value, alternatives, concatenation,
-    file_url_to_path, path_dirname, path_join, path_resolve, require_resolve, url,
+    file_url_to_path, is_open_object, merge_config, merge_objects, path_dirname, path_join,
+    path_resolve, require_resolve, url,
 };
+use crate::presets::{VITEST_DEFAULT_EXCLUDE, VITEST_DEFAULT_INCLUDE};
 use crate::resolver::{ModuleResolver, Resolution};
 
 const MAX_CALL_DEPTH: usize = 8;
@@ -96,6 +98,7 @@ pub(crate) struct Evaluator<'e> {
     coverage: RefCell<HashMap<FunctionRef, bool>>,
     nesting: Cell<usize>,
     steps: Cell<usize>,
+    evaluates_spreads: Cell<bool>,
 }
 
 impl<'e> Evaluator<'e> {
@@ -116,6 +119,7 @@ impl<'e> Evaluator<'e> {
             coverage: RefCell::new(HashMap::new()),
             nesting: Cell::new(0),
             steps: Cell::new(0),
+            evaluates_spreads: Cell::new(false),
         }
     }
 
@@ -150,6 +154,23 @@ impl<'e> Evaluator<'e> {
             .insert(module.clone(), summary.clone());
 
         summary
+    }
+
+    pub fn evaluate_config(&self, module: &RepoPath) -> Value {
+        self.steps.set(0);
+
+        let context = Context::top(module);
+
+        match self.export(module, "default", 0) {
+            Value::Function(function) => {
+                self.call_function(&context, &function, vec![Value::runtime_value()])
+            }
+            config => self.call(
+                &context,
+                Value::Builtin(Builtin::DefineConfig),
+                vec![config],
+            ),
+        }
     }
 
     pub fn resolve(&self, importer: &RepoPath, specifier: &str) -> Resolution {
@@ -469,6 +490,7 @@ impl<'e> Evaluator<'e> {
 
         match expr {
             Expr::Text(text) => Value::text(text),
+            Expr::Boolean(boolean) => Value::Boolean(*boolean),
             Expr::ModuleFile => module_file(&context.module),
             Expr::ModuleDirectory => path_dirname(&module_file(&context.module)),
             Expr::ModuleResolve => Value::Builtin(Builtin::RequireResolve(
@@ -499,6 +521,10 @@ impl<'e> Evaluator<'e> {
                     .map(|(key, property)| (key.clone(), self.evaluate(context, property)))
                     .collect(),
             ),
+            Expr::Merge(parts) if self.evaluates_spreads.get() => {
+                merge_objects(self.evaluate_all(context, parts))
+            }
+            Expr::Merge(_) => Value::runtime_value(),
             Expr::ElementOf(array) => element_of(self.evaluate(context, array)),
             Expr::Parameter { function, index } => {
                 self.parameter(context, *function, *index, false)
@@ -710,6 +736,25 @@ impl<'e> Evaluator<'e> {
             Value::Builtin(Builtin::RequireResolve(bases)) => {
                 require_resolve(&first_argument, &bases)
             }
+            Value::Builtin(Builtin::ObjectKeys | Builtin::ObjectValues)
+                if is_open_object(&first_argument) =>
+            {
+                Value::runtime_value()
+            }
+            Value::Builtin(Builtin::DefineConfig) => match first_argument {
+                Value::Function(function) => {
+                    self.call_function(context, &function, vec![Value::runtime_value()])
+                }
+                config => config,
+            },
+            Value::Builtin(Builtin::MergeConfig) => {
+                let overrides = arguments
+                    .get(1)
+                    .cloned()
+                    .unwrap_or_else(Value::runtime_value);
+
+                merge_config(first_argument, overrides)
+            }
             Value::Builtin(Builtin::ObjectKeys) => match first_argument {
                 Value::Object(properties) => {
                     Value::Array(properties.iter().map(|(key, _)| Value::text(key)).collect())
@@ -897,6 +942,28 @@ fn builtin_import(specifier: &str, name: &ImportedName) -> Option<Value> {
         ("url", Some(member)) => Some(url_member(member)),
         ("module", None) => Some(Value::Builtin(Builtin::ModuleModule)),
         ("module", Some(member)) => Some(module_member(member)),
+        (
+            "vitest/config" | "vitest" | "vite" | "vitest/node" | "@playwright/test" | "cypress",
+            Some(member),
+        ) => runner_config_member(member),
+        _ => None,
+    }
+}
+
+fn runner_config_member(member: &str) -> Option<Value> {
+    let texts = |texts: &[&str]| Value::Array(texts.iter().map(|text| Value::text(text)).collect());
+
+    match member {
+        "defineConfig" | "defineProject" | "defineWorkspace" => {
+            Some(Value::Builtin(Builtin::DefineConfig))
+        }
+        "mergeConfig" => Some(Value::Builtin(Builtin::MergeConfig)),
+        "defaultInclude" => Some(texts(VITEST_DEFAULT_INCLUDE)),
+        "defaultExclude" => Some(texts(VITEST_DEFAULT_EXCLUDE)),
+        "configDefaults" => Some(Value::Object(vec![
+            ("include".to_owned(), texts(VITEST_DEFAULT_INCLUDE)),
+            ("exclude".to_owned(), texts(VITEST_DEFAULT_EXCLUDE)),
+        ])),
         _ => None,
     }
 }

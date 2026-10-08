@@ -12,6 +12,7 @@ pub(crate) enum ImportedName {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Text(String),
+    Boolean(bool),
     ModuleFile,
     ModuleDirectory,
     ModuleResolve,
@@ -25,6 +26,7 @@ pub(crate) enum Expr {
     Array(Vec<Expr>),
     Spread(Box<Expr>),
     Object(Vec<(String, Expr)>),
+    Merge(Vec<Expr>),
     ElementOf(Box<Expr>),
     Parameter {
         function: FunctionIndex,

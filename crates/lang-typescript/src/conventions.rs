@@ -11,12 +11,12 @@ pub const ALWAYS_ALL_DEFAULTS: &[&str] = &[
     "**/.npmrc",
     "**/.nvmrc",
     "**/.node-version",
-    "**/vitest.*",
-    "**/vite.config.*",
-    "**/jest.*",
     "**/babel.config.*",
     "**/.babelrc*",
     "**/.swcrc",
+    "**/playwright.config.*",
+    "**/cypress.config.*",
+    "**/.mocharc*",
 ];
 
 pub const MANIFEST_DEFAULTS: &[&str] = &[
@@ -30,7 +30,7 @@ pub const MANIFEST_DEFAULTS: &[&str] = &[
     "**/jsconfig*.json",
 ];
 
-const RUNNER_CONFIG_PREFIXES: [&str; 3] = ["vitest.", "vite.config.", "jest."];
+const RUNNER_CONFIG_PREFIXES: [&str; 3] = ["vitest.", "vite.config.", "jest.config."];
 
 const TEST_RUNNER_PACKAGES: &[&str] = &[
     "@playwright/test",
@@ -64,6 +64,12 @@ const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "m
 
 const DECLARATION_FILE_SUFFIXES: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
 
+const ASSET_EXTENSIONS: &[&str] = &[
+    "aac", "apng", "avif", "bmp", "css", "eot", "flac", "gif", "ico", "jpeg", "jpg", "less", "m4a",
+    "mov", "mp3", "mp4", "ogg", "otf", "pcss", "png", "postcss", "sass", "scss", "sss", "styl",
+    "stylus", "svg", "tiff", "ttf", "wav", "webm", "webp", "woff", "woff2",
+];
+
 const TEST_FILE_MARKERS: [&str; 2] = ["test", "spec"];
 
 const PLUGIN_MANIFEST_NAMES: [&str; 3] = ["package.json", "plugin.json", "manifest.json"];
@@ -80,6 +86,20 @@ pub fn is_source_file(path: &RepoPath) -> bool {
         .is_some_and(|(_, extension)| SOURCE_EXTENSIONS.contains(&extension));
 
     has_source_extension && !is_declaration_file
+}
+
+pub fn source_stem(path: &RepoPath) -> Option<&str> {
+    is_source_file(path)
+        .then(|| path.as_str().rsplit_once('.').map(|(stem, _)| stem))
+        .flatten()
+}
+
+pub fn is_asset_file(path: &RepoPath) -> bool {
+    file_name(path)
+        .rsplit_once('.')
+        .is_some_and(|(_, extension)| {
+            ASSET_EXTENSIONS.contains(&extension.to_ascii_lowercase().as_str())
+        })
 }
 
 pub fn is_test_file(path: &RepoPath) -> bool {
@@ -219,6 +239,7 @@ mod tests {
             "patches/lodash@4.17.21.patch",
             "vitest.config.ts",
             "test/vitest.e2e.config.ts",
+            "e2e/playwright.config.ts",
             ".npmrc",
             "src/a.ts",
             "src/package-helpers.ts",
@@ -240,7 +261,7 @@ mod tests {
 
         assert_eq!(
             matched_paths(&always_all(ALWAYS_ALL_DEFAULTS)),
-            [".npmrc", "test/vitest.e2e.config.ts", "vitest.config.ts"]
+            [".npmrc", "e2e/playwright.config.ts"]
         );
         assert_eq!(
             matched_paths(&always_all(MANIFEST_DEFAULTS)),
@@ -258,7 +279,7 @@ mod tests {
         for runner_config in [
             "vitest.config.ts",
             "test/vitest.unit-paths.mjs",
-            "jest.setup.js",
+            "jest.config.js",
             "app/vite.config.mts",
         ] {
             assert!(
@@ -267,7 +288,7 @@ mod tests {
             );
         }
 
-        for other_file in ["src/vitest-helpers.ts", "vite.ts", "src/jester.ts"] {
+        for other_file in ["src/vitest-helpers.ts", "vite.ts", "jest.setup.js"] {
             assert!(!is_runner_config(&repo_path(other_file)), "{other_file}");
         }
 

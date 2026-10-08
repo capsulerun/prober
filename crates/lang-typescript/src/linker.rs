@@ -1,44 +1,69 @@
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
-use prober_core::config::InferenceSettings;
-use prober_core::files::FileId;
+use prober_core::changes::{BaseRevision, FileChange};
+use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
-use prober_core::graph::{Edge, EdgeKind, Graph, GraphBuilder, UnresolvedSite};
+use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
 use prober_core::report::ModeReason;
 use rayon::prelude::*;
 
-use crate::conventions::{
-    LANGUAGE, is_module_file, is_runner_config, is_source_file, is_test_file,
-    is_test_runner_package,
-};
+use crate::conventions::{LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file};
+use crate::dynamic::evaluator::Evaluator;
 use crate::dynamic::{DynamicInference, DynamicLoading};
 use crate::file_system::RepoFileSystem;
-use crate::imports::{parse_imports, string_literals};
-use crate::manifests::{ManifestChanges, PackageChange};
+use crate::imports::{GlobImport, MockRequest, parse_imports, string_literals};
+use crate::manifests::ManifestChanges;
+use crate::manifests::documents::{parse_jsonc, parse_yaml};
+use crate::presets::patterns::join_directory;
+use crate::presets::{RunnerGroup, RunnerPresets, ScopeInputs, imports_node_test, runner_groups};
 use crate::resolver::{ModuleResolver, package_node};
-use crate::workspaces::{PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest};
+use crate::root_scope::RootScopeEffects;
+use crate::test_links::TestLinks;
+use crate::workspaces::{
+    PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest, parent_directory,
+};
 
-const PACKAGE_NODE_PREFIX: &str = "node_modules/";
+pub(crate) const PACKAGE_NODE_PREFIX: &str = "node_modules/";
+
+const RAW_IMPORT_QUERY: &str = "?raw";
 
 pub struct TypeScriptLinker {
     repo_root: PathBuf,
     resolver: ModuleResolver,
     inference: InferenceSettings,
+    presets: RunnerPresets,
 }
 
-struct Dependency {
-    path: RepoPath,
-    kind: EdgeKind,
+pub struct LinkChanges<'c> {
+    pub changes: &'c [FileChange],
+    pub manifests: &'c ManifestChanges,
+    pub base: &'c dyn BaseRevision,
 }
 
-struct LinkedFile {
-    path: RepoPath,
-    dependencies: Vec<Dependency>,
-    has_dynamic_sites: bool,
-    resolution_change: Option<String>,
+struct NoBase;
+
+impl BaseRevision for NoBase {
+    fn read_file(&self, _: &RepoPath) -> Result<Option<Vec<u8>>> {
+        Ok(None)
+    }
+}
+
+pub(crate) struct Dependency {
+    pub path: RepoPath,
+    pub kind: EdgeKind,
+}
+
+pub(crate) struct LinkedFile {
+    pub path: RepoPath,
+    pub is_test: bool,
+    pub dependencies: Vec<Dependency>,
+    pub has_dynamic_sites: bool,
+    pub resolution_change: Option<String>,
+    pub mocks: Vec<MockRequest>,
+    pub glob_imports: Vec<GlobImport>,
 }
 
 impl TypeScriptLinker {
@@ -52,28 +77,68 @@ impl TypeScriptLinker {
         let file_system =
             RepoFileSystem::at(&repo_root).with_links(package_links(&repo_root, &packages));
         let resolver = ModuleResolver::new(&repo_root, file_system, packages.into_keys().collect());
-
-        Ok(Self {
+        let linker = Self {
             repo_root,
             resolver,
             inference: InferenceSettings::default(),
-        })
+            presets: RunnerPresets::default(),
+        };
+
+        Ok(linker.with_presets(&Presets::Auto, repo_files))
     }
 
     pub fn with_inference(self, inference: InferenceSettings) -> Self {
         Self { inference, ..self }
     }
 
+    pub fn with_presets(self, presets: &Presets, repo_files: &[RepoPath]) -> Self {
+        let importers = HashMap::new();
+        let evaluator = Evaluator::new(&self.repo_root, &self.resolver, &importers);
+        let presets = RunnerPresets::read(presets, &self.repo_root, repo_files, &evaluator);
+
+        Self { presets, ..self }
+    }
+
+    pub fn global_config_patterns(&self) -> Vec<&'static str> {
+        self.presets.global_config_patterns()
+    }
+
+    pub fn test_files(&self, repo_files: &[RepoPath]) -> Vec<RepoPath> {
+        repo_files
+            .iter()
+            .filter(|path| {
+                is_test_file(path) || self.presets.is_test(path, self.reads_node_test(path))
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn reads_node_test(&self, path: &RepoPath) -> bool {
+        self.presets.detects_node_test()
+            && is_source_file(path)
+            && fs::read_to_string(self.repo_root.join(path.as_str()))
+                .is_ok_and(|source_text| source_text.contains("node:test"))
+    }
+
     pub fn link(&self, repo_files: &[RepoPath], graph: &mut GraphBuilder) -> Result<()> {
-        self.link_changes(repo_files, &ManifestChanges::default(), graph)
+        let no_changes = LinkChanges {
+            changes: &[],
+            manifests: &ManifestChanges::default(),
+            base: &NoBase,
+        };
+
+        self.link_changes(repo_files, &no_changes, graph)?;
+
+        Ok(())
     }
 
     pub fn link_changes(
         &self,
         repo_files: &[RepoPath],
-        manifest_changes: &ManifestChanges,
+        link_changes: &LinkChanges,
         graph: &mut GraphBuilder,
-    ) -> Result<()> {
+    ) -> Result<Vec<ModeReason>> {
+        let manifest_changes = link_changes.manifests;
         let base_resolver = manifest_changes
             .resolution_change()
             .map(|_| self.base_resolver(repo_files, manifest_changes));
@@ -83,166 +148,214 @@ impl TypeScriptLinker {
             .map(|path| self.link_file(path, base_resolver.as_ref()))
             .collect::<Result<Vec<LinkedFile>>>()?;
         let dynamic_inference = self.infer_dynamic_links(repo_files, &linked_files)?;
+        let groups = self.runner_groups(repo_files, &linked_files, &dynamic_inference);
+        let tests: BTreeSet<RepoPath> = linked_files
+            .iter()
+            .filter(|linked_file| linked_file.is_test)
+            .map(|linked_file| linked_file.path.clone())
+            .collect();
 
         graph.add_language(LANGUAGE, |path| is_module_file(path) && !is_test_file(path));
 
-        for linked_file in linked_files {
-            let file = if is_test_file(&linked_file.path) {
-                graph.add_test_file(linked_file.path.clone(), LANGUAGE)
-            } else {
-                graph.add_file(linked_file.path.clone())
-            };
-
-            for dependency in linked_file.dependencies {
-                let dependency_file = graph.add_file(dependency.path);
-
-                graph.add_edge(Edge {
-                    dependent: file,
-                    dependency: dependency_file,
-                    kind: dependency.kind,
-                });
-            }
-
-            if let (Some(specifier), Some(resolution_change)) = (
-                linked_file.resolution_change,
-                manifest_changes.resolution_change(),
-            ) {
-                let description =
-                    format!("{} resolves {specifier:?} differently", linked_file.path);
-
-                graph.add_changed_part(resolution_change.clone(), linked_file.path, description);
-            }
+        for linked_file in &linked_files {
+            self.add_linked_file(linked_file, manifest_changes, graph);
         }
+
+        let mocked_modules = TestLinks {
+            repo_files,
+            linked_files: &linked_files,
+            resolver: &self.resolver,
+            follows_glob_imports: self.presets.follows_glob_imports(),
+        }
+        .add_to(graph);
 
         add_dynamic_inference(dynamic_inference, graph);
         add_manifest_changes(manifest_changes, graph);
 
-        Ok(())
+        RootScopeEffects {
+            repo_root: &self.repo_root,
+            repo_files,
+            groups: &groups,
+            tests: &tests,
+            changes: link_changes,
+            mocked_modules: &mocked_modules,
+        }
+        .add_to(graph)
     }
 
-    pub fn root_scope_reasons(
+    fn add_linked_file(
         &self,
-        graph: &Graph,
-        repo_files: &[RepoPath],
+        linked_file: &LinkedFile,
         manifest_changes: &ManifestChanges,
-    ) -> Result<Vec<ModeReason>> {
-        if manifest_changes.packages().is_empty() {
-            return Ok(Vec::new());
-        }
+        graph: &mut GraphBuilder,
+    ) {
+        let file = if linked_file.is_test {
+            let test = graph.add_test_file(linked_file.path.clone(), LANGUAGE);
 
-        let root_scope_packages = self.root_scope_packages(graph, repo_files)?;
-        let mut root_scope_changes: BTreeMap<&RepoPath, Vec<&PackageChange>> = BTreeMap::new();
-
-        for package_change in manifest_changes.packages() {
-            if is_test_runner_package(&package_change.name)
-                || root_scope_packages.contains(&package_change.name)
-            {
-                root_scope_changes
-                    .entry(&package_change.change.path)
-                    .or_default()
-                    .push(package_change);
+            if self.presets.is_asset_blind(&linked_file.path) {
+                graph.mark_asset_blind(test);
             }
+
+            test
+        } else {
+            graph.add_file(linked_file.path.clone())
+        };
+
+        for dependency in &linked_file.dependencies {
+            let dependency_file = graph.add_file(dependency.path.clone());
+
+            graph.add_edge(Edge {
+                dependent: file,
+                dependency: dependency_file,
+                kind: dependency.kind,
+            });
         }
 
-        let root_scope_reasons = root_scope_changes
-            .into_values()
-            .filter_map(|package_changes| {
-                let first_change = package_changes.iter().min_by_key(|package_change| {
-                    (package_change.through.is_some(), &package_change.name)
-                })?;
-                let detail = match &first_change.through {
-                    None => first_change.detail.clone(),
-                    Some(dependency) => format!("through {dependency} {}", first_change.detail),
-                };
+        if let (Some(specifier), Some(resolution_change)) = (
+            &linked_file.resolution_change,
+            manifest_changes.resolution_change(),
+        ) {
+            let description = format!("{} resolves {specifier:?} differently", linked_file.path);
 
-                Some(ModeReason::RootScopePackage {
-                    change: first_change.change.clone(),
-                    package: first_change.name.clone(),
-                    detail,
-                    other_packages: package_changes.len() - 1,
-                })
-            })
-            .collect();
-
-        Ok(root_scope_reasons)
-    }
-
-    fn root_scope_packages(
-        &self,
-        graph: &Graph,
-        repo_files: &[RepoPath],
-    ) -> Result<BTreeSet<String>> {
-        let runner_configs: Vec<&RepoPath> = repo_files
-            .iter()
-            .filter(|path| is_runner_config(path) && is_source_file(path))
-            .collect();
-        let mut files_to_visit: VecDeque<FileId> = VecDeque::new();
-
-        for runner_config in runner_configs {
-            let source_bytes = fs::read(self.repo_root.join(runner_config.as_str()))
-                .with_context(|| format!("cannot read {runner_config}"))?;
-            let source_text = String::from_utf8_lossy(&source_bytes);
-            let referenced_files = string_literals(runner_config, &source_text)
-                .iter()
-                .flat_map(|literal| self.referenced_files(runner_config, literal))
-                .filter(|referenced_file| !is_test_file(referenced_file))
-                .collect::<Vec<_>>();
-
-            files_to_visit.extend(
-                std::iter::once(runner_config)
-                    .chain(&referenced_files)
-                    .filter_map(|path| graph.file_id(path)),
+            graph.add_changed_part(
+                resolution_change.clone(),
+                linked_file.path.clone(),
+                description,
             );
         }
-
-        let mut visited_files: HashSet<FileId> = files_to_visit.iter().copied().collect();
-        let mut packages = BTreeSet::new();
-
-        while let Some(file) = files_to_visit.pop_front() {
-            let runtime_dependencies = graph
-                .dependencies(file)
-                .iter()
-                .filter(|edge| edge.kind.selects_tests());
-
-            for edge in runtime_dependencies {
-                let dependency_path = graph.path(edge.dependency).as_str();
-
-                if let Some(package_name) = dependency_path.strip_prefix(PACKAGE_NODE_PREFIX) {
-                    packages.insert(package_name.to_owned());
-                } else if visited_files.insert(edge.dependency) {
-                    files_to_visit.push_back(edge.dependency);
-                }
-            }
-        }
-
-        Ok(packages)
     }
 
-    fn referenced_files(&self, config: &RepoPath, literal: &str) -> Vec<RepoPath> {
-        let literal = literal.strip_prefix("<rootDir>/").unwrap_or(literal);
-        let looks_like_a_path = !literal.is_empty()
-            && literal.len() < 256
-            && !matches!(literal, "." | "..")
-            && !literal.contains(|character: char| {
-                character.is_whitespace() || "*?{}[]:".contains(character)
-            });
-
-        if !looks_like_a_path {
+    fn runner_groups(
+        &self,
+        repo_files: &[RepoPath],
+        linked_files: &[LinkedFile],
+        dynamic_inference: &DynamicInference,
+    ) -> Vec<RunnerGroup> {
+        if self.presets.runner_configs().is_empty() && self.presets.jest_manifests().is_empty() {
             return Vec::new();
         }
 
-        let relative_specifier = if literal.starts_with("./") || literal.starts_with("../") {
-            literal.to_owned()
-        } else {
-            format!("./{}", literal.trim_start_matches('/'))
+        let repo_file_set: HashSet<&RepoPath> = repo_files.iter().collect();
+        let is_linked = |path: &RepoPath| {
+            repo_file_set.contains(path) || path.as_str().starts_with(PACKAGE_NODE_PREFIX)
         };
-        let root_file = RepoPath::new(PACKAGE_MANIFEST).expect("valid repo path");
+        let mut dependencies: HashMap<&RepoPath, Vec<&RepoPath>> = HashMap::new();
 
-        [config, &root_file]
-            .into_iter()
-            .flat_map(|importer| self.resolver.resolve(importer, &relative_specifier))
-            .filter(|referenced_file| !referenced_file.as_str().starts_with(PACKAGE_NODE_PREFIX))
-            .collect()
+        for linked_file in linked_files {
+            dependencies.entry(&linked_file.path).or_default().extend(
+                linked_file
+                    .dependencies
+                    .iter()
+                    .filter(|dependency| {
+                        dependency.kind.selects_tests() && is_linked(&dependency.path)
+                    })
+                    .map(|dependency| &dependency.path),
+            );
+        }
+
+        for dynamic_link in dynamic_inference
+            .links
+            .iter()
+            .filter(|dynamic_link| is_linked(&dynamic_link.dependency))
+        {
+            dependencies
+                .entry(&dynamic_link.dependent)
+                .or_default()
+                .push(&dynamic_link.dependency);
+        }
+
+        let tests: HashSet<&RepoPath> = linked_files
+            .iter()
+            .filter(|linked_file| linked_file.is_test)
+            .map(|linked_file| &linked_file.path)
+            .collect();
+        let package_directories: BTreeSet<String> = repo_files
+            .iter()
+            .filter(|path| path.as_str().rsplit('/').next() == Some(PACKAGE_MANIFEST))
+            .map(|path| parent_directory(path).to_owned())
+            .collect();
+        let literal_references = |file: &RepoPath| self.literal_references(file, &repo_file_set);
+        let manifest_setups: Vec<(RepoPath, Vec<RepoPath>)> = self
+            .presets
+            .jest_manifests()
+            .iter()
+            .map(|manifest| {
+                let references = self.jest_field_references(manifest, &repo_file_set);
+
+                (manifest.clone(), references)
+            })
+            .collect();
+
+        runner_groups(&ScopeInputs {
+            runner_configs: self.presets.runner_configs(),
+            manifest_setups: &manifest_setups,
+            package_directories: &package_directories,
+            tests: &tests,
+            dependencies: &dependencies,
+            literal_references: &literal_references,
+        })
+    }
+
+    fn literal_references(
+        &self,
+        file: &RepoPath,
+        repo_file_set: &HashSet<&RepoPath>,
+    ) -> Vec<RepoPath> {
+        let Ok(text) = fs::read_to_string(self.repo_root.join(file.as_str())) else {
+            return Vec::new();
+        };
+        let literals = if is_source_file(file) {
+            string_literals(file, &text)
+        } else {
+            parse_jsonc(&text)
+                .or_else(|_| parse_yaml(&text))
+                .map(|document| document_strings(&document))
+                .unwrap_or_default()
+        };
+
+        self.referenced_files(file, &literals, repo_file_set)
+    }
+
+    fn jest_field_references(
+        &self,
+        manifest: &RepoPath,
+        repo_file_set: &HashSet<&RepoPath>,
+    ) -> Vec<RepoPath> {
+        let literals = fs::read_to_string(self.repo_root.join(manifest.as_str()))
+            .ok()
+            .and_then(|text| parse_jsonc(&text).ok())
+            .and_then(|document| Some(document_strings(document.get("jest")?)))
+            .unwrap_or_default();
+
+        self.referenced_files(manifest, &literals, repo_file_set)
+    }
+
+    fn referenced_files(
+        &self,
+        file: &RepoPath,
+        literals: &[String],
+        repo_file_set: &HashSet<&RepoPath>,
+    ) -> Vec<RepoPath> {
+        let file_directory = parent_directory(file);
+        let mut referenced = BTreeSet::new();
+
+        for literal in literals {
+            let literal = literal.strip_prefix("<rootDir>/").unwrap_or(literal);
+
+            if literal.is_empty() || literal.len() > 255 {
+                continue;
+            }
+
+            for directory in [file_directory, ""] {
+                let named_file = join_directory(directory, literal.trim_start_matches('/'))
+                    .and_then(|joined| RepoPath::new(joined).ok())
+                    .filter(|named_file| repo_file_set.contains(named_file));
+
+                referenced.extend(named_file);
+            }
+        }
+
+        referenced.into_iter().collect()
     }
 
     fn base_resolver(
@@ -323,6 +436,10 @@ impl TypeScriptLinker {
             .with_context(|| format!("cannot read {path}"))?;
         let source_text = String::from_utf8_lossy(&source_bytes);
         let parsed_imports = parse_imports(path, &source_text);
+        let imports_node_test = parsed_imports
+            .import_requests
+            .iter()
+            .any(|import_request| imports_node_test(&import_request.specifier));
         let mut dependencies = Vec::new();
         let mut resolution_change = None;
 
@@ -337,22 +454,45 @@ impl TypeScriptLinker {
                 resolution_change = Some(import_request.specifier.clone());
             }
 
-            dependencies.extend(
-                resolved_paths
-                    .into_iter()
-                    .map(|dependency_path| Dependency {
-                        path: dependency_path,
-                        kind: import_request.kind,
-                    }),
-            );
+            let is_raw_import = import_request.specifier.contains(RAW_IMPORT_QUERY);
+
+            dependencies.extend(resolved_paths.into_iter().map(|dependency_path| {
+                let kind = if import_request.kind == EdgeKind::Import
+                    && is_asset_file(&dependency_path)
+                    && !is_raw_import
+                {
+                    EdgeKind::Asset
+                } else {
+                    import_request.kind
+                };
+
+                Dependency {
+                    path: dependency_path,
+                    kind,
+                }
+            }));
         }
 
         Ok(LinkedFile {
             path: path.clone(),
+            is_test: self.presets.is_test(path, imports_node_test),
             dependencies,
             has_dynamic_sites: parsed_imports.has_dynamic_sites,
             resolution_change,
+            mocks: parsed_imports.mocks,
+            glob_imports: parsed_imports.glob_imports,
         })
+    }
+}
+
+fn document_strings(document: &serde_json::Value) -> Vec<String> {
+    match document {
+        serde_json::Value::String(text) => vec![text.clone()],
+        serde_json::Value::Array(items) => items.iter().flat_map(document_strings).collect(),
+        serde_json::Value::Object(properties) => {
+            properties.values().flat_map(document_strings).collect()
+        }
+        _ => Vec::new(),
     }
 }
 

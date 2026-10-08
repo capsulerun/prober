@@ -7,15 +7,15 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
 use prober_core::changes::{BaseRevision, FileChange};
-use prober_core::config::{AlwaysAll, Config, config_hash};
+use prober_core::config::{AlwaysAll, Config, Presets, config_hash};
 use prober_core::files::RepoPath;
-use prober_core::graph::{Graph, GraphBuilder};
+use prober_core::graph::GraphBuilder;
 use prober_core::report::{ModeReason, Report};
 use prober_core::scan::ScanReport;
 use prober_core::select::{Widening, select_tests};
 use prober_lang_typescript::{
-    ALWAYS_ALL_DEFAULTS, LANGUAGE, MANIFEST_DEFAULTS, ManifestChanges, TypeScriptLinker,
-    is_test_file,
+    ALWAYS_ALL_DEFAULTS, LANGUAGE, LinkChanges, MANIFEST_DEFAULTS, ManifestChanges,
+    TypeScriptLinker, is_test_file,
 };
 use prober_vcs::GitRepository;
 
@@ -44,7 +44,7 @@ pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result
                 message: format!("{error:#}"),
             };
 
-            Ok(workspace.run_all(vec![error_reason], config_hash))
+            Ok(workspace.run_all(None, vec![error_reason], config_hash))
         }
         Err(error) => Err(error),
     }
@@ -55,7 +55,11 @@ pub fn scan(directory: &Path) -> Result<ScanReport> {
     let config_text = workspace.read_config()?;
     let config = Config::parse(&config_text)?;
     let linker = workspace.linker(&config)?;
-    let graph = workspace.link(&linker, &ManifestChanges::default())?;
+    let mut builder = GraphBuilder::default();
+
+    linker.link(&workspace.repo_files, &mut builder)?;
+
+    let graph = builder.build();
 
     Ok(ScanReport::new(
         &graph,
@@ -102,13 +106,14 @@ impl Workspace {
         let resolved_revisions = self
             .repository
             .resolve_revisions(&revisions.base, &revisions.head)?;
-        let mut global_reasons = always_all_reasons(&config, &changes)?;
+        let linker = self.linker(&config)?;
+        let mut global_reasons =
+            always_all_reasons(&config, &changes, &linker.global_config_patterns())?;
+        let merge_base = MergeBase {
+            repository: &self.repository,
+            commit: &resolved_revisions.merge_base,
+        };
         let manifest_changes = if config.inference.manifests {
-            let merge_base = MergeBase {
-                repository: &self.repository,
-                commit: &resolved_revisions.merge_base,
-            };
-
             ManifestChanges::between(&self.repo_root, &self.repo_files, &changes, &merge_base)?
         } else {
             ManifestChanges::default()
@@ -118,16 +123,21 @@ impl Workspace {
 
         if !global_reasons.is_empty() {
             let report = self
-                .run_all(global_reasons, config_hash)
+                .run_all(Some(&linker), global_reasons, config_hash)
                 .with_revisions(resolved_revisions);
 
             return Ok(report);
         }
 
-        let linker = self.linker(&config)?;
-        let graph = self.link(&linker, &manifest_changes)?;
+        let link_changes = LinkChanges {
+            changes: &changes,
+            manifests: &manifest_changes,
+            base: &merge_base,
+        };
+        let mut builder = GraphBuilder::default();
         let root_scope_reasons =
-            linker.root_scope_reasons(&graph, &self.repo_files, &manifest_changes)?;
+            linker.link_changes(&self.repo_files, &link_changes, &mut builder)?;
+        let graph = builder.build();
 
         if !root_scope_reasons.is_empty() {
             let report = Report::all(&graph, root_scope_reasons, config_hash)
@@ -161,24 +171,39 @@ impl Workspace {
     }
 
     fn linker(&self, config: &Config) -> Result<TypeScriptLinker> {
-        let linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?;
+        let linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?
+            .with_inference(config.inference);
 
-        Ok(linker.with_inference(config.inference))
+        if config.presets == Presets::Auto {
+            return Ok(linker);
+        }
+
+        Ok(linker.with_presets(&config.presets, &self.repo_files))
     }
 
-    fn link(&self, linker: &TypeScriptLinker, manifest_changes: &ManifestChanges) -> Result<Graph> {
+    fn run_all(
+        &self,
+        linker: Option<&TypeScriptLinker>,
+        reasons: Vec<ModeReason>,
+        config_hash: String,
+    ) -> Report {
+        let default_linker = linker
+            .is_none()
+            .then(|| TypeScriptLinker::new(&self.repo_root, &self.repo_files).ok())
+            .flatten();
+        let test_files = match linker.or(default_linker.as_ref()) {
+            Some(linker) => linker.test_files(&self.repo_files),
+            None => self
+                .repo_files
+                .iter()
+                .filter(|path| is_test_file(path))
+                .cloned()
+                .collect(),
+        };
         let mut builder = GraphBuilder::default();
 
-        linker.link_changes(&self.repo_files, manifest_changes, &mut builder)?;
-
-        Ok(builder.build())
-    }
-
-    fn run_all(&self, reasons: Vec<ModeReason>, config_hash: String) -> Report {
-        let mut builder = GraphBuilder::default();
-
-        for test_file in self.repo_files.iter().filter(|path| is_test_file(path)) {
-            builder.add_test_file(test_file.clone(), LANGUAGE);
+        for test_file in test_files {
+            builder.add_test_file(test_file, LANGUAGE);
         }
 
         Report::all(&builder.build(), reasons, config_hash)
@@ -196,7 +221,11 @@ impl BaseRevision for MergeBase<'_> {
     }
 }
 
-fn always_all_reasons(config: &Config, changes: &[FileChange]) -> Result<Vec<ModeReason>> {
+fn always_all_reasons(
+    config: &Config,
+    changes: &[FileChange],
+    runner_config_patterns: &[&str],
+) -> Result<Vec<ModeReason>> {
     let manifest_patterns = if config.inference.manifests {
         &[][..]
     } else {
@@ -205,6 +234,7 @@ fn always_all_reasons(config: &Config, changes: &[FileChange]) -> Result<Vec<Mod
     let built_in_patterns = ALWAYS_ALL_DEFAULTS
         .iter()
         .chain(manifest_patterns)
+        .chain(runner_config_patterns)
         .map(|&pattern| pattern.to_owned())
         .collect();
     let built_in_always_all = AlwaysAll::new(built_in_patterns)?;

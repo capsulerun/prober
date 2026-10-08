@@ -1,5 +1,5 @@
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::changes::FileChange;
 use crate::files::FileId;
@@ -62,16 +62,22 @@ pub fn select_tests(
     changes: &[FileChange],
     widening: Widening,
 ) -> Vec<SelectedTest> {
-    let discoveries = discover_dependents(graph, changes, widening);
-    let mut selected_tests: Vec<SelectedTest> = discoveries
-        .keys()
-        .filter(|&&file| graph.is_test(file))
-        .map(|&test_file| SelectedTest {
-            file: test_file,
-            reason: trace_reason(test_file, &discoveries),
-        })
+    let (asset_changes, code_changes): (Vec<FileChange>, Vec<FileChange>) = changes
+        .iter()
+        .cloned()
+        .partition(|change| is_asset_change(graph, change));
+    let code_discoveries = discover_dependents(graph, &code_changes, widening);
+    let asset_discoveries = discover_dependents(graph, &asset_changes, Widening::Off);
+    let mut selected_tests = tests_reached(graph, &code_discoveries, |_| true);
+    let selected_files: HashSet<FileId> = selected_tests
+        .iter()
+        .map(|selected_test| selected_test.file)
         .collect();
+    let asset_tests = tests_reached(graph, &asset_discoveries, |test| {
+        !graph.is_asset_blind(test) && !selected_files.contains(&test)
+    });
 
+    selected_tests.extend(asset_tests);
     selected_tests.sort_by(|left, right| {
         let left_path = graph.path(left.file);
         let right_path = graph.path(right.file);
@@ -82,6 +88,116 @@ pub fn select_tests(
     });
 
     selected_tests
+}
+
+fn is_asset_change(graph: &Graph, change: &FileChange) -> bool {
+    graph
+        .file_id(&change.path)
+        .is_some_and(|changed_file| graph.is_asset(changed_file))
+}
+
+fn tests_reached(
+    graph: &Graph,
+    discoveries: &HashMap<FileId, Discovery>,
+    keeps: impl Fn(FileId) -> bool,
+) -> Vec<SelectedTest> {
+    discoveries
+        .keys()
+        .filter(|&&file| graph.is_test(file) && keeps(file))
+        .filter_map(|&test_file| {
+            let reason = reason_past_mocks(graph, discoveries, test_file)?;
+
+            Some(SelectedTest {
+                file: test_file,
+                reason,
+            })
+        })
+        .collect()
+}
+
+fn reason_past_mocks(
+    graph: &Graph,
+    discoveries: &HashMap<FileId, Discovery>,
+    test_file: FileId,
+) -> Option<Reason> {
+    let mocked_modules = graph.mocked_modules(test_file);
+    let is_mocked = |file: FileId| {
+        mocked_modules.binary_search(&file).is_ok() && !graph.has_changed_contract(file)
+    };
+
+    if trace_avoids(test_file, discoveries, &is_mocked) {
+        return Some(trace_reason(test_file, discoveries));
+    }
+
+    let mut dependents_on_path: HashMap<FileId, (FileId, EdgeKind)> = HashMap::new();
+    let mut files_to_visit = VecDeque::from([test_file]);
+
+    while let Some(file) = files_to_visit.pop_front() {
+        let test_selecting_edges = graph
+            .dependencies(file)
+            .iter()
+            .filter(|edge| edge.kind.selects_tests());
+
+        for edge in test_selecting_edges {
+            let dependency = edge.dependency;
+            let is_unexplored = dependency != test_file
+                && !dependents_on_path.contains_key(&dependency)
+                && discoveries.contains_key(&dependency)
+                && !is_mocked(dependency);
+
+            if !is_unexplored {
+                continue;
+            }
+
+            dependents_on_path.insert(dependency, (file, edge.kind));
+
+            if trace_avoids(dependency, discoveries, &is_mocked) {
+                return Some(reason_through(dependency, &dependents_on_path, discoveries));
+            }
+
+            files_to_visit.push_back(dependency);
+        }
+    }
+
+    None
+}
+
+fn trace_avoids(
+    file: FileId,
+    discoveries: &HashMap<FileId, Discovery>,
+    is_mocked: &impl Fn(FileId) -> bool,
+) -> bool {
+    let mut file = file;
+
+    loop {
+        if is_mocked(file) {
+            return false;
+        }
+
+        match discoveries[&file].reached_via {
+            Some(Link::Edge { dependency, .. }) => file = dependency,
+            Some(Link::ChangedPart(_) | Link::UnresolvedSite(_)) | None => return true,
+        }
+    }
+}
+
+fn reason_through(
+    file: FileId,
+    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
+    discoveries: &HashMap<FileId, Discovery>,
+) -> Reason {
+    let mut reason = trace_reason(file, discoveries);
+    let mut dependency = file;
+
+    while let Some(&(dependent, kind)) = dependents_on_path.get(&dependency) {
+        reason.hops.push(Hop {
+            dependent,
+            link: Link::Edge { kind, dependency },
+        });
+        dependency = dependent;
+    }
+
+    reason
 }
 
 fn discover_dependents<'a>(
@@ -208,9 +324,9 @@ fn visit_dependents<'a>(
     }
 }
 
-fn trace_reason(test_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> Reason {
+fn trace_reason(reached_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> Reason {
     let mut hops = Vec::new();
-    let mut file = test_file;
+    let mut file = reached_file;
 
     while let Some(link) = discoveries[&file].reached_via {
         hops.push(Hop {
@@ -227,7 +343,7 @@ fn trace_reason(test_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> 
     hops.reverse();
 
     Reason {
-        change: discoveries[&test_file].change.clone(),
+        change: discoveries[&reached_file].change.clone(),
         hops,
     }
 }
@@ -237,7 +353,7 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::files::RepoPath;
-    use crate::graph::EdgeKind::{Import, TypeOnly};
+    use crate::graph::EdgeKind::{Asset, Import, TypeOnly};
     use crate::graph::{Edge, GraphBuilder, UnresolvedCause, UnresolvedSite};
 
     fn repo_path(path: &str) -> RepoPath {
@@ -773,6 +889,166 @@ mod tests {
         assert_eq!(
             selected_with_distances(&graph, &[modified("package.json")]),
             [("src/a.test.ts", 2)]
+        );
+    }
+
+    fn graph_with_mocks(
+        edges: &[(&str, EdgeKind, &str)],
+        mocks: &[(&str, &str)],
+        changed_contracts: &[&str],
+    ) -> Graph {
+        let mut builder = GraphBuilder::default();
+
+        for &(dependent_path, kind, dependency_path) in edges {
+            let dependent = if dependent_path.ends_with(".test.ts") {
+                builder.add_test_file(repo_path(dependent_path), "typescript")
+            } else {
+                builder.add_file(repo_path(dependent_path))
+            };
+            let dependency = builder.add_file(repo_path(dependency_path));
+
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        for &(test, mocked_module) in mocks {
+            let test = builder.add_file(repo_path(test));
+            let mocked_module = builder.add_file(repo_path(mocked_module));
+
+            builder.add_mock(test, mocked_module);
+        }
+
+        for &module in changed_contracts {
+            let module = builder.add_file(repo_path(module));
+
+            builder.mark_changed_contract(module);
+        }
+
+        builder.build()
+    }
+
+    const SERVICE_WITH_MOCKED_DB: &[(&str, EdgeKind, &str)] = &[
+        ("src/db.ts", Import, "src/sql.ts"),
+        ("src/service.ts", Import, "src/db.ts"),
+        ("src/service.test.ts", Import, "src/service.ts"),
+        ("src/service.test.ts", Import, "src/db.ts"),
+        ("src/db.test.ts", Import, "src/db.ts"),
+    ];
+
+    #[test]
+    fn test_mocking_a_module_is_not_selected_by_changes_behind_the_mock() {
+        let graph = graph_with_mocks(
+            SERVICE_WITH_MOCKED_DB,
+            &[("src/service.test.ts", "src/db.ts")],
+            &[],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/db.ts")]),
+            [("src/db.test.ts", 1)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/sql.ts")]),
+            [("src/db.test.ts", 2)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/service.ts")]),
+            [("src/service.test.ts", 1)]
+        );
+    }
+
+    #[test]
+    fn changed_export_signature_of_a_mocked_module_selects_its_mockers() {
+        let graph = graph_with_mocks(
+            SERVICE_WITH_MOCKED_DB,
+            &[("src/service.test.ts", "src/db.ts")],
+            &["src/db.ts"],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/db.ts")]),
+            [("src/db.test.ts", 1), ("src/service.test.ts", 1)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/sql.ts")]),
+            [("src/db.test.ts", 2), ("src/service.test.ts", 2)]
+        );
+    }
+
+    #[test]
+    fn path_around_the_mock_still_selects_the_test_with_that_path_as_reason() {
+        let edges = [
+            ("src/db.ts", Import, "src/config.ts"),
+            ("src/service.ts", Import, "src/db.ts"),
+            ("src/logger.ts", Import, "src/config.ts"),
+            ("src/service.ts", Import, "src/logger.ts"),
+            ("src/service.test.ts", Import, "src/service.ts"),
+        ];
+        let graph = graph_with_mocks(&edges, &[("src/service.test.ts", "src/db.ts")], &[]);
+        let selected_tests = select_tests(&graph, &[modified("src/config.ts")], Widening::Scoped);
+
+        assert_eq!(selected_tests.len(), 1);
+        assert_eq!(
+            reason_files(&graph, &selected_tests[0]),
+            [
+                "src/config.ts",
+                "src/logger.ts",
+                "src/service.ts",
+                "src/service.test.ts"
+            ]
+        );
+    }
+
+    #[test]
+    fn asset_change_reaches_only_tests_that_render_assets() {
+        let mut builder = GraphBuilder::default();
+        let styles = builder.add_file(repo_path("src/button.css"));
+        let button = builder.add_file(repo_path("src/button.ts"));
+        let unit_test = builder.add_test_file(repo_path("src/button.test.ts"), "typescript");
+        let browser_test =
+            builder.add_test_file(repo_path("src/button.browser.test.ts"), "typescript");
+        let edges = [
+            (button, styles, Asset),
+            (unit_test, button, Import),
+            (browser_test, button, Import),
+        ];
+
+        for (dependent, dependency, kind) in edges {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        builder.mark_asset_blind(unit_test);
+
+        let graph = builder.build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/button.css")]),
+            [("src/button.browser.test.ts", 2)]
+        );
+        assert_eq!(
+            selected_with_distances(
+                &graph,
+                &[modified("src/button.css"), modified("src/button.ts")]
+            ),
+            [("src/button.browser.test.ts", 1), ("src/button.test.ts", 1)]
+        );
+        assert_eq!(
+            reason_files(
+                &graph,
+                &select_tests(&graph, &[modified("src/button.css")], Widening::Scoped)[0]
+            ),
+            [
+                "src/button.css",
+                "src/button.ts",
+                "src/button.browser.test.ts"
+            ]
         );
     }
 
