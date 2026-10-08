@@ -372,6 +372,37 @@ fn files_at_lists_the_files_of_the_revision_not_of_the_working_tree() {
 }
 
 #[test]
+fn file_is_read_as_committed_at_the_revision() {
+    let repository = TestRepository::new();
+
+    repository.write("package.json", r#"{ "version": "1.0.0" }"#);
+    repository.write("src/a.ts", "a");
+    repository.commit_all("first");
+    repository.write("package.json", r#"{ "version": "1.1.0" }"#);
+    repository.commit_all("second");
+    repository.write("package.json", "uncommitted");
+
+    let git_repository = GitRepository::discover(repository.path()).unwrap();
+    let read_file = |revision, path| {
+        git_repository
+            .read_file(revision, &repo_path(path))
+            .unwrap()
+            .map(|bytes| String::from_utf8(bytes).unwrap())
+    };
+
+    assert_eq!(
+        read_file("HEAD~1", "package.json").as_deref(),
+        Some(r#"{ "version": "1.0.0" }"#)
+    );
+    assert_eq!(
+        read_file("HEAD", "package.json").as_deref(),
+        Some(r#"{ "version": "1.1.0" }"#)
+    );
+    assert_eq!(read_file("HEAD", "src/missing.ts"), None);
+    assert_eq!(read_file("HEAD", "src"), None);
+}
+
+#[test]
 fn only_the_checked_out_commit_is_checked_out() {
     let repository = TestRepository::new();
 

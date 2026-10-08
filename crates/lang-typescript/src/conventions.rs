@@ -1,24 +1,16 @@
-//! TypeScript conventions: which files are parsed, which are tests, and which changes run every test.
+//! TypeScript conventions: which files are parsed, which are tests, which run them, and which changes run every test.
 
 use prober_core::files::RepoPath;
 
 pub const LANGUAGE: &str = "typescript";
 
 pub const ALWAYS_ALL_DEFAULTS: &[&str] = &[
-    "**/package.json",
-    "**/package-lock.json",
-    "**/npm-shrinkwrap.json",
-    "**/pnpm-lock.yaml",
-    "**/pnpm-workspace.yaml",
-    "**/yarn.lock",
     "**/.yarnrc.yml",
     "**/bun.lock",
     "**/bun.lockb",
     "**/.npmrc",
     "**/.nvmrc",
     "**/.node-version",
-    "**/tsconfig*.json",
-    "**/jsconfig*.json",
     "**/vitest.*",
     "**/vite.config.*",
     "**/jest.*",
@@ -26,6 +18,47 @@ pub const ALWAYS_ALL_DEFAULTS: &[&str] = &[
     "**/.babelrc*",
     "**/.swcrc",
 ];
+
+pub const MANIFEST_DEFAULTS: &[&str] = &[
+    "**/package.json",
+    "**/package-lock.json",
+    "**/npm-shrinkwrap.json",
+    "**/pnpm-lock.yaml",
+    "**/pnpm-workspace.yaml",
+    "**/yarn.lock",
+    "**/tsconfig*.json",
+    "**/jsconfig*.json",
+];
+
+const RUNNER_CONFIG_PREFIXES: [&str; 3] = ["vitest.", "vite.config.", "jest."];
+
+const TEST_RUNNER_PACKAGES: &[&str] = &[
+    "@playwright/test",
+    "@swc/jest",
+    "@vitest/browser",
+    "@vitest/ui",
+    "@vitest/web-worker",
+    "ava",
+    "babel-jest",
+    "cypress",
+    "jasmine",
+    "jasmine-core",
+    "jest",
+    "karma",
+    "mocha",
+    "playwright",
+    "playwright-core",
+    "tap",
+    "ts-jest",
+    "ts-node",
+    "tsx",
+    "uvu",
+    "vite",
+    "vite-node",
+    "vitest",
+];
+
+const TEST_RUNNER_PACKAGE_PREFIXES: [&str; 4] = ["@jest/", "@vitest/coverage-", "jest-", "karma-"];
 
 const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
 
@@ -61,6 +94,21 @@ pub fn is_test_file(path: &RepoPath) -> bool {
 
 pub fn is_module_file(path: &RepoPath) -> bool {
     is_source_file(path) || file_name(path).ends_with(".json")
+}
+
+pub fn is_runner_config(path: &RepoPath) -> bool {
+    let file_name = file_name(path);
+
+    RUNNER_CONFIG_PREFIXES
+        .iter()
+        .any(|prefix| file_name.starts_with(prefix))
+}
+
+pub fn is_test_runner_package(package_name: &str) -> bool {
+    TEST_RUNNER_PACKAGES.contains(&package_name)
+        || TEST_RUNNER_PACKAGE_PREFIXES
+            .iter()
+            .any(|prefix| package_name.starts_with(prefix))
 }
 
 pub fn is_plugin_manifest(path: &RepoPath) -> bool {
@@ -159,19 +207,19 @@ mod tests {
     }
 
     #[test]
-    fn always_all_defaults_match_manifests_lockfiles_and_tool_configs_at_any_depth() {
-        let patterns = ALWAYS_ALL_DEFAULTS
-            .iter()
-            .map(|&pattern| pattern.to_owned())
-            .collect();
-        let always_all = AlwaysAll::new(patterns).unwrap();
+    fn always_all_defaults_match_tool_configs_at_any_depth_but_not_diffed_manifests() {
+        let always_all = |patterns: &[&str]| {
+            AlwaysAll::new(patterns.iter().map(|&pattern| pattern.to_owned()).collect()).unwrap()
+        };
         let changes: Vec<FileChange> = [
             "package.json",
             "extensions/telegram/package.json",
             "pnpm-lock.yaml",
             "tsconfig.base.json",
+            "patches/lodash@4.17.21.patch",
             "vitest.config.ts",
             "test/vitest.e2e.config.ts",
+            ".npmrc",
             "src/a.ts",
             "src/package-helpers.ts",
             "docs/jest-migration.md",
@@ -182,22 +230,70 @@ mod tests {
             kind: ChangeKind::Modified,
         })
         .collect();
-        let matched_paths: Vec<&str> = always_all
-            .matching_changes(&changes)
-            .iter()
-            .map(|always_all_match| always_all_match.matched_path.as_str())
-            .collect();
+        let matched_paths = |always_all: &AlwaysAll| -> Vec<String> {
+            always_all
+                .matching_changes(&changes)
+                .iter()
+                .map(|always_all_match| always_all_match.matched_path.as_str().to_owned())
+                .collect()
+        };
 
         assert_eq!(
-            matched_paths,
+            matched_paths(&always_all(ALWAYS_ALL_DEFAULTS)),
+            [".npmrc", "test/vitest.e2e.config.ts", "vitest.config.ts"]
+        );
+        assert_eq!(
+            matched_paths(&always_all(MANIFEST_DEFAULTS)),
             [
                 "extensions/telegram/package.json",
                 "package.json",
                 "pnpm-lock.yaml",
-                "test/vitest.e2e.config.ts",
                 "tsconfig.base.json",
-                "vitest.config.ts",
             ]
         );
+    }
+
+    #[test]
+    fn runner_configs_and_test_runner_packages_are_recognised_by_name() {
+        for runner_config in [
+            "vitest.config.ts",
+            "test/vitest.unit-paths.mjs",
+            "jest.setup.js",
+            "app/vite.config.mts",
+        ] {
+            assert!(
+                is_runner_config(&repo_path(runner_config)),
+                "{runner_config}"
+            );
+        }
+
+        for other_file in ["src/vitest-helpers.ts", "vite.ts", "src/jester.ts"] {
+            assert!(!is_runner_config(&repo_path(other_file)), "{other_file}");
+        }
+
+        for runner_package in [
+            "vitest",
+            "@vitest/coverage-v8",
+            "jest-environment-jsdom",
+            "@jest/globals",
+            "vite",
+        ] {
+            assert!(is_test_runner_package(runner_package), "{runner_package}");
+        }
+
+        for other_package in [
+            "lodash",
+            "vue",
+            "@vue/shared",
+            "jestful",
+            "@vitest/eslint-plugin",
+        ] {
+            assert!(!is_test_runner_package(other_package), "{other_package}");
+        }
+    }
+
+    #[test]
+    fn package_lists_are_sorted_so_they_stay_easy_to_review() {
+        assert!(TEST_RUNNER_PACKAGES.is_sorted());
     }
 }

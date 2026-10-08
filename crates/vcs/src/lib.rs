@@ -59,6 +59,27 @@ impl GitRepository {
         Ok(files)
     }
 
+    pub fn read_file(&self, revision: &str, path: &RepoPath) -> Result<Option<Vec<u8>>> {
+        let commit = self.resolve_commit(revision)?;
+        let tree = self.repository.find_commit(commit)?.tree()?;
+        let Some(entry) = tree
+            .lookup_entry_by_path(path.as_str())
+            .with_context(|| format!("cannot look up {path} at {revision:?}"))?
+        else {
+            return Ok(None);
+        };
+
+        if !entry.mode().is_blob_or_symlink() {
+            return Ok(None);
+        }
+
+        let blob = entry
+            .object()
+            .with_context(|| format!("cannot read {path} at {revision:?}"))?;
+
+        Ok(Some(blob.detach().data))
+    }
+
     pub fn resolve_revisions(&self, base: &str, head: &str) -> Result<ResolvedRevisions> {
         let commit_range = self.commit_range(base, head)?;
 

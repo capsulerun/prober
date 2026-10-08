@@ -23,6 +23,10 @@ impl ProberRun {
 
 impl TestRepository {
     fn with_project_on_main() -> Self {
+        Self::with_files_on_main(&[])
+    }
+
+    fn with_files_on_main(extra_files: &[(&str, &str)]) -> Self {
         let test_repository = Self {
             directory: TempDir::new().unwrap(),
         };
@@ -37,10 +41,13 @@ impl TestRepository {
         );
         test_repository.write("src/b.test.ts", r#"import { b } from "./b";"#);
         test_repository.write("docs/guide.md", "# Guide");
+
+        for &(path, content) in extra_files {
+            test_repository.write(path, content);
+        }
+
         test_repository.commit_all("project");
         test_repository.git(&["switch", "--quiet", "--create", "feature"]);
-
-        fs::create_dir(test_repository.path().join("node_modules")).unwrap();
 
         test_repository
     }
@@ -290,7 +297,7 @@ fn docs_only_change_selects_no_test() {
 fn built_in_global_file_change_runs_every_test() {
     let repository = TestRepository::with_project_on_main();
 
-    repository.change_and_commit("package.json", r#"{ "name": "app", "private": true }"#);
+    repository.change_and_commit(".npmrc", "registry=https://registry.example.com/\n");
 
     let run = repository.prober(&["--base", "main", "--format", "json"]);
     let report = run.json();
@@ -300,14 +307,210 @@ fn built_in_global_file_change_runs_every_test() {
         report["mode_reasons"],
         json!([{
             "kind": "always_all",
-            "file": "package.json",
-            "pattern": "**/package.json",
-            "message": "package.json (modified) matches always_all \"**/package.json\"",
+            "file": ".npmrc",
+            "pattern": "**/.npmrc",
+            "message": ".npmrc (added) matches always_all \"**/.npmrc\"",
         }])
     );
     assert_eq!(
         report["targets"],
         json!({ "typescript": ["src/a.test.ts", "src/b.test.ts"] })
+    );
+}
+
+const LOCKFILE: &str = "lockfileVersion: '9.0'
+
+importers:
+  .:
+    dependencies:
+      lodash:
+        specifier: ^4.17.20
+        version: 4.17.20
+    devDependencies:
+      eslint:
+        specifier: ^9.0.0
+        version: 9.0.0
+      vitest:
+        specifier: ^3.2.0
+        version: 3.2.0
+
+packages:
+  eslint@9.0.0:
+    resolution: {integrity: sha512-eslint}
+  lodash@4.17.20:
+    resolution: {integrity: sha512-lodash}
+  vitest@3.2.0:
+    resolution: {integrity: sha512-vitest}
+
+snapshots:
+  eslint@9.0.0: {}
+  lodash@4.17.20: {}
+  vitest@3.2.0: {}
+";
+
+const MANIFEST: &str = r#"{
+  "name": "app",
+  "version": "1.0.0",
+  "dependencies": { "lodash": "^4.17.20" },
+  "devDependencies": { "eslint": "^9.0.0", "vitest": "^3.2.0" }
+}"#;
+
+fn repository_with_dependencies() -> TestRepository {
+    TestRepository::with_files_on_main(&[
+        ("package.json", MANIFEST),
+        ("pnpm-lock.yaml", LOCKFILE),
+        (
+            "src/a.ts",
+            r#"import { chunk } from "lodash"; export const a = chunk;"#,
+        ),
+    ])
+}
+
+fn bump(repository: &TestRepository, package: &str, from: &str, to: &str) {
+    let manifest = fs::read_to_string(repository.path().join("package.json")).unwrap();
+    let lockfile = fs::read_to_string(repository.path().join("pnpm-lock.yaml")).unwrap();
+
+    repository.write(
+        "package.json",
+        &manifest.replace(&format!("\"^{from}\""), &format!("\"^{to}\"")),
+    );
+    repository.write(
+        "pnpm-lock.yaml",
+        &lockfile
+            .replace(&format!("{package}@{from}"), &format!("{package}@{to}"))
+            .replace(&format!("^{from}"), &format!("^{to}"))
+            .replace(&format!("version: {from}"), &format!("version: {to}")),
+    );
+    repository.commit_all(&format!("bump {package}"));
+}
+
+#[test]
+fn release_version_bump_selects_no_test() {
+    let repository = repository_with_dependencies();
+
+    repository.change_and_commit("package.json", &MANIFEST.replace("1.0.0", "1.1.0"));
+
+    let run = repository.prober(&["--base", "main"]);
+
+    assert_eq!(run.stdout, "");
+    assert_eq!(
+        run.stderr,
+        "prober: none of 2 test files — 1 changed file reaches no test file\n"
+    );
+}
+
+#[test]
+fn tooling_bump_selects_no_test() {
+    let repository = repository_with_dependencies();
+
+    bump(&repository, "eslint", "9.0.0", "9.1.0");
+
+    let run = repository.prober(&["--base", "main"]);
+
+    assert_eq!(run.stdout, "");
+    assert_eq!(
+        run.stderr,
+        "prober: none of 2 test files — 2 changed files reach no test file\n"
+    );
+}
+
+#[test]
+fn runtime_dependency_bump_selects_the_tests_reaching_its_importers() {
+    let repository = repository_with_dependencies();
+
+    bump(&repository, "lodash", "4.17.20", "4.17.21");
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(report["mode"], "selected");
+    assert_eq!(
+        report["targets"],
+        json!({ "typescript": ["src/a.test.ts", "src/b.test.ts"] })
+    );
+    assert_eq!(
+        report["reasons"]["src/a.test.ts"],
+        json!([
+            "pnpm-lock.yaml (modified)",
+            "-> package lodash changed (4.17.20 -> 4.17.21)",
+            "-> imported by src/a.ts",
+            "-> imported by src/a.test.ts",
+        ])
+    );
+}
+
+#[test]
+fn runner_bump_runs_every_test_with_a_root_scope_reason() {
+    let repository = repository_with_dependencies();
+
+    bump(&repository, "vitest", "3.2.0", "3.2.1");
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(report["mode"], "all");
+    assert_eq!(
+        report["mode_reasons"],
+        json!([{
+            "kind": "root_scope",
+            "file": "pnpm-lock.yaml",
+            "package": "vitest",
+            "message": "pnpm-lock.yaml (modified) changes package vitest (3.2.0 -> 3.2.1), which every test loads",
+        }])
+    );
+}
+
+#[test]
+fn exports_change_selects_the_tests_whose_imports_resolve_elsewhere() {
+    let lib_manifest = r#"{ "name": "@acme/lib", "exports": { ".": "./src/index.ts" } }"#;
+    let repository = TestRepository::with_files_on_main(&[
+        ("pnpm-workspace.yaml", "packages:\n  - packages/*\n"),
+        ("packages/lib/package.json", lib_manifest),
+        ("packages/lib/src/index.ts", "export const lib = 1;"),
+        ("packages/lib/src/next.ts", "export const lib = 2;"),
+        (
+            "src/a.ts",
+            r#"import { lib } from "@acme/lib"; export const a = lib;"#,
+        ),
+    ]);
+
+    repository.change_and_commit(
+        "packages/lib/package.json",
+        &lib_manifest.replace("./src/index.ts", "./src/next.ts"),
+    );
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["reasons"]["src/a.test.ts"],
+        json!([
+            "packages/lib/package.json (modified)",
+            "-> src/a.ts resolves \"@acme/lib\" differently",
+            "-> imported by src/a.test.ts",
+        ])
+    );
+    assert_eq!(
+        report["targets"],
+        json!({ "typescript": ["src/a.test.ts", "src/b.test.ts"] })
+    );
+}
+
+#[test]
+fn manifests_switched_off_keep_package_json_global() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.write("prober.toml", "[inference]\nmanifests = false\n");
+    repository.change_and_commit("package.json", r#"{ "name": "app", "private": true }"#);
+
+    let run = repository.prober(&["--base", "main"]);
+
+    assert_eq!(
+        run.stderr,
+        "prober: all 2 test files — package.json (modified) matches always_all \"**/package.json\"\n"
     );
 }
 
@@ -504,21 +707,6 @@ fn scan_outside_a_repository_fails() {
             .starts_with("prober scan: no git repository found at "),
         "{}",
         run.stderr
-    );
-}
-
-#[test]
-fn missing_node_modules_is_warned_about_before_the_summary() {
-    let repository = TestRepository::with_project_on_main();
-
-    fs::remove_dir(repository.path().join("node_modules")).unwrap();
-    repository.change_and_commit("src/a.ts", "export const a = 2;");
-
-    let run = repository.prober(&["--base", "main"]);
-
-    assert_eq!(
-        run.stderr,
-        "prober: warning: node_modules not found: imports between workspace packages cannot be resolved, run prober after installing dependencies\nprober: selected 2/2 test files (100.0%)\n"
     );
 }
 

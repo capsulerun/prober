@@ -1,8 +1,8 @@
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, ExportAllDeclaration, ExportFromDeclaration, Expression,
-    ImportDeclaration, ImportExpression, ImportOrExportKind, NewExpression,
-    TSImportEqualsDeclaration, TSModuleReference,
+    ImportDeclaration, ImportExpression, ImportOrExportKind, NewExpression, StringLiteral,
+    TSImportEqualsDeclaration, TSModuleReference, TemplateLiteral,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
@@ -44,6 +44,41 @@ pub fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
     import_collector.visit_program(&parsed.program);
 
     import_collector.parsed_imports
+}
+
+pub fn string_literals(path: &RepoPath, source_text: &str) -> Vec<String> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
+    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    let mut literal_collector = LiteralCollector::default();
+
+    literal_collector.visit_program(&parsed.program);
+
+    literal_collector.literals
+}
+
+#[derive(Default)]
+struct LiteralCollector {
+    literals: Vec<String>,
+}
+
+impl<'a> Visit<'a> for LiteralCollector {
+    fn visit_string_literal(&mut self, string_literal: &StringLiteral<'a>) {
+        self.literals.push(string_literal.value.to_string());
+    }
+
+    fn visit_template_literal(&mut self, template_literal: &TemplateLiteral<'a>) {
+        if template_literal.expressions.is_empty()
+            && let Some(text) = template_literal
+                .quasis
+                .first()
+                .and_then(|quasi| quasi.value.cooked.as_deref())
+        {
+            self.literals.push(text.to_owned());
+        }
+
+        walk::walk_template_literal(self, template_literal);
+    }
 }
 
 #[derive(Default)]
@@ -337,6 +372,20 @@ mod tests {
                 runtime("./logger"),
                 runtime("./clock")
             ]
+        );
+    }
+
+    #[test]
+    fn string_literals_include_plain_templates_but_not_interpolated_ones() {
+        let source_text = r#"
+            export default defineConfig({
+                test: { setupFiles: ["./test/setup.ts", `scripts/setup-vitest.ts`], name: `unit-${id}` },
+            });
+        "#;
+
+        assert_eq!(
+            string_literals(&RepoPath::new("vitest.config.ts").unwrap(), source_text),
+            ["./test/setup.ts", "scripts/setup-vitest.ts"]
         );
     }
 

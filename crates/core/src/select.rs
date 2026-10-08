@@ -14,6 +14,7 @@ pub enum Widening {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     Edge { kind: EdgeKind, dependency: FileId },
+    ChangedPart(usize),
     UnresolvedSite(usize),
 }
 
@@ -33,7 +34,7 @@ impl Reason {
     pub fn widening_site(&self) -> Option<usize> {
         match self.hops.first()?.link {
             Link::UnresolvedSite(site_index) => Some(site_index),
-            Link::Edge { .. } => None,
+            Link::Edge { .. } | Link::ChangedPart(_) => None,
         }
     }
 }
@@ -105,6 +106,23 @@ fn discover_dependents<'a>(
             changed_file,
             change,
             None,
+        );
+    }
+
+    for (part_index, changed_part) in graph.changed_parts().iter().enumerate() {
+        let Some(&change) = changes_by_path
+            .iter()
+            .find(|change| change.path == changed_part.change_path)
+        else {
+            continue;
+        };
+
+        discover(
+            &mut discoveries,
+            &mut files_to_visit,
+            changed_part.node,
+            change,
+            Some(Link::ChangedPart(part_index)),
         );
     }
 
@@ -202,7 +220,7 @@ fn trace_reason(test_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> 
 
         match link {
             Link::Edge { dependency, .. } => file = dependency,
-            Link::UnresolvedSite(_) => break,
+            Link::ChangedPart(_) | Link::UnresolvedSite(_) => break,
         }
     }
 
@@ -679,6 +697,82 @@ mod tests {
         assert_eq!(
             widening_sites(&graph, &[modified("src/a.ts")])[1],
             ("src/fresh.test.ts".to_owned(), Some(0))
+        );
+    }
+
+    #[test]
+    fn changed_part_selects_through_its_node_instead_of_the_whole_file() {
+        let mut builder = GraphBuilder::default();
+        let lodash = builder.add_file(repo_path("node_modules/lodash"));
+        let a = builder.add_file(repo_path("src/a.ts"));
+        let a_test = builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
+        let b = builder.add_file(repo_path("src/b.ts"));
+        let b_test = builder.add_test_file(repo_path("src/b.test.ts"), "typescript");
+        let import_edges = [(a, lodash), (a_test, a), (b_test, b)];
+
+        for (dependent, dependency) in import_edges {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind: Import,
+            });
+        }
+
+        builder.add_changed_part(
+            repo_path("pnpm-lock.yaml"),
+            repo_path("node_modules/lodash"),
+            "package lodash changed (4.17.20 -> 4.17.21)".to_owned(),
+        );
+
+        let graph = builder.build();
+        let selected_tests = select_tests(&graph, &[modified("pnpm-lock.yaml")], Widening::Scoped);
+
+        assert_eq!(selected_tests.len(), 1);
+        assert_eq!(
+            reason_files(&graph, &selected_tests[0]),
+            [
+                "pnpm-lock.yaml",
+                "node_modules/lodash",
+                "src/a.ts",
+                "src/a.test.ts"
+            ]
+        );
+        assert_eq!(
+            selected_tests[0].reason.hops[0],
+            Hop {
+                dependent: lodash,
+                link: Link::ChangedPart(0),
+            }
+        );
+        assert_eq!(selected_tests[0].reason.widening_site(), None);
+    }
+
+    #[test]
+    fn changed_part_of_a_file_outside_the_diff_selects_nothing() {
+        let mut builder = GraphBuilder::default();
+        let a = builder.add_file(repo_path("src/a.ts"));
+        let a_test = builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
+
+        builder.add_edge(Edge {
+            dependent: a_test,
+            dependency: a,
+            kind: Import,
+        });
+        builder.add_changed_part(
+            repo_path("package.json"),
+            repo_path("src/a.ts"),
+            "src/a.ts is affected by field \"type\"".to_owned(),
+        );
+
+        let graph = builder.build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("pnpm-lock.yaml")]),
+            []
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("package.json")]),
+            [("src/a.test.ts", 2)]
         );
     }
 
