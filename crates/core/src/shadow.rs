@@ -59,13 +59,18 @@ pub struct RecordedSelection {
 #[derive(Deserialize)]
 struct SelectionJson {
     schema_version: u32,
+
     #[serde(default)]
     revisions: Option<ResolvedRevisions>,
+
     mode: String,
+
     #[serde(default)]
     mode_reasons: Option<Vec<ModeReasonRecord>>,
+
     #[serde(default)]
     targets: BTreeMap<String, Vec<String>>,
+
     #[serde(default)]
     distances: BTreeMap<String, usize>,
 }

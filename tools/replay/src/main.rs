@@ -1,3 +1,4 @@
+mod base_branches;
 mod changes;
 mod collect;
 mod commands;
@@ -5,6 +6,8 @@ mod config;
 mod failures;
 mod logs;
 mod record;
+mod report;
+mod repository_files;
 mod selections;
 mod snapshot;
 mod worktree;
@@ -15,6 +18,7 @@ use clap::{Parser, Subcommand};
 
 use crate::collect::CollectArguments;
 use crate::failures::FailuresArguments;
+use crate::report::ReportArguments;
 use crate::selections::SelectionsArguments;
 
 #[derive(Debug, Parser)]
@@ -39,6 +43,11 @@ enum Command {
 
     #[command(about = "Extracts the changes and their failed test files from a snapshot")]
     Failures(FailuresArguments),
+
+    #[command(
+        about = "Writes the benchmark report: savings on merged changes and misses on failed changes"
+    )]
+    Report(ReportArguments),
 }
 
 fn main() -> ExitCode {
@@ -46,6 +55,7 @@ fn main() -> ExitCode {
         Command::Selections(arguments) => selections::run(&arguments),
         Command::Collect(arguments) => collect::run(&arguments),
         Command::Failures(arguments) => failures::run(&arguments),
+        Command::Report(arguments) => report::run(&arguments),
     };
 
     match outcome {

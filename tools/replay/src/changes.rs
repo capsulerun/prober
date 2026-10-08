@@ -10,6 +10,7 @@ use crate::commands::git;
 pub struct Change {
     #[serde(default)]
     pub id: String,
+
     pub base: String,
     pub head: String,
 }
