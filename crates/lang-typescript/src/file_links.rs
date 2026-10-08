@@ -21,6 +21,7 @@ use crate::dynamic::value::{AccessKind, Pattern, Value};
 use crate::file_links::accesses::{AccessTarget, Location, access_targets};
 use crate::file_links::listed::{ListedPath, is_stylesheet, listed_paths, lists_paths};
 use crate::linker::LinkedFile;
+use crate::manifests::is_manifest;
 use crate::presets::patterns::join_directory;
 use crate::repo_index::RepoIndex;
 use crate::resolver::ModuleResolver;
@@ -485,7 +486,7 @@ impl FileReading<'_> {
                 listed.into_iter().filter_map(move |listed_path| {
                     let candidates: Vec<String> = candidate_paths(&directories, &listed_path.text)
                         .into_iter()
-                        .filter(|candidate| is_known(candidate))
+                        .filter(|candidate| is_known(candidate) && !names_a_manifest(candidate))
                         .collect();
 
                     (!candidates.is_empty()).then_some(Reading {
@@ -587,6 +588,10 @@ impl FileReading<'_> {
             }
         }
     }
+}
+
+fn names_a_manifest(candidate: &str) -> bool {
+    RepoPath::new(candidate).is_ok_and(|path| is_manifest(&path))
 }
 
 fn file_extensions(repo_files: &[RepoPath]) -> HashSet<&str> {

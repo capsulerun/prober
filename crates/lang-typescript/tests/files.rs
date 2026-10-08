@@ -317,8 +317,9 @@ execFileSync("python3", ["scripts/check_contract.py"]);
         ),
         (
             "scripts/check_contract.py",
-            "import json\n\nwith open(\"contracts/session.json\") as contract:\n    json.load(contract)\n",
+            "import json\n\nwith open(\"contracts/session.json\") as contract:\n    json.load(contract)\n\nprint(open(\"package.json\").read())\n",
         ),
+        ("package.json", r#"{ "name": "app" }"#),
         ("contracts/session.json", r#"{ "type": "object" }"#),
         (
             "apps/android/src/test/SessionContractTest.kt",
@@ -337,6 +338,7 @@ execFileSync("python3", ["scripts/check_contract.py"]);
             ],
         )])
     );
+    assert_eq!(dependents(&project.link(), "package.json"), []);
 }
 
 #[test]
