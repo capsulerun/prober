@@ -28,7 +28,7 @@ impl ReportPaths {
         }
     }
 
-    fn resolve(&self, reported_path: &str) -> Option<RepoPath> {
+    pub fn resolve(&self, reported_path: &str) -> Option<RepoPath> {
         let reported_path = reported_path.trim().replace('\\', "/");
         let path_from_repo_root = match Path::new(&reported_path).strip_prefix(&self.repo_root) {
             Ok(path_inside_repo) => path_inside_repo.to_str()?.replace('\\', "/"),
@@ -289,7 +289,7 @@ fn test_case_file(
         .find_map(|candidate| report_paths.resolve(candidate))
 }
 
-fn looks_like_test_file(name: &str) -> bool {
+pub fn looks_like_test_file(name: &str) -> bool {
     let has_whitespace = name.chars().any(char::is_whitespace);
     let extension = name
         .rsplit('/')

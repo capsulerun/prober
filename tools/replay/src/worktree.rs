@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
-use crate::git::git;
+use crate::commands::git;
 
 pub struct Worktree {
     path: PathBuf,
@@ -40,6 +40,20 @@ impl Worktree {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    pub fn has_commit(&self, commit: &str) -> bool {
+        git(
+            &self.path,
+            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+        )
+        .is_ok()
+    }
+
+    pub fn fetch(&self, commit: &str) -> Result<()> {
+        git(&self.path, &["fetch", "--quiet", "origin", commit])?;
+
+        Ok(())
     }
 
     pub fn check_out(&self, commit: &str) -> Result<()> {

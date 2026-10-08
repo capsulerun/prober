@@ -4,7 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 
-use crate::git::git;
+use crate::commands::git;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Change {

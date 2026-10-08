@@ -108,15 +108,19 @@ impl ReplayFixture {
     }
 
     fn replay(&self, arguments: &[&str]) -> ReplayRun {
-        self.replay_with_prober("prober", arguments)
+        self.replay_with(&self.repository(), "prober", arguments)
     }
 
     fn replay_with_prober(&self, prober_script: &str, arguments: &[&str]) -> ReplayRun {
-        let repository = self.repository();
+        self.replay_with(&self.repository(), prober_script, arguments)
+    }
+
+    fn replay_with(&self, repository: &Path, prober_script: &str, arguments: &[&str]) -> ReplayRun {
         let output = self.path("records.jsonl");
         let worktree = self.path("worktree");
         let output = Command::new(env!("CARGO_BIN_EXE_prober-replay"))
             .args([
+                "selections",
                 "--repo",
                 repository.to_str().unwrap(),
                 "--output",
@@ -322,4 +326,42 @@ fn setup_command_runs_once_when_the_worktree_is_created() {
     assert!(created_on_first_run);
     assert!(!Path::new(&setup_marker).exists());
     assert_eq!(fixture.records().len(), 2);
+}
+
+#[test]
+fn missing_heads_are_fetched_from_origin_when_asked() {
+    let fixture = ReplayFixture::with_commits(2);
+    let clone = fixture.path("clone");
+    let changes_path = fixture.path("changes.jsonl");
+
+    fixture.git(&[
+        "clone",
+        "--quiet",
+        fixture.repository().to_str().unwrap(),
+        clone.to_str().unwrap(),
+    ]);
+    fs::write(fixture.repository().join("late.ts"), "export {};").unwrap();
+    fixture.git(&["add", "--all"]);
+    fixture.git(&["commit", "--quiet", "--message", "late commit"]);
+
+    let late_commit = fixture.git(&["rev-parse", "HEAD"]).trim().to_owned();
+
+    fs::write(
+        &changes_path,
+        format!(
+            "{{\"base\": \"{}\", \"head\": \"{late_commit}\"}}\n",
+            fixture.commits[0]
+        ),
+    )
+    .unwrap();
+    fixture.replay_with(
+        &clone,
+        "prober",
+        &["--changes", changes_path.to_str().unwrap(), "--fetch"],
+    );
+
+    let records = fixture.records();
+
+    assert_eq!(records[0]["error"], Value::Null);
+    assert_eq!(records[0]["selection"]["revisions"]["head"], late_commit);
 }
