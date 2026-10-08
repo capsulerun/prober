@@ -24,7 +24,7 @@ fn loaded_by(graph: &Graph, dependency: &str) -> Vec<(String, String)> {
 
             (
                 format!("{}:{}", graph.path(edge.dependent), inference.line),
-                inference.description.clone(),
+                inference.description(),
             )
         })
         .collect()
@@ -518,8 +518,8 @@ fn plugin_folders_with_a_manifest_link_every_file_of_the_folder() {
     );
 
     let without_plugin_folders = project.link_with(InferenceSettings {
-        dynamic_imports: true,
         plugin_folders: false,
+        ..InferenceSettings::default()
     });
 
     assert_eq!(
@@ -618,6 +618,47 @@ fn loads_that_cannot_be_known_are_unresolved_with_their_cause() {
 }
 
 #[test]
+fn load_of_a_missing_file_links_the_paths_it_names_without_widening() {
+    let project = TestProject::new(&[
+        (
+            "src/loader.ts",
+            r#"
+                import path from "node:path";
+
+                export const runtime = await import(path.join(__dirname, "runtime.js"));
+            "#,
+        ),
+        (
+            "src/loader.test.ts",
+            r#"import { runtime } from "./loader";"#,
+        ),
+        ("src/other.ts", ""),
+    ]);
+    let graph = project.link();
+
+    assert_eq!(
+        loaded_by(&graph, "src/runtime.ts"),
+        [loaded("src/loader.ts:4", "inferred path src/runtime.js")]
+    );
+    assert_eq!(
+        selected_tests(&graph, &[change("src/runtime.ts", ChangeKind::Deleted)]),
+        ["src/loader.test.ts"]
+    );
+    assert_eq!(
+        selected_tests(&graph, &[change("src/other.ts", ChangeKind::Modified)]),
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        unresolved_sites(&graph),
+        [unresolved(
+            "src/loader.ts:4",
+            r#"path.join(__dirname, "runtime.js")"#,
+            UnresolvedCause::NoMatchingFile
+        )]
+    );
+}
+
+#[test]
 fn disabled_inference_leaves_every_dynamic_load_unresolved() {
     let project = TestProject::new(&[
         (
@@ -641,7 +682,7 @@ fn disabled_inference_leaves_every_dynamic_load_unresolved() {
     ]);
     let graph = project.link_with(InferenceSettings {
         dynamic_imports: false,
-        plugin_folders: true,
+        ..InferenceSettings::default()
     });
 
     assert_eq!(loaded_by(&graph, "src/plugins/telegram.ts"), []);

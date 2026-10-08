@@ -6,5 +6,6 @@ pub mod junit;
 pub mod outcomes;
 mod ratios;
 pub mod report;
+pub mod scan;
 pub mod select;
 pub mod shadow;

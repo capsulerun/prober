@@ -1,4 +1,5 @@
 mod pipeline;
+mod scan;
 mod shadow;
 
 use std::env;
@@ -10,6 +11,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use prober_core::report::ListSeparator;
 
 use crate::pipeline::{OnError, Revisions, SelectionRun};
+use crate::scan::ScanArguments;
 use crate::shadow::ShadowArguments;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -38,6 +40,11 @@ struct Arguments {
 enum Command {
     #[command(about = "Compares a recorded selection with the JUnit reports of a full test run")]
     Shadow(ShadowArguments),
+
+    #[command(
+        about = "Reports what Prober infers from the repository, what it cannot resolve, and the files no test reaches"
+    )]
+    Scan(ScanArguments),
 }
 
 #[derive(Debug, Args)]
@@ -76,6 +83,7 @@ fn main() -> ExitCode {
 
     match &arguments.command {
         Some(Command::Shadow(shadow_arguments)) => shadow::run(shadow_arguments),
+        Some(Command::Scan(scan_arguments)) => scan::run(scan_arguments),
         None => select(&arguments.selection),
     }
 }

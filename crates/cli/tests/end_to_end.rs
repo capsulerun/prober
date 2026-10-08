@@ -215,7 +215,7 @@ fn json_report_explains_each_selected_test() {
 }
 
 #[test]
-fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader() {
+fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader_unless_widening_is_off() {
     let repository = TestRepository::with_project_on_main();
 
     repository.write(
@@ -245,9 +245,29 @@ fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader() {
 
     repository.write("prober.toml", "[inference]\ndynamic_imports = false\n");
 
-    let without_inference = repository.prober(&["--base", "HEAD~1"]);
+    let without_inference = repository.prober(&["--base", "HEAD~1", "--format", "json"]);
 
-    assert_eq!(without_inference.stdout, "");
+    assert_eq!(
+        without_inference.json()["reasons"],
+        json!({ "src/loader.test.ts": [
+            "src/plugins/telegram.ts (modified)",
+            "-> widened: unresolved dynamic import at src/loader.ts:2 (`./plugins/${name}.js`)",
+            "-> imported by src/loader.test.ts",
+        ] })
+    );
+    assert_eq!(
+        without_inference.stderr,
+        "prober: selected 1/3 test files (33.3%), 1 added by widening\n"
+    );
+
+    repository.write(
+        "prober.toml",
+        "[inference]\ndynamic_imports = false\nwidening = false\n",
+    );
+
+    let without_widening = repository.prober(&["--base", "HEAD~1"]);
+
+    assert_eq!(without_widening.stdout, "");
 }
 
 #[test]
@@ -407,6 +427,81 @@ fn outside_a_repository_fails_even_with_on_error_all() {
     assert!(
         run.stderr
             .starts_with("prober: no git repository found at "),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.write(
+        "src/loader.ts",
+        "const name = process.env.PLUGIN;\nexport const plugin = await import(`./plugins/${name}.js`);\n",
+    );
+    repository.write("src/plugins/telegram.ts", "export const id = 1;");
+    repository.write(
+        "src/worker.ts",
+        "onMessage((request: { moduleUrl: string }) => import(request.moduleUrl));\nexport const ready = true;\n",
+    );
+    repository.write("src/worker.test.ts", r#"import { ready } from "./worker";"#);
+    repository.commit_all("loaders");
+
+    let run = repository.prober(&["scan", "--format", "json"]);
+    let scan = run.json();
+
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(
+        scan["inferred"],
+        json!([{
+            "site": "src/loader.ts:2",
+            "patterns": [{ "kind": "glob", "pattern": "src/plugins/*.js" }],
+            "links": 1,
+        }])
+    );
+    assert_eq!(
+        scan["unresolved"],
+        json!([{
+            "site": "src/worker.ts:1",
+            "expression": "request.moduleUrl",
+            "cause": "parameter",
+            "tests": 1,
+        }])
+    );
+    assert_eq!(
+        scan["unreachable"],
+        json!({
+            "modules": ["package.json", "src/loader.ts", "src/plugins/telegram.ts"],
+            "other_files": ["docs/guide.md"],
+        })
+    );
+    assert_eq!(
+        run.stderr,
+        "prober scan: 1 links inferred from 1 sites; 1 unresolved sites reach 1/3 test files (33.3%); 0 sites load missing files; 4 files reach no test\n"
+    );
+
+    let text_run = repository.prober(&["scan"]);
+
+    assert!(
+        text_run
+            .stdout
+            .starts_with("Inferred links: 1 from 1 sites\n"),
+        "{}",
+        text_run.stdout
+    );
+}
+
+#[test]
+fn scan_outside_a_repository_fails() {
+    let directory = TempDir::new().unwrap();
+    let run = run_prober(directory.path(), &["scan"], None);
+
+    assert_eq!(run.exit_code, 1);
+    assert_eq!(run.stdout, "");
+    assert!(
+        run.stderr
+            .starts_with("prober scan: no git repository found at "),
         "{}",
         run.stderr
     );

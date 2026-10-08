@@ -9,7 +9,7 @@ use prober_core::changes::{ChangeKind, FileChange};
 use prober_core::config::InferenceSettings;
 use prober_core::files::RepoPath;
 use prober_core::graph::{EdgeKind, Graph, GraphBuilder};
-use prober_core::select::select_tests;
+use prober_core::select::{Widening, select_tests};
 use prober_lang_typescript::TypeScriptLinker;
 use tempfile::TempDir;
 
@@ -110,7 +110,7 @@ pub fn dependents<'g>(graph: &'g Graph, dependency: &str) -> Vec<(&'g str, EdgeK
 }
 
 pub fn selected_tests(graph: &Graph, changes: &[FileChange]) -> Vec<String> {
-    select_tests(graph, changes)
+    select_tests(graph, changes, Widening::Scoped)
         .iter()
         .map(|selected_test| graph.path(selected_test.file).as_str().to_owned())
         .collect()

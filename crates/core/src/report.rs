@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -7,9 +8,11 @@ use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{EdgeKind, Graph, TestFile};
 use crate::ratios::{format_percentage, rounded_ratio};
-use crate::select::{Hop, Reason, SelectedTest};
+use crate::select::{Hop, Link, Reason, SelectedTest};
 
 const SCHEMA_VERSION: u32 = 1;
+
+const UNRESOLVED_DYNAMIC_IMPORT: &str = "unresolved-dynamic-import";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
@@ -101,6 +104,13 @@ pub struct Target {
     pub impact: Option<Impact>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WidenedSite {
+    pub site: String,
+    pub cause: &'static str,
+    pub added: usize,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListSeparator {
     Newline,
@@ -112,6 +122,7 @@ pub struct Report {
     pub revisions: Option<ResolvedRevisions>,
     pub mode: Mode,
     pub targets: Vec<Target>,
+    pub widened: Vec<WidenedSite>,
     pub test_count_by_language: BTreeMap<&'static str, usize>,
     pub config_hash: String,
 }
@@ -148,6 +159,7 @@ impl Report {
             revisions: None,
             mode,
             targets,
+            widened: widened_sites(graph, selected_tests),
             test_count_by_language: count_by_language(&graph.test_files_by_path()),
             config_hash,
         }
@@ -168,6 +180,7 @@ impl Report {
             revisions: None,
             mode: Mode::All { reasons },
             targets,
+            widened: Vec::new(),
             test_count_by_language: count_by_language(&test_files),
             config_hash,
         }
@@ -182,6 +195,13 @@ impl Report {
 
     pub fn test_count(&self) -> usize {
         self.test_count_by_language.values().sum()
+    }
+
+    pub fn tests_added_by_widening(&self) -> usize {
+        self.widened
+            .iter()
+            .map(|widened_site| widened_site.added)
+            .sum()
     }
 
     pub fn to_json(&self) -> String {
@@ -212,6 +232,7 @@ impl Report {
             targets,
             reasons,
             distances,
+            widened: self.widened.iter().map(JsonWidenedSite::new).collect(),
             stats: self.json_stats(),
         };
         let mut json =
@@ -242,9 +263,14 @@ impl Report {
         let selected_count = self.targets.len();
 
         match &self.mode {
-            Mode::Selected => format!(
+            Mode::Selected if self.widened.is_empty() => format!(
                 "prober: selected {selected_count}/{test_count} test files ({})",
                 format_percentage(selected_count as f64, test_count as f64)
+            ),
+            Mode::Selected => format!(
+                "prober: selected {selected_count}/{test_count} test files ({}), {} added by widening",
+                format_percentage(selected_count as f64, test_count as f64),
+                self.tests_added_by_widening()
             ),
             Mode::All { reasons } => format!(
                 "prober: all {test_count} test files — {}",
@@ -288,6 +314,7 @@ impl Report {
             tests_total: self.test_count(),
             tests_selected: self.targets.len(),
             selected_ratio: rounded_ratio(self.targets.len() as f64, self.test_count() as f64),
+            tests_added_by_widening: self.tests_added_by_widening(),
             by_language,
             config_hash: &self.config_hash,
         }
@@ -303,7 +330,27 @@ struct JsonReport<'a> {
     targets: BTreeMap<&'static str, Vec<&'a str>>,
     reasons: BTreeMap<&'a str, &'a [String]>,
     distances: BTreeMap<&'a str, usize>,
+    widened: Vec<JsonWidenedSite<'a>>,
     stats: JsonStats<'a>,
+}
+
+#[derive(Serialize)]
+struct JsonWidenedSite<'a> {
+    site: &'a str,
+    kind: &'static str,
+    cause: &'static str,
+    added: usize,
+}
+
+impl<'a> JsonWidenedSite<'a> {
+    fn new(widened_site: &'a WidenedSite) -> Self {
+        Self {
+            site: &widened_site.site,
+            kind: UNRESOLVED_DYNAMIC_IMPORT,
+            cause: widened_site.cause,
+            added: widened_site.added,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -344,6 +391,7 @@ struct JsonStats<'a> {
     tests_total: usize,
     tests_selected: usize,
     selected_ratio: f64,
+    tests_added_by_widening: usize,
     by_language: BTreeMap<&'static str, JsonLanguageStats>,
     config_hash: &'a str,
 }
@@ -384,18 +432,71 @@ fn describe_reason(graph: &Graph, reason: &Reason) -> Vec<String> {
 fn describe_hop(graph: &Graph, hop: &Hop) -> String {
     let dependent = graph.path(hop.dependent);
 
-    match hop.edge {
-        EdgeKind::Import => format!("-> imported by {dependent}"),
-        EdgeKind::TypeOnly => format!("-> type-imported by {dependent}"),
-        EdgeKind::Contains => format!("-> in folder {dependent}/"),
-        EdgeKind::Dynamic => match graph.inference(hop.dependent, hop.dependency) {
+    match hop.link {
+        Link::Edge {
+            kind: EdgeKind::Import,
+            ..
+        } => format!("-> imported by {dependent}"),
+        Link::Edge {
+            kind: EdgeKind::TypeOnly,
+            ..
+        } => format!("-> type-imported by {dependent}"),
+        Link::Edge {
+            kind: EdgeKind::Contains,
+            ..
+        } => format!("-> in folder {dependent}/"),
+        Link::Edge {
+            kind: EdgeKind::Dynamic,
+            dependency,
+        } => match graph.inference(hop.dependent, dependency) {
             Some(inference) => format!(
                 "-> loaded by {dependent}:{} ({})",
-                inference.line, inference.description
+                inference.line,
+                inference.description()
             ),
             None => format!("-> loaded by {dependent}"),
         },
+        Link::UnresolvedSite(site_index) => {
+            let unresolved_site = &graph.unresolved_sites()[site_index];
+
+            format!(
+                "-> widened: unresolved dynamic import at {dependent}:{} ({})",
+                unresolved_site.line, unresolved_site.expression
+            )
+        }
     }
+}
+
+fn widened_sites(graph: &Graph, selected_tests: &[SelectedTest]) -> Vec<WidenedSite> {
+    let mut added_by_site: BTreeMap<usize, usize> = BTreeMap::new();
+
+    for site_index in selected_tests
+        .iter()
+        .filter_map(|selected_test| selected_test.reason.widening_site())
+    {
+        *added_by_site.entry(site_index).or_default() += 1;
+    }
+
+    let mut widened_sites: Vec<WidenedSite> = added_by_site
+        .into_iter()
+        .map(|(site_index, added)| {
+            let unresolved_site = &graph.unresolved_sites()[site_index];
+
+            WidenedSite {
+                site: format!(
+                    "{}:{}",
+                    graph.path(unresolved_site.file),
+                    unresolved_site.line
+                ),
+                cause: unresolved_site.cause.key(),
+                added,
+            }
+        })
+        .collect();
+
+    widened_sites.sort_by_key(|widened_site| Reverse(widened_site.added));
+
+    widened_sites
 }
 
 fn join_messages(mode_reasons: &[ModeReason]) -> String {
@@ -409,8 +510,8 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::config::Config;
-    use crate::graph::{Edge, GraphBuilder, Inference};
-    use crate::select::select_tests;
+    use crate::graph::{Edge, GraphBuilder, Inference, UnresolvedCause, UnresolvedSite};
+    use crate::select::{Widening, select_tests};
 
     const CONFIG_HASH: &str = "0123456789abcdef";
 
@@ -465,7 +566,9 @@ mod tests {
             },
             Inference {
                 line: 7,
-                description: "inferred glob src/plugins/*.ts".to_owned(),
+                kind: "glob",
+                pattern: "src/plugins/*.ts".to_owned(),
+                detail: None,
             },
         );
 
@@ -473,7 +576,7 @@ mod tests {
     }
 
     fn report_for_changes(graph: &Graph, changes: &[FileChange]) -> Report {
-        let selected_tests = select_tests(graph, changes);
+        let selected_tests = select_tests(graph, changes, Widening::Scoped);
 
         Report::from_selection(graph, changes, &selected_tests, CONFIG_HASH.to_owned())
     }
@@ -528,10 +631,12 @@ mod tests {
     "src/a.test.ts": 1,
     "src/b.test.ts": 2
   },
+  "widened": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 2,
     "selected_ratio": 0.6667,
+    "tests_added_by_widening": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -566,6 +671,61 @@ mod tests {
             ])
         );
         assert_eq!(json_report["distances"]["src/loader.test.ts"], 2);
+    }
+
+    #[test]
+    fn widened_tests_are_counted_per_unresolved_site_and_explained() {
+        let mut builder = GraphBuilder::default();
+        let worker_test = builder.add_test_file(repo_path("src/worker.test.ts"), "typescript");
+        let pool_test = builder.add_test_file(repo_path("src/pool.test.ts"), "typescript");
+        let worker = builder.add_file(repo_path("src/worker.ts"));
+
+        builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+        builder.add_edge(Edge {
+            dependent: worker_test,
+            dependency: worker,
+            kind: EdgeKind::Import,
+        });
+        builder.add_edge(Edge {
+            dependent: pool_test,
+            dependency: worker,
+            kind: EdgeKind::Import,
+        });
+        builder.add_unresolved_site(UnresolvedSite {
+            file: worker,
+            line: 313,
+            expression: "request.moduleUrl".to_owned(),
+            cause: UnresolvedCause::Parameter,
+            language: "typescript",
+        });
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("src/a.ts")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["widened"],
+            serde_json::json!([{
+                "site": "src/worker.ts:313",
+                "kind": "unresolved-dynamic-import",
+                "cause": "parameter",
+                "added": 2,
+            }])
+        );
+        assert_eq!(json_report["stats"]["tests_added_by_widening"], 2);
+        assert_eq!(
+            json_report["reasons"]["src/pool.test.ts"],
+            serde_json::json!([
+                "src/a.ts (modified)",
+                "-> widened: unresolved dynamic import at src/worker.ts:313 (request.moduleUrl)",
+                "-> imported by src/pool.test.ts",
+            ])
+        );
+        assert_eq!(json_report["distances"]["src/pool.test.ts"], 2);
+        assert_eq!(
+            report.summary_line(),
+            "prober: selected 2/2 test files (100.0%), 2 added by widening"
+        );
     }
 
     #[test]
@@ -604,10 +764,12 @@ mod tests {
   },
   "reasons": {},
   "distances": {},
+  "widened": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 3,
     "selected_ratio": 1.0,
+    "tests_added_by_widening": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -647,10 +809,12 @@ mod tests {
   "targets": {},
   "reasons": {},
   "distances": {},
+  "widened": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 0,
     "selected_ratio": 0.0,
+    "tests_added_by_widening": 0,
     "by_language": {
       "python": {
         "total": 1,
