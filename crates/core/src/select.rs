@@ -58,6 +58,24 @@ struct Discovery<'a> {
     content: ContentChange,
 }
 
+#[derive(Default)]
+struct Discoveries<'a> {
+    files: HashMap<FileId, Discovery<'a>>,
+    origins: HashMap<FileId, Discovery<'a>>,
+}
+
+impl<'a> Discoveries<'a> {
+    fn discover_origin(
+        &mut self,
+        files_to_visit: &mut VecDeque<FileId>,
+        file: FileId,
+        discovery: Discovery<'a>,
+    ) {
+        self.origins.entry(file).or_insert(discovery);
+        discover(&mut self.files, files_to_visit, file, discovery);
+    }
+}
+
 pub fn select_tests(
     graph: &Graph,
     changes: &[FileChange],
@@ -99,10 +117,11 @@ fn is_asset_change(graph: &Graph, change: &FileChange) -> bool {
 
 fn tests_reached(
     graph: &Graph,
-    discoveries: &HashMap<FileId, Discovery>,
+    discoveries: &Discoveries,
     keeps: impl Fn(FileId) -> bool,
 ) -> Vec<SelectedTest> {
     discoveries
+        .files
         .keys()
         .filter(|&&file| graph.is_test(file) && keeps(file))
         .filter_map(|&test_file| {
@@ -118,7 +137,7 @@ fn tests_reached(
 
 fn reason_past_mocks(
     graph: &Graph,
-    discoveries: &HashMap<FileId, Discovery>,
+    discoveries: &Discoveries,
     test_file: FileId,
 ) -> Option<Reason> {
     let mocked_modules = graph.mocked_modules(test_file);
@@ -126,11 +145,16 @@ fn reason_past_mocks(
         mocked_modules.binary_search(&file).is_ok() && !graph.has_changed_contract(file)
     };
 
-    if trace_avoids(test_file, discoveries, &is_mocked) {
-        return Some(trace_reason(test_file, discoveries));
+    if trace_avoids(test_file, &discoveries.files, &is_mocked) {
+        return Some(trace_reason(test_file, &discoveries.files));
     }
 
     let mut dependents_on_path: HashMap<FileId, (FileId, EdgeKind)> = HashMap::new();
+
+    if let Some(origin) = discoveries.origins.get(&test_file) {
+        return Some(reason_from_origin(test_file, origin, &dependents_on_path));
+    }
+
     let mut files_to_visit = VecDeque::from([test_file]);
 
     while let Some(file) = files_to_visit.pop_front() {
@@ -142,6 +166,7 @@ fn reason_past_mocks(
         for edge in test_selecting_edges {
             let dependency = edge.dependency;
             let carries_the_change = discoveries
+                .files
                 .get(&dependency)
                 .is_some_and(|discovery| edge.kind.follows(discovery.content));
             let is_unexplored = dependency != test_file
@@ -155,8 +180,20 @@ fn reason_past_mocks(
 
             dependents_on_path.insert(dependency, (file, edge.kind));
 
-            if trace_avoids(dependency, discoveries, &is_mocked) {
-                return Some(reason_through(dependency, &dependents_on_path, discoveries));
+            if trace_avoids(dependency, &discoveries.files, &is_mocked) {
+                return Some(reason_through(
+                    dependency,
+                    &dependents_on_path,
+                    &discoveries.files,
+                ));
+            }
+
+            if let Some(origin) = discoveries
+                .origins
+                .get(&dependency)
+                .filter(|origin| edge.kind.follows(origin.content))
+            {
+                return Some(reason_from_origin(dependency, origin, &dependents_on_path));
             }
 
             files_to_visit.push_back(dependency);
@@ -190,7 +227,36 @@ fn reason_through(
     dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
     discoveries: &HashMap<FileId, Discovery>,
 ) -> Reason {
-    let mut reason = trace_reason(file, discoveries);
+    let reason = trace_reason(file, discoveries);
+
+    extended_to_the_test(reason, file, dependents_on_path)
+}
+
+fn reason_from_origin(
+    file: FileId,
+    origin: &Discovery,
+    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
+) -> Reason {
+    let reason = Reason {
+        change: origin.change.clone(),
+        hops: origin
+            .reached_via
+            .map(|link| Hop {
+                dependent: file,
+                link,
+            })
+            .into_iter()
+            .collect(),
+    };
+
+    extended_to_the_test(reason, file, dependents_on_path)
+}
+
+fn extended_to_the_test(
+    mut reason: Reason,
+    file: FileId,
+    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
+) -> Reason {
     let mut dependency = file;
 
     while let Some(&(dependent, kind)) = dependents_on_path.get(&dependency) {
@@ -208,8 +274,8 @@ fn discover_dependents<'a>(
     graph: &Graph,
     changes: &'a [FileChange],
     widening: Widening,
-) -> HashMap<FileId, Discovery<'a>> {
-    let mut discoveries = HashMap::new();
+) -> Discoveries<'a> {
+    let mut discoveries = Discoveries::default();
     let mut files_to_visit = VecDeque::new();
     let mut changes_by_path: Vec<&FileChange> = changes.iter().collect();
 
@@ -220,8 +286,7 @@ fn discover_dependents<'a>(
             continue;
         };
 
-        discover(
-            &mut discoveries,
+        discoveries.discover_origin(
             &mut files_to_visit,
             changed_file,
             Discovery {
@@ -240,8 +305,7 @@ fn discover_dependents<'a>(
             continue;
         };
 
-        discover(
-            &mut discoveries,
+        discoveries.discover_origin(
             &mut files_to_visit,
             changed_part.node,
             Discovery {
@@ -252,7 +316,7 @@ fn discover_dependents<'a>(
         );
     }
 
-    visit_dependents(graph, &mut discoveries, &mut files_to_visit);
+    visit_dependents(graph, &mut discoveries.files, &mut files_to_visit);
 
     if widening == Widening::Off {
         return discoveries;
@@ -272,8 +336,7 @@ fn discover_dependents<'a>(
         });
 
         if let Some(&change) = loadable_change {
-            discover(
-                &mut discoveries,
+            discoveries.discover_origin(
                 &mut files_to_visit,
                 unresolved_site.file,
                 Discovery {
@@ -285,7 +348,7 @@ fn discover_dependents<'a>(
         }
     }
 
-    visit_dependents(graph, &mut discoveries, &mut files_to_visit);
+    visit_dependents(graph, &mut discoveries.files, &mut files_to_visit);
 
     discoveries
 }
@@ -956,6 +1019,44 @@ mod tests {
     ];
 
     #[test]
+    fn test_cut_from_a_change_by_its_mock_is_still_selected_by_widening() {
+        let mut builder = GraphBuilder::default();
+        let catalog_test = builder.add_test_file(repo_path("src/catalog.test.ts"), "typescript");
+        let loader = builder.add_file(repo_path("src/loader.ts"));
+        let locale = builder.add_file(repo_path("src/locale.ts"));
+
+        builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+        builder.add_edge(Edge {
+            dependent: catalog_test,
+            dependency: loader,
+            kind: Import,
+        });
+        builder.add_edge(Edge {
+            dependent: loader,
+            dependency: locale,
+            kind: Import,
+        });
+        builder.add_mock(catalog_test, loader);
+        builder.add_unresolved_site(UnresolvedSite {
+            file: catalog_test,
+            line: 92,
+            expression: "import(entry)".to_owned(),
+            cause: UnresolvedCause::RuntimeValue,
+            language: "typescript",
+        });
+
+        let graph = builder.build();
+        let selected_tests = select_tests(&graph, &[modified("src/locale.ts")], Widening::Scoped);
+
+        assert_eq!(selected_tests.len(), 1);
+        assert_eq!(selected_tests[0].reason.widening_site(), Some(0));
+        assert_eq!(
+            select_tests(&graph, &[modified("src/locale.ts")], Widening::Off),
+            []
+        );
+    }
+
+    #[test]
     fn test_mocking_a_module_is_not_selected_by_changes_behind_the_mock() {
         let graph = graph_with_mocks(
             SERVICE_WITH_MOCKED_DB,
@@ -1136,6 +1237,31 @@ mod tests {
         );
         assert_eq!(
             selected_with_distances(&graph, &[modified("extensions/a/send.ts")]),
+            []
+        );
+    }
+
+    #[test]
+    fn a_listing_of_a_listing_passes_nothing_on() {
+        let graph = build_graph(
+            &["test/workflows.test.ts"],
+            &[
+                (
+                    "test/workflows.test.ts",
+                    Reads,
+                    ".github/workflows/scorecard.yml",
+                ),
+                (".github/workflows/scorecard.yml", Lists, "taxonomy.yaml"),
+                ("taxonomy.yaml", Lists, "docs/logging.md"),
+            ],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("taxonomy.yaml")]),
+            [("test/workflows.test.ts", 2)]
+        );
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("docs/logging.md")]),
             []
         );
     }
