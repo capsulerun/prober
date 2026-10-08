@@ -1,4 +1,5 @@
 mod conventions;
+mod dynamic;
 mod imports;
 mod linker;
 mod resolver;

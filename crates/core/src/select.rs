@@ -7,6 +7,7 @@ use crate::graph::{EdgeKind, Graph};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Hop {
+    pub dependency: FileId,
     pub dependent: FileId,
     pub edge: EdgeKind,
 }
@@ -118,6 +119,7 @@ fn trace_reason(test_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> 
 
     while let Some(reached_via) = discoveries[&file].reached_via {
         hops.push(Hop {
+            dependency: reached_via.dependency,
             dependent: file,
             edge: reached_via.edge,
         });

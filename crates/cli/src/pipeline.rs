@@ -105,7 +105,7 @@ impl Workspace {
             });
         }
 
-        let linker = TypeScriptLinker::new(&self.repo_root)?;
+        let linker = TypeScriptLinker::new(&self.repo_root)?.with_inference(config.inference);
         let graph = self.link_graph(&linker)?;
         let selected_tests = select_tests(&graph, &changes);
         let report = Report::from_selection(&graph, &changes, &selected_tests, config_hash)

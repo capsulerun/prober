@@ -215,6 +215,42 @@ fn json_report_explains_each_selected_test() {
 }
 
 #[test]
+fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.write(
+        "src/loader.ts",
+        "const name = process.env.PLUGIN;\nexport const plugin = await import(`./plugins/${name}.js`);\n",
+    );
+    repository.write("src/plugins/telegram.ts", "export const id = 1;");
+    repository.write(
+        "src/loader.test.ts",
+        r#"import { plugin } from "./loader";"#,
+    );
+    repository.commit_all("plugin loader");
+    repository.change_and_commit("src/plugins/telegram.ts", "export const id = 2;");
+
+    let report = repository
+        .prober(&["--base", "HEAD~1", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["reasons"],
+        json!({ "src/loader.test.ts": [
+            "src/plugins/telegram.ts (modified)",
+            "-> loaded by src/loader.ts:2 (inferred glob src/plugins/*.js)",
+            "-> imported by src/loader.test.ts",
+        ] })
+    );
+
+    repository.write("prober.toml", "[inference]\ndynamic_imports = false\n");
+
+    let without_inference = repository.prober(&["--base", "HEAD~1"]);
+
+    assert_eq!(without_inference.stdout, "");
+}
+
+#[test]
 fn docs_only_change_selects_no_test() {
     let repository = TestRepository::with_project_on_main();
 
@@ -286,7 +322,7 @@ fn invalid_config_runs_every_test_with_an_error_reason() {
         report["mode_reasons"],
         json!([{
             "kind": "error",
-            "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`",
+            "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
         }])
     );
     assert_eq!(report["stats"]["tests_selected"], 2);
@@ -304,7 +340,7 @@ fn on_error_fail_exits_with_the_error() {
     assert_eq!(run.stdout, "");
     assert_eq!(
         run.stderr,
-        "prober: invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`\n"
+        "prober: invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`\n"
     );
 }
 

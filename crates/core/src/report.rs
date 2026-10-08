@@ -387,6 +387,14 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
     match hop.edge {
         EdgeKind::Import => format!("-> imported by {dependent}"),
         EdgeKind::TypeOnly => format!("-> type-imported by {dependent}"),
+        EdgeKind::Contains => format!("-> in folder {dependent}/"),
+        EdgeKind::Dynamic => match graph.inference(hop.dependent, hop.dependency) {
+            Some(inference) => format!(
+                "-> loaded by {dependent}:{} ({})",
+                inference.line, inference.description
+            ),
+            None => format!("-> loaded by {dependent}"),
+        },
     }
 }
 
@@ -401,7 +409,7 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::config::Config;
-    use crate::graph::{Edge, GraphBuilder};
+    use crate::graph::{Edge, GraphBuilder, Inference};
     use crate::select::select_tests;
 
     const CONFIG_HASH: &str = "0123456789abcdef";
@@ -434,6 +442,32 @@ mod tests {
                 kind: EdgeKind::Import,
             });
         }
+
+        builder.build()
+    }
+
+    fn plugin_loader_graph() -> Graph {
+        let mut builder = GraphBuilder::default();
+        let loader_test = builder.add_test_file(repo_path("src/loader.test.ts"), "typescript");
+        let loader = builder.add_file(repo_path("src/loader.ts"));
+        let plugin = builder.add_file(repo_path("src/plugins/a.ts"));
+
+        builder.add_edge(Edge {
+            dependent: loader_test,
+            dependency: loader,
+            kind: EdgeKind::Import,
+        });
+        builder.add_inferred_edge(
+            Edge {
+                dependent: loader,
+                dependency: plugin,
+                kind: EdgeKind::Dynamic,
+            },
+            Inference {
+                line: 7,
+                description: "inferred glob src/plugins/*.ts".to_owned(),
+            },
+        );
 
         builder.build()
     }
@@ -515,6 +549,23 @@ mod tests {
 }
 "#
         );
+    }
+
+    #[test]
+    fn dynamic_hop_names_the_loading_site_and_its_inference() {
+        let graph = plugin_loader_graph();
+        let report = report_for_changes(&graph, &[modified("src/plugins/a.ts")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["src/loader.test.ts"],
+            serde_json::json!([
+                "src/plugins/a.ts (modified)",
+                "-> loaded by src/loader.ts:7 (inferred glob src/plugins/*.ts)",
+                "-> imported by src/loader.test.ts",
+            ])
+        );
+        assert_eq!(json_report["distances"]["src/loader.test.ts"], 2);
     }
 
     #[test]
@@ -712,12 +763,12 @@ mod tests {
             json_report["mode_reasons"],
             serde_json::json!([{
                 "kind": "error",
-                "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`",
+                "message": "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
             }])
         );
         assert_eq!(
             report.summary_line(),
-            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`"
+            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`"
         );
     }
 }
