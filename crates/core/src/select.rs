@@ -1,5 +1,3 @@
-//! Traversal from changed files to the test files that depend on them, ordered by distance with a reason each.
-
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, VecDeque};
 

@@ -1,5 +1,3 @@
-//! Adds TypeScript and JavaScript files to the graph: test files, and an edge for every import that resolves.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 

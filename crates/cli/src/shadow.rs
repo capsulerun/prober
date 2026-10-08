@@ -1,5 +1,3 @@
-//! The `prober shadow` command: compares a recorded selection with the JUnit reports of a full test run.
-
 use std::env;
 use std::fs::{self, OpenOptions};
 use std::io::Write;

@@ -1,5 +1,3 @@
-//! Files and changes between revisions, checked on real repositories built with the git command line.
-
 use std::fs;
 use std::path::Path;
 use std::process::Command;

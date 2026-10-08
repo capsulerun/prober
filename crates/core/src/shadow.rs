@@ -1,5 +1,3 @@
-//! Shadow mode: a recorded selection compared with the outcomes of a full test run (savings, misses, failure distances).
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 

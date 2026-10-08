@@ -1,5 +1,3 @@
-//! The prober binary (selection and shadow) run end to end on small git repositories holding a TypeScript project.
-
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
