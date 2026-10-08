@@ -4,5 +4,7 @@ pub mod files;
 pub mod graph;
 pub mod junit;
 pub mod outcomes;
+mod ratios;
 pub mod report;
 pub mod select;
+pub mod shadow;
