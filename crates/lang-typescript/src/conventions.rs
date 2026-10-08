@@ -33,6 +33,10 @@ const DECLARATION_FILE_SUFFIXES: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
 
 const TEST_FILE_MARKERS: [&str; 2] = ["test", "spec"];
 
+const PLUGIN_MANIFEST_NAMES: [&str; 3] = ["package.json", "plugin.json", "manifest.json"];
+
+const PLUGIN_MANIFEST_SUFFIX: &str = ".plugin.json";
+
 pub fn is_source_file(path: &RepoPath) -> bool {
     let file_name = file_name(path);
     let is_declaration_file = DECLARATION_FILE_SUFFIXES
@@ -53,6 +57,16 @@ pub fn is_test_file(path: &RepoPath) -> bool {
         .map(|(_, marker)| marker);
 
     is_source_file(path) && test_marker.is_some_and(|marker| TEST_FILE_MARKERS.contains(&marker))
+}
+
+pub fn is_module_file(path: &RepoPath) -> bool {
+    is_source_file(path) || file_name(path).ends_with(".json")
+}
+
+pub fn is_plugin_manifest(path: &RepoPath) -> bool {
+    let file_name = file_name(path);
+
+    PLUGIN_MANIFEST_NAMES.contains(&file_name) || file_name.ends_with(PLUGIN_MANIFEST_SUFFIX)
 }
 
 fn file_name(path: &RepoPath) -> &str {
@@ -122,6 +136,25 @@ mod tests {
 
         for other_file in other_files {
             assert!(!is_test_file(&repo_path(other_file)), "{other_file}");
+        }
+    }
+
+    #[test]
+    fn plugin_manifests_are_package_plugin_and_manifest_files() {
+        let manifests = [
+            "extensions/telegram/package.json",
+            "plugins/a/plugin.json",
+            "plugins/b/manifest.json",
+            "extensions/slack/openclaw.plugin.json",
+        ];
+        let other_files = ["extensions/telegram/index.ts", "extensions/plugin.json.ts"];
+
+        for manifest in manifests {
+            assert!(is_plugin_manifest(&repo_path(manifest)), "{manifest}");
+        }
+
+        for other_file in other_files {
+            assert!(!is_plugin_manifest(&repo_path(other_file)), "{other_file}");
         }
     }
 

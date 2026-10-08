@@ -11,6 +11,9 @@ use crate::files::RepoPath;
 struct ConfigFile {
     #[serde(default)]
     always_all: AlwaysAllSection,
+
+    #[serde(default)]
+    inference: InferenceSettings,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -20,9 +23,26 @@ struct AlwaysAllSection {
     files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct InferenceSettings {
+    pub dynamic_imports: bool,
+    pub plugin_folders: bool,
+}
+
+impl Default for InferenceSettings {
+    fn default() -> Self {
+        Self {
+            dynamic_imports: true,
+            plugin_folders: true,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Config {
     pub always_all: AlwaysAll,
+    pub inference: InferenceSettings,
 }
 
 impl Config {
@@ -32,7 +52,10 @@ impl Config {
         let always_all = AlwaysAll::new(config_file.always_all.files)
             .map_err(|pattern_error| anyhow!("invalid prober.toml: {pattern_error}"))?;
 
-        Ok(Self { always_all })
+        Ok(Self {
+            always_all,
+            inference: config_file.inference,
+        })
     }
 }
 
@@ -157,7 +180,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_config_runs_nothing_globally() {
+    fn missing_config_runs_nothing_globally_and_enables_every_inference() {
         let config = Config::parse("").unwrap();
 
         assert_eq!(
@@ -165,6 +188,21 @@ mod tests {
                 .always_all
                 .matching_changes(&[modified("ci/deploy.sh")]),
             []
+        );
+        assert_eq!(config.inference, InferenceSettings::default());
+        assert!(config.inference.dynamic_imports && config.inference.plugin_folders);
+    }
+
+    #[test]
+    fn each_inference_switches_off_on_its_own() {
+        let config = Config::parse("[inference]\nplugin_folders = false\n").unwrap();
+
+        assert_eq!(
+            config.inference,
+            InferenceSettings {
+                dynamic_imports: true,
+                plugin_folders: false,
+            }
         );
     }
 
@@ -242,7 +280,11 @@ mod tests {
             ),
             (
                 "presets = \"auto\"\n",
-                "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all`",
+                "invalid prober.toml at line 1, column 1: unknown field `presets`, expected `always_all` or `inference`",
+            ),
+            (
+                "[inference]\nanchors = false\n",
+                "invalid prober.toml at line 2, column 1: unknown field `anchors`, expected `dynamic_imports` or `plugin_folders`",
             ),
             (
                 "[always_all]\ntests = [\"a.test.ts\"]\n",

@@ -1415,6 +1415,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6cb138bb79a146c1bd460005623e142ef0181e3d0219cb493e02f7d08a35695"
 
 [[package]]
+name = "itertools"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8b4baf93f58d4425749ca49a51c50ebab072c5df6994d08fed93541c331481dc"
+dependencies = [
+ "either",
+]
+
+[[package]]
 name = "itoa"
 version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1782,6 +1791,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "oxc_semantic"
+version = "0.146.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "366191309f606847936aade62707b06683ed5e0b0c8cb66c27710a61f64a50f1"
+dependencies = [
+ "itertools",
+ "memchr",
+ "oxc_allocator",
+ "oxc_ast",
+ "oxc_ast_visit",
+ "oxc_data_structures",
+ "oxc_diagnostics",
+ "oxc_ecmascript",
+ "oxc_index",
+ "oxc_span",
+ "oxc_str",
+ "oxc_syntax",
+ "rustc-hash",
+ "self_cell",
+ "smallvec",
+]
+
+[[package]]
 name = "oxc_span"
 version = "0.146.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1979,11 +2011,13 @@ name = "prober-lang-typescript"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "globset",
  "oxc_allocator",
  "oxc_ast",
  "oxc_ast_visit",
  "oxc_parser",
  "oxc_resolver",
+ "oxc_semantic",
  "oxc_span",
  "prober-core",
  "rayon",

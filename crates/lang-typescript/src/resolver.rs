@@ -1,6 +1,6 @@
 use std::path::{Component, Path, PathBuf};
 
-use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};
+use oxc_resolver::{ResolveError, ResolveOptions, Resolver, TsconfigDiscovery};
 use prober_core::files::RepoPath;
 
 const RESOLVED_EXTENSIONS: [&str; 9] = [
@@ -15,6 +15,13 @@ const TYPESCRIPT_EQUIVALENTS: [(&str, &[&str]); 4] = [
 ];
 
 const CONDITION_NAMES: [&str; 4] = ["node", "import", "require", "default"];
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Resolution {
+    RepoFile(RepoPath),
+    Outside,
+    Missing,
+}
 
 pub struct ModuleResolver {
     resolver: Resolver,
@@ -57,6 +64,22 @@ impl ModuleResolver {
             Ok(resolution) => self.repo_path(resolution.path()).into_iter().collect(),
             Err(_) => missing_relative_candidates(importer, specifier),
         }
+    }
+
+    pub fn resolve_specifier(&self, importer: &RepoPath, specifier: &str) -> Resolution {
+        let importer_path = self.repo_root.join(importer.as_str());
+
+        match self.resolver.resolve_file(&importer_path, specifier) {
+            Ok(resolution) => self
+                .repo_path(resolution.path())
+                .map_or(Resolution::Outside, Resolution::RepoFile),
+            Err(ResolveError::Builtin { .. }) => Resolution::Outside,
+            Err(_) => Resolution::Missing,
+        }
+    }
+
+    pub fn absolute_specifier(&self, path: &str) -> String {
+        self.repo_root.join(path).to_string_lossy().into_owned()
     }
 
     fn repo_path(&self, absolute_path: &Path) -> Option<RepoPath> {
