@@ -4,11 +4,17 @@ use anyhow::{Context, Result, anyhow};
 use gix::bstr::{BStr, ByteSlice};
 use gix::diff::Rewrites;
 use gix::object::tree::diff::ChangeDetached;
-use prober_core::changes::{ChangeKind, FileChange};
+use prober_core::changes::{ChangeKind, FileChange, ResolvedRevisions};
 use prober_core::files::RepoPath;
 
 pub struct GitRepository {
     repository: gix::Repository,
+}
+
+struct CommitRange {
+    base: gix::ObjectId,
+    head: gix::ObjectId,
+    merge_base: gix::ObjectId,
 }
 
 impl GitRepository {
@@ -53,19 +59,23 @@ impl GitRepository {
         Ok(files)
     }
 
+    pub fn resolve_revisions(&self, base: &str, head: &str) -> Result<ResolvedRevisions> {
+        let commit_range = self.commit_range(base, head)?;
+
+        Ok(ResolvedRevisions {
+            base: commit_range.base.to_string(),
+            head: commit_range.head.to_string(),
+            merge_base: commit_range.merge_base.to_string(),
+        })
+    }
+
     pub fn changes_between(&self, base: &str, head: &str) -> Result<Vec<FileChange>> {
-        let base_commit = self.resolve_commit(base)?;
-        let head_commit = self.resolve_commit(head)?;
-        let merge_base = self
+        let commit_range = self.commit_range(base, head)?;
+        let merge_base_tree = self
             .repository
-            .merge_base(base_commit, head_commit)
-            .map_err(|_| {
-                anyhow!(self.with_shallow_clone_hint(format!(
-                    "no merge base between {base:?} and {head:?}"
-                )))
-            })?;
-        let merge_base_tree = self.repository.find_commit(merge_base)?.tree()?;
-        let head_tree = self.repository.find_commit(head_commit)?.tree()?;
+            .find_commit(commit_range.merge_base)?
+            .tree()?;
+        let head_tree = self.repository.find_commit(commit_range.head)?.tree()?;
         let rename_tracking =
             gix::diff::Options::default().with_rewrites(Some(Rewrites::default()));
         let tree_changes =
@@ -80,6 +90,25 @@ impl GitRepository {
         file_changes.sort_by(|left, right| left.path.cmp(&right.path));
 
         Ok(file_changes)
+    }
+
+    fn commit_range(&self, base: &str, head: &str) -> Result<CommitRange> {
+        let base_commit = self.resolve_commit(base)?;
+        let head_commit = self.resolve_commit(head)?;
+        let merge_base = self
+            .repository
+            .merge_base(base_commit, head_commit)
+            .map_err(|_| {
+                anyhow!(self.with_shallow_clone_hint(format!(
+                    "no merge base between {base:?} and {head:?}"
+                )))
+            })?;
+
+        Ok(CommitRange {
+            base: base_commit,
+            head: head_commit,
+            merge_base: merge_base.detach(),
+        })
     }
 
     fn resolve_commit(&self, revision: &str) -> Result<gix::ObjectId> {

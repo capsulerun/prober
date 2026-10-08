@@ -1,5 +1,3 @@
-//! Test outcomes per test file, merged from the test cases of one or several test reports.
-
 use std::collections::BTreeMap;
 use std::time::Duration;
 

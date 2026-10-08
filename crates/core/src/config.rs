@@ -1,5 +1,3 @@
-//! The optional `prober.toml`: for now, the `always_all` files whose change runs every test.
-
 use anyhow::{Result, anyhow};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;

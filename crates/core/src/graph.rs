@@ -1,5 +1,3 @@
-//! File-level dependency graph, stored as a reverse index from each file to the files that depend on it.
-
 use std::collections::HashMap;
 
 use crate::files::{FileId, FileTable, RepoPath};

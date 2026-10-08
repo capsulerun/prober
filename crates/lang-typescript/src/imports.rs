@@ -1,5 +1,3 @@
-//! Module specifiers a TypeScript or JavaScript file loads, read from its syntax tree.
-
 use oxc_allocator::Allocator;
 use oxc_ast::ast::{
     Argument, CallExpression, ExportAllDeclaration, ExportFromDeclaration, Expression,

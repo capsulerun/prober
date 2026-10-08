@@ -1,5 +1,3 @@
-//! Resolution of import specifiers to repo files with Node and TypeScript rules (oxc_resolver).
-
 use std::path::{Component, Path, PathBuf};
 
 use oxc_resolver::{ResolveOptions, Resolver, TsconfigDiscovery};

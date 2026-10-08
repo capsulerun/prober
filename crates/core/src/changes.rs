@@ -1,6 +1,6 @@
-//! Files changed between the base and head revisions.
-
 use std::fmt;
+
+use serde::{Deserialize, Serialize};
 
 use crate::files::RepoPath;
 
@@ -10,6 +10,13 @@ pub enum ChangeKind {
     Modified,
     Deleted,
     Renamed { from: RepoPath },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolvedRevisions {
+    pub base: String,
+    pub head: String,
+    pub merge_base: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

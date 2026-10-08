@@ -1,5 +1,3 @@
-//! JUnit reports produced by real test runners (vitest 5.0.3, jest-junit 17.0.0) read into outcomes per test file.
-
 use std::fs;
 use std::path::Path;
 use std::time::Duration;

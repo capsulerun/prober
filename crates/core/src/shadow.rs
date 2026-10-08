@@ -1,11 +1,10 @@
-//! Shadow mode: a recorded selection compared with the outcomes of a full test run (savings, misses, failure distances).
-
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::changes::ResolvedRevisions;
 use crate::files::RepoPath;
 use crate::outcomes::{TestFileOutcome, TestOutcomes, TestStatus};
 use crate::ratios::{format_percentage, rounded_ratio};
@@ -50,6 +49,7 @@ pub struct ModeReasonRecord {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedSelection {
+    pub revisions: Option<ResolvedRevisions>,
     pub mode: SelectionMode,
     pub mode_reasons: Vec<ModeReasonRecord>,
     pub test_files: BTreeSet<RepoPath>,
@@ -59,6 +59,8 @@ pub struct RecordedSelection {
 #[derive(Deserialize)]
 struct SelectionJson {
     schema_version: u32,
+    #[serde(default)]
+    revisions: Option<ResolvedRevisions>,
     mode: String,
     #[serde(default)]
     mode_reasons: Option<Vec<ModeReasonRecord>>,
@@ -93,6 +95,7 @@ impl RecordedSelection {
             .collect::<Result<BTreeMap<_, _>>>()?;
 
         Ok(Self {
+            revisions: selection.revisions,
             mode: SelectionMode::parse(&selection.mode)?,
             mode_reasons: selection.mode_reasons.unwrap_or_default(),
             test_files,
@@ -110,6 +113,7 @@ pub struct FailedTestFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ShadowResult {
+    pub revisions: Option<ResolvedRevisions>,
     pub selection_mode: SelectionMode,
     pub mode_reasons: Vec<ModeReasonRecord>,
     pub reported_test_files: usize,
@@ -154,6 +158,7 @@ impl ShadowResult {
             .collect();
 
         Self {
+            revisions: selection.revisions.clone(),
             selection_mode: selection.mode,
             mode_reasons: selection.mode_reasons.clone(),
             reported_test_files: reported_outcomes.len(),
@@ -187,6 +192,7 @@ impl ShadowResult {
     pub fn to_json(&self) -> String {
         let shadow_json = ShadowJson {
             schema_version: SCHEMA_VERSION,
+            revisions: self.revisions.as_ref(),
             selection_mode: self.selection_mode.name(),
             mode_reasons: &self.mode_reasons,
             test_files: TestFilesJson {
@@ -383,6 +389,7 @@ impl ShadowResult {
 #[derive(Serialize)]
 struct ShadowJson<'a> {
     schema_version: u32,
+    revisions: Option<&'a ResolvedRevisions>,
     selection_mode: &'static str,
     mode_reasons: &'a [ModeReasonRecord],
     test_files: TestFilesJson,
@@ -501,6 +508,7 @@ mod tests {
             shadow_result.to_json(),
             r#"{
   "schema_version": 1,
+  "revisions": null,
   "selection_mode": "selected",
   "mode_reasons": [],
   "test_files": {
@@ -711,9 +719,16 @@ Selection mode `all`: ci/deploy.sh (modified) matches always_all \"ci/**\".
             kind: ChangeKind::Modified,
         }];
         let selected_tests = select_tests(&graph, &changes);
-        let report = Report::from_selection(&graph, &changes, &selected_tests, "hash".to_owned());
+        let revisions = ResolvedRevisions {
+            base: "1111111".to_owned(),
+            head: "2222222".to_owned(),
+            merge_base: "1111111".to_owned(),
+        };
+        let report = Report::from_selection(&graph, &changes, &selected_tests, "hash".to_owned())
+            .with_revisions(revisions.clone());
         let selection = RecordedSelection::parse(&report.to_json()).unwrap();
 
+        assert_eq!(selection.revisions, Some(revisions));
         assert_eq!(selection.mode, SelectionMode::Selected);
         assert_eq!(
             selection.test_files,

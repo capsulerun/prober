@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
-use crate::changes::FileChange;
+use crate::changes::{FileChange, ResolvedRevisions};
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{EdgeKind, Graph, TestFile};
@@ -109,6 +109,7 @@ pub enum ListSeparator {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Report {
+    pub revisions: Option<ResolvedRevisions>,
     pub mode: Mode,
     pub targets: Vec<Target>,
     pub test_count_by_language: BTreeMap<&'static str, usize>,
@@ -144,6 +145,7 @@ impl Report {
             .collect();
 
         Self {
+            revisions: None,
             mode,
             targets,
             test_count_by_language: count_by_language(&graph.test_files_by_path()),
@@ -163,10 +165,18 @@ impl Report {
             .collect();
 
         Self {
+            revisions: None,
             mode: Mode::All { reasons },
             targets,
             test_count_by_language: count_by_language(&test_files),
             config_hash,
+        }
+    }
+
+    pub fn with_revisions(self, revisions: ResolvedRevisions) -> Self {
+        Self {
+            revisions: Some(revisions),
+            ..self
         }
     }
 
@@ -196,6 +206,7 @@ impl Report {
             .map(|reasons| reasons.iter().map(JsonModeReason::new).collect());
         let json_report = JsonReport {
             schema_version: SCHEMA_VERSION,
+            revisions: self.revisions.as_ref(),
             mode: self.mode.name(),
             mode_reasons,
             targets,
@@ -286,6 +297,7 @@ impl Report {
 #[derive(Serialize)]
 struct JsonReport<'a> {
     schema_version: u32,
+    revisions: Option<&'a ResolvedRevisions>,
     mode: &'static str,
     mode_reasons: Option<Vec<JsonModeReason<'a>>>,
     targets: BTreeMap<&'static str, Vec<&'a str>>,
@@ -455,6 +467,7 @@ mod tests {
             report.to_json(),
             r#"{
   "schema_version": 1,
+  "revisions": null,
   "mode": "selected",
   "mode_reasons": null,
   "targets": {
@@ -510,6 +523,7 @@ mod tests {
             report.to_json(),
             r#"{
   "schema_version": 1,
+  "revisions": null,
   "mode": "all",
   "mode_reasons": [
     {
@@ -568,6 +582,7 @@ mod tests {
             report.to_json(),
             r#"{
   "schema_version": 1,
+  "revisions": null,
   "mode": "none",
   "mode_reasons": [
     {

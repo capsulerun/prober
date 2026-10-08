@@ -1,5 +1,3 @@
-//! JUnit XML test reports (vitest, jest-junit, surefire-style reruns) read into test outcomes per test file.
-
 use std::fmt::Display;
 use std::iter;
 use std::path::{Path, PathBuf};
