@@ -109,6 +109,11 @@ fn missing_relative_candidates(importer: &RepoPath, specifier: &str) -> Vec<Repo
     else {
         return Vec::new();
     };
+
+    missing_path_candidates(&missing_path)
+}
+
+pub fn missing_path_candidates(missing_path: &str) -> Vec<RepoPath> {
     let with_extensions = RESOLVED_EXTENSIONS
         .iter()
         .map(|extension| format!("{missing_path}{extension}"));
@@ -128,7 +133,7 @@ fn missing_relative_candidates(importer: &RepoPath, specifier: &str) -> Vec<Repo
         })
         .flatten();
 
-    std::iter::once(missing_path.clone())
+    std::iter::once(missing_path.to_owned())
         .chain(with_extensions)
         .chain(index_files)
         .chain(typescript_equivalents)

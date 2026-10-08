@@ -20,10 +20,30 @@ impl EdgeKind {
     }
 }
 
+pub type ModuleFilter = fn(&RepoPath) -> bool;
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Inference {
     pub line: u32,
-    pub description: String,
+    pub kind: &'static str,
+    pub pattern: String,
+    pub detail: Option<String>,
+}
+
+impl Inference {
+    pub fn description(&self) -> String {
+        let Inference {
+            kind,
+            pattern,
+            detail,
+            ..
+        } = self;
+
+        match detail {
+            Some(detail) => format!("inferred {kind} {pattern} ({detail})"),
+            None => format!("inferred {kind} {pattern}"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -36,6 +56,20 @@ pub enum UnresolvedCause {
 }
 
 impl UnresolvedCause {
+    pub fn widens(self) -> bool {
+        self != UnresolvedCause::NoMatchingFile
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            UnresolvedCause::InferenceDisabled => "inference_disabled",
+            UnresolvedCause::Parameter => "parameter",
+            UnresolvedCause::RuntimeValue => "runtime_value",
+            UnresolvedCause::TooWide => "too_wide",
+            UnresolvedCause::NoMatchingFile => "no_matching_file",
+        }
+    }
+
     pub fn description(self) -> &'static str {
         match self {
             UnresolvedCause::InferenceDisabled => "inference is disabled",
@@ -53,6 +87,7 @@ pub struct UnresolvedSite {
     pub line: u32,
     pub expression: String,
     pub cause: UnresolvedCause,
+    pub language: &'static str,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,6 +110,7 @@ pub struct GraphBuilder {
     edges: Vec<Edge>,
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
+    module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
 impl GraphBuilder {
@@ -112,11 +148,17 @@ impl GraphBuilder {
         self.unresolved_sites.push(unresolved_site);
     }
 
+    pub fn add_language(&mut self, language: &'static str, loads: ModuleFilter) {
+        self.module_filters.insert(language, loads);
+    }
+
     pub fn build(mut self) -> Graph {
         let mut dependents_by_file = vec![Vec::new(); self.files.len()];
+        let mut dependencies_by_file = vec![Vec::new(); self.files.len()];
 
         for edge in self.edges {
             dependents_by_file[edge.dependency.index()].push(edge);
+            dependencies_by_file[edge.dependent.index()].push(edge);
         }
 
         for dependents in &mut dependents_by_file {
@@ -127,6 +169,16 @@ impl GraphBuilder {
                 left_path.cmp(right_path).then(left.kind.cmp(&right.kind))
             });
             dependents.dedup();
+        }
+
+        for dependencies in &mut dependencies_by_file {
+            dependencies.sort_by(|left, right| {
+                let left_path = self.files.path(left.dependency);
+                let right_path = self.files.path(right.dependency);
+
+                left_path.cmp(right_path).then(left.kind.cmp(&right.kind))
+            });
+            dependencies.dedup();
         }
 
         self.unresolved_sites.sort_by(|left, right| {
@@ -144,8 +196,10 @@ impl GraphBuilder {
             files: self.files,
             test_languages: self.test_languages,
             dependents_by_file,
+            dependencies_by_file,
             inferences: self.inferences,
             unresolved_sites: self.unresolved_sites,
+            module_filters: self.module_filters,
         }
     }
 }
@@ -155,8 +209,10 @@ pub struct Graph {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
     dependents_by_file: Vec<Vec<Edge>>,
+    dependencies_by_file: Vec<Vec<Edge>>,
     inferences: HashMap<(FileId, FileId), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
+    module_filters: HashMap<&'static str, ModuleFilter>,
 }
 
 impl Graph {
@@ -192,8 +248,36 @@ impl Graph {
         &self.dependents_by_file[file.index()]
     }
 
+    pub fn dependencies(&self, file: FileId) -> &[Edge] {
+        &self.dependencies_by_file[file.index()]
+    }
+
     pub fn inference(&self, dependent: FileId, dependency: FileId) -> Option<&Inference> {
         self.inferences.get(&(dependent, dependency))
+    }
+
+    pub fn inferred_edges(&self) -> impl Iterator<Item = (Edge, &Inference)> {
+        self.inferences
+            .iter()
+            .map(|(&(dependent, dependency), inference)| {
+                let inferred_edge = Edge {
+                    dependent,
+                    dependency,
+                    kind: EdgeKind::Dynamic,
+                };
+
+                (inferred_edge, inference)
+            })
+    }
+
+    pub fn can_load(&self, language: &str, path: &RepoPath) -> bool {
+        self.module_filters
+            .get(language)
+            .is_none_or(|loads| loads(path))
+    }
+
+    pub fn is_module(&self, path: &RepoPath) -> bool {
+        self.module_filters.values().any(|loads| loads(path))
     }
 
     pub fn unresolved_sites(&self) -> &[UnresolvedSite] {
@@ -319,7 +403,9 @@ mod tests {
         };
         let inference_at = |line: u32| Inference {
             line,
-            description: "inferred glob src/plugins/*.ts".to_owned(),
+            kind: "glob",
+            pattern: "src/plugins/*.ts".to_owned(),
+            detail: None,
         };
 
         builder.add_inferred_edge(dynamic_edge, inference_at(12));
@@ -334,6 +420,48 @@ mod tests {
         );
         assert_eq!(graph.inference(loader, plugin), Some(&inference_at(4)));
         assert_eq!(graph.inference(plugin, loader), None);
+        assert_eq!(
+            graph.dependencies(loader),
+            [Edge {
+                dependent: loader,
+                dependency: plugin,
+                kind: EdgeKind::Dynamic,
+            }]
+        );
+        assert_eq!(
+            graph.inferred_edges().collect::<Vec<_>>(),
+            [(graph.dependencies(loader)[0], &inference_at(4))]
+        );
+    }
+
+    #[test]
+    fn inference_is_described_by_its_kind_pattern_and_detail() {
+        let plugin_folder = Inference {
+            line: 3,
+            kind: "plugin folder",
+            pattern: "extensions/{id}/".to_owned(),
+            detail: Some("id=telegram".to_owned()),
+        };
+
+        assert_eq!(
+            plugin_folder.description(),
+            "inferred plugin folder extensions/{id}/ (id=telegram)"
+        );
+    }
+
+    #[test]
+    fn each_language_says_which_files_its_unresolved_sites_can_load() {
+        let mut builder = GraphBuilder::default();
+
+        builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+
+        let graph = builder.build();
+
+        assert!(graph.can_load("typescript", &repo_path("src/a.ts")));
+        assert!(!graph.can_load("typescript", &repo_path("docs/a.md")));
+        assert!(graph.can_load("python", &repo_path("docs/a.md")));
+        assert!(graph.is_module(&repo_path("src/a.ts")));
+        assert!(!graph.is_module(&repo_path("docs/a.md")));
     }
 
     #[test]
@@ -346,6 +474,7 @@ mod tests {
             line,
             expression: "request.moduleUrl".to_owned(),
             cause: UnresolvedCause::RuntimeValue,
+            language: "typescript",
         };
 
         builder.add_unresolved_site(unresolved_site(worker, 3));

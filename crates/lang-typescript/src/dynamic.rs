@@ -20,7 +20,7 @@ use crate::conventions::{is_module_file, is_plugin_manifest, is_test_file};
 use crate::dynamic::evaluator::Evaluator;
 use crate::dynamic::summarizer::summarize_module;
 use crate::dynamic::targets::{GlobTarget, Target, match_globs, targets_of};
-use crate::resolver::{ModuleResolver, Resolution};
+use crate::resolver::{ModuleResolver, Resolution, missing_path_candidates};
 
 const MAX_WAVES: usize = 4;
 
@@ -46,7 +46,14 @@ pub(crate) struct DynamicInference {
 }
 
 impl DynamicInference {
-    fn add_link(&mut self, site: &Site, dependency: RepoPath, description: String) {
+    fn add_link(
+        &mut self,
+        site: &Site,
+        dependency: RepoPath,
+        kind: &'static str,
+        pattern: &str,
+        detail: Option<String>,
+    ) {
         if dependency == site.module {
             return;
         }
@@ -56,7 +63,9 @@ impl DynamicInference {
             dependency,
             inference: Inference {
                 line: site.line,
-                description,
+                kind,
+                pattern: pattern.to_owned(),
+                detail,
             },
         });
     }
@@ -201,10 +210,16 @@ impl DynamicLoading<'_> {
 
         match self.resolver.resolve_specifier(&site.module, &specifier) {
             Resolution::RepoFile(dependency) => {
-                inference.add_link(site, dependency, format!("inferred path {path}"));
+                inference.add_link(site, dependency, "path", path, None);
             }
             Resolution::Outside => {}
-            Resolution::Missing => inference.add_unresolved(site, UnresolvedCause::NoMatchingFile),
+            Resolution::Missing => {
+                for candidate in missing_path_candidates(path) {
+                    inference.add_link(site, candidate, "path", path, None);
+                }
+
+                inference.add_unresolved(site, UnresolvedCause::NoMatchingFile);
+            }
         }
     }
 
@@ -220,7 +235,7 @@ impl DynamicLoading<'_> {
         if let Resolution::RepoFile(dependency) =
             self.resolver.resolve_specifier(&importer, specifier)
         {
-            inference.add_link(site, dependency, format!("inferred specifier {specifier}"));
+            inference.add_link(site, dependency, "specifier", specifier, None);
         }
     }
 
@@ -285,17 +300,15 @@ impl DynamicLoading<'_> {
                         inference.add_link(
                             site,
                             folder_path,
-                            format!("inferred plugin folder {folder_pattern} (id={id})"),
+                            "plugin folder",
+                            &folder_pattern,
+                            Some(format!("id={id}")),
                         );
                     }
                 }
                 None => {
                     for file in matched {
-                        inference.add_link(
-                            site,
-                            file,
-                            format!("inferred glob {}", glob_target.glob),
-                        );
+                        inference.add_link(site, file, "glob", &glob_target.glob, None);
                     }
                 }
             }

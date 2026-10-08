@@ -459,7 +459,7 @@ mod tests {
     use crate::changes::{ChangeKind, FileChange};
     use crate::graph::{Edge, EdgeKind, GraphBuilder};
     use crate::report::Report;
-    use crate::select::select_tests;
+    use crate::select::{Widening, select_tests};
 
     fn repo_path(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()
@@ -723,7 +723,7 @@ Selection mode `all`: ci/deploy.sh (modified) matches always_all \"ci/**\".
             path: repo_path("src/b.ts"),
             kind: ChangeKind::Modified,
         }];
-        let selected_tests = select_tests(&graph, &changes);
+        let selected_tests = select_tests(&graph, &changes, Widening::Scoped);
         let revisions = ResolvedRevisions {
             base: "1111111".to_owned(),
             head: "2222222".to_owned(),

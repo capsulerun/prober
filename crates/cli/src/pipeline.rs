@@ -11,7 +11,8 @@ use prober_core::config::{AlwaysAll, Config, config_hash};
 use prober_core::files::RepoPath;
 use prober_core::graph::{Graph, GraphBuilder};
 use prober_core::report::{ModeReason, Report};
-use prober_core::select::select_tests;
+use prober_core::scan::ScanReport;
+use prober_core::select::{Widening, select_tests};
 use prober_lang_typescript::{ALWAYS_ALL_DEFAULTS, LANGUAGE, TypeScriptLinker, is_test_file};
 use prober_vcs::GitRepository;
 
@@ -33,6 +34,16 @@ pub struct SelectionRun {
     pub warnings: Vec<String>,
 }
 
+pub struct ScanRun {
+    pub report: ScanReport,
+    pub warnings: Vec<String>,
+}
+
+struct LinkedGraph {
+    graph: Graph,
+    warnings: Vec<String>,
+}
+
 pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<SelectionRun> {
     let workspace = Workspace::open(directory, &revisions.head)?;
     let config_text = workspace.read_config();
@@ -52,6 +63,23 @@ pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result
         }
         Err(error) => Err(error),
     }
+}
+
+pub fn scan(directory: &Path) -> Result<ScanRun> {
+    let workspace = Workspace::open(directory, "HEAD")?;
+    let config_text = workspace.read_config()?;
+    let config = Config::parse(&config_text)?;
+    let linked_graph = workspace.link(&config)?;
+    let report = ScanReport::new(
+        &linked_graph.graph,
+        &workspace.repo_files,
+        config_hash(&config_text),
+    );
+
+    Ok(ScanRun {
+        report,
+        warnings: linked_graph.warnings,
+    })
 }
 
 struct Workspace {
@@ -105,16 +133,17 @@ impl Workspace {
             });
         }
 
-        let linker = TypeScriptLinker::new(&self.repo_root)?.with_inference(config.inference);
-        let graph = self.link_graph(&linker)?;
-        let selected_tests = select_tests(&graph, &changes);
+        let LinkedGraph { graph, warnings } = self.link(&config)?;
+        let widening = if config.inference.widening {
+            Widening::Scoped
+        } else {
+            Widening::Off
+        };
+        let selected_tests = select_tests(&graph, &changes, widening);
         let report = Report::from_selection(&graph, &changes, &selected_tests, config_hash)
             .with_revisions(resolved_revisions);
 
-        Ok(SelectionRun {
-            report,
-            warnings: linker.missing_dependencies_warning().into_iter().collect(),
-        })
+        Ok(SelectionRun { report, warnings })
     }
 
     fn changes(&self, revisions: &Revisions) -> Result<Vec<FileChange>> {
@@ -129,12 +158,16 @@ impl Workspace {
             .changes_between(&revisions.base, &revisions.head)
     }
 
-    fn link_graph(&self, linker: &TypeScriptLinker) -> Result<Graph> {
+    fn link(&self, config: &Config) -> Result<LinkedGraph> {
+        let linker = TypeScriptLinker::new(&self.repo_root)?.with_inference(config.inference);
         let mut builder = GraphBuilder::default();
 
         linker.link(&self.repo_files, &mut builder)?;
 
-        Ok(builder.build())
+        Ok(LinkedGraph {
+            graph: builder.build(),
+            warnings: linker.missing_dependencies_warning().into_iter().collect(),
+        })
     }
 
     fn run_all(&self, reasons: Vec<ModeReason>, config_hash: String) -> Report {

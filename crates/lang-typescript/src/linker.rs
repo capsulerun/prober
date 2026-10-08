@@ -8,7 +8,7 @@ use prober_core::files::RepoPath;
 use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
 use rayon::prelude::*;
 
-use crate::conventions::{LANGUAGE, is_source_file, is_test_file};
+use crate::conventions::{LANGUAGE, is_module_file, is_source_file, is_test_file};
 use crate::dynamic::{DynamicInference, DynamicLoading};
 use crate::imports::parse_imports;
 use crate::resolver::ModuleResolver;
@@ -55,6 +55,8 @@ impl TypeScriptLinker {
             .map(|path| self.link_file(path))
             .collect::<Result<Vec<LinkedFile>>>()?;
         let dynamic_inference = self.infer_dynamic_links(repo_files, &linked_files)?;
+
+        graph.add_language(LANGUAGE, |path| is_module_file(path) && !is_test_file(path));
 
         for linked_file in linked_files {
             let file = if is_test_file(&linked_file.path) {
@@ -189,6 +191,7 @@ fn add_dynamic_inference(dynamic_inference: DynamicInference, graph: &mut GraphB
             line: dynamic_site.line,
             expression: dynamic_site.expression,
             cause: dynamic_site.cause,
+            language: LANGUAGE,
         });
     }
 }
