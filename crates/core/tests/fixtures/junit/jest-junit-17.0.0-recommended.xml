@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="jest tests" tests="6" failures="1" errors="1" time="0.182">
+  <testsuite name="math" errors="0" failures="1" skipped="1" timestamp="2026-10-08T09:03:33" time="0.069" tests="3">
+    <testcase classname="math adds" name="math adds" time="0.001" file="src/math.test.js">
+    </testcase>
+    <testcase classname="math subtracts" name="math subtracts" time="0.001" file="src/math.test.js">
+      <failure>Error: expect(received).toBe(expected) // Object.is equality
+
+Expected: 1
+Received: 2
+    at Object.toBe (/home/runner/work/app/app/src/math.test.js:3:39)
+    at Promise.finally.completed (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1834:28)
+    at new Promise (&lt;anonymous&gt;)
+    at callAsyncCircusFn (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1774:10)
+    at _callCircusTest (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1167:40)
+    at _runTestInContext (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1103:3)
+    at runTestWithContext (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:996:5)
+    at _runTestsForDescribeBlockOnce (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1008:11)
+    at _runTestsForDescribeBlock (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:824:5)
+    at _runTestsForDescribeBlockOnce (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:1003:11)
+    at _runTestsForDescribeBlock (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:824:5)
+    at run (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:789:3)
+    at runAndTransformResultsToJestFormat (/home/runner/work/app/node_modules/jest-circus/build/jestAdapterInit.js:2300:21)
+    at jestAdapter (/home/runner/work/app/node_modules/jest-circus/build/runner.js:111:19)
+    at runTestInternal (/home/runner/work/app/node_modules/jest-runner/build/index.js:247:16)
+    at runTest (/home/runner/work/app/node_modules/jest-runner/build/index.js:315:7)</failure>
+    </testcase>
+    <testcase classname="math multiplies" name="math multiplies" time="0" file="src/math.test.js">
+      <skipped/>
+    </testcase>
+  </testsuite>
+  <testsuite name="undefined" errors="0" failures="0" skipped="1" timestamp="2026-10-08T09:03:33" time="0.006" tests="1">
+    <testcase classname=" is skipped" name=" is skipped" time="0" file="src/skipped.test.js">
+      <skipped/>
+    </testcase>
+  </testsuite>
+  <testsuite name="src/broken.test.js" errors="1" failures="0" skipped="0" timestamp="1970-01-01T00:00:00" time="0" tests="0">
+    <testcase classname="Test suite failed to run" name="src/broken.test.js" time="0" file="src/broken.test.js">
+      <error>  ● Test suite failed to run
+
+    cannot load this test file
+
+    &gt; 1 | throw new Error(&quot;cannot load this test file&quot;);
+        |       ^
+      2 |
+
+      at Object.&lt;anonymous&gt; (src/broken.test.js:1:7)
+</error>
+    </testcase>
+    <testcase classname="Test suite failed to run" name="src/broken.test.js" time="0" file="src/broken.test.js">
+      <failure>{}</failure>
+    </testcase>
+  </testsuite>
+  <testsuite name="undefined" errors="0" failures="0" skipped="0" timestamp="2026-10-08T09:03:33" time="0.009" tests="1">
+    <testcase classname=" passes on retry" name=" passes on retry" time="0" file="src/flaky.test.js">
+    </testcase>
+  </testsuite>
+  <testsuite name="undefined" errors="0" failures="0" skipped="0" timestamp="2026-10-08T09:03:33" time="0.006" tests="1">
+    <testcase classname=" joins &lt;words&gt; &amp; keeps &quot;quotes&quot;" name=" joins &lt;words&gt; &amp; keeps &quot;quotes&quot;" time="0" file="src/nested/strings.test.js">
+    </testcase>
+  </testsuite>
+</testsuites>
