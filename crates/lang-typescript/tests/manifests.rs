@@ -56,17 +56,12 @@ fn outcome_of(
         .unwrap();
 
     let graph = builder.build();
-    let test_runner_reasons = linker
-        .test_runner_reasons(&graph, &repo_files, &manifest_changes)
+    let root_scope_reasons = linker
+        .root_scope_reasons(&graph, &repo_files, &manifest_changes)
         .unwrap();
 
-    if !test_runner_reasons.is_empty() {
-        return Outcome::All(
-            test_runner_reasons
-                .iter()
-                .map(ModeReason::message)
-                .collect(),
-        );
+    if !root_scope_reasons.is_empty() {
+        return Outcome::All(root_scope_reasons.iter().map(ModeReason::message).collect());
     }
 
     let selected_tests = select_tests(&graph, changes, Widening::Scoped);
@@ -411,7 +406,7 @@ fn tsconfig_paths_change_selects_the_files_whose_aliases_resolve_differently() {
 }
 
 #[test]
-fn test_runner_packages_and_the_packages_of_runner_configs_and_setup_files_run_every_test() {
+fn runner_packages_and_the_packages_of_runner_configs_and_setup_files_run_every_test() {
     let base_lock = "lockfileVersion: '9.0'
 packages:
   '@vitejs/plugin-vue@5.0.0': {resolution: {integrity: a}}
@@ -446,18 +441,20 @@ packages:
 
     assert_eq!(
         bump("vitest", "3.2.0", "3.2.1"),
-        all(&["pnpm-lock.yaml (modified) changes test runner package vitest (3.2.0 -> 3.2.1)"])
+        all(&[
+            "pnpm-lock.yaml (modified) changes package vitest (3.2.0 -> 3.2.1), which every test loads"
+        ])
     );
     assert_eq!(
         bump("'@vitejs/plugin-vue", "5.0.0", "5.1.0"),
         all(&[
-            "pnpm-lock.yaml (modified) changes test runner package @vitejs/plugin-vue (5.0.0 -> 5.1.0)"
+            "pnpm-lock.yaml (modified) changes package @vitejs/plugin-vue (5.0.0 -> 5.1.0), which every test loads"
         ])
     );
     assert_eq!(
         bump("fake-indexeddb", "6.0.0", "6.1.0"),
         all(&[
-            "pnpm-lock.yaml (modified) changes test runner package fake-indexeddb (6.0.0 -> 6.1.0)"
+            "pnpm-lock.yaml (modified) changes package fake-indexeddb (6.0.0 -> 6.1.0), which every test loads"
         ])
     );
     assert_eq!(

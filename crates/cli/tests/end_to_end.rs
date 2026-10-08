@@ -441,7 +441,7 @@ fn runtime_dependency_bump_selects_the_tests_reaching_its_importers() {
 }
 
 #[test]
-fn test_runner_bump_runs_every_test() {
+fn runner_bump_runs_every_test_with_a_root_scope_reason() {
     let repository = repository_with_dependencies();
 
     bump(&repository, "vitest", "3.2.0", "3.2.1");
@@ -454,10 +454,10 @@ fn test_runner_bump_runs_every_test() {
     assert_eq!(
         report["mode_reasons"],
         json!([{
-            "kind": "test_runner",
+            "kind": "root_scope",
             "file": "pnpm-lock.yaml",
             "package": "vitest",
-            "message": "pnpm-lock.yaml (modified) changes test runner package vitest (3.2.0 -> 3.2.1)",
+            "message": "pnpm-lock.yaml (modified) changes package vitest (3.2.0 -> 3.2.1), which every test loads",
         }])
     );
 }

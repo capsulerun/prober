@@ -55,7 +55,7 @@ pub enum ModeReason {
         change: FileChange,
         field: String,
     },
-    TestRunner {
+    RootScopePackage {
         change: FileChange,
         package: String,
         detail: String,
@@ -75,7 +75,7 @@ impl ModeReason {
             ModeReason::AlwaysAll { .. } => "always_all",
             ModeReason::UnparsableManifest { .. } => "unparsable_manifest",
             ModeReason::GlobalField { .. } => "global_field",
-            ModeReason::TestRunner { .. } => "test_runner",
+            ModeReason::RootScopePackage { .. } => "root_scope",
             ModeReason::NoImpact { .. } => "no_impact",
             ModeReason::Error { .. } => "error",
         }
@@ -92,19 +92,19 @@ impl ModeReason {
             ModeReason::GlobalField { change, field } => {
                 format!("{change} changes {field:?}, which may affect every test")
             }
-            ModeReason::TestRunner {
+            ModeReason::RootScopePackage {
                 change,
                 package,
                 detail,
                 other_packages: 0,
-            } => format!("{change} changes test runner package {package} ({detail})"),
-            ModeReason::TestRunner {
+            } => format!("{change} changes package {package} ({detail}), which every test loads"),
+            ModeReason::RootScopePackage {
                 change,
                 package,
                 detail,
                 other_packages,
             } => format!(
-                "{change} changes test runner package {package} ({detail}) and {other_packages} more"
+                "{change} changes package {package} ({detail}) and {other_packages} more that every test loads"
             ),
             ModeReason::NoImpact {
                 changed_file_count: 0,
@@ -438,7 +438,7 @@ impl<'a> JsonModeReason<'a> {
                 field: Some(field),
                 ..json_mode_reason
             },
-            ModeReason::TestRunner {
+            ModeReason::RootScopePackage {
                 change, package, ..
             } => Self {
                 file: Some(change.path.as_str()),
@@ -784,13 +784,13 @@ mod tests {
                 change: modified("tsconfig.json"),
                 field: "compilerOptions.target".to_owned(),
             },
-            ModeReason::TestRunner {
+            ModeReason::RootScopePackage {
                 change: modified("package.json"),
                 package: "vitest".to_owned(),
                 detail: "^3.2.0 -> ^3.2.1".to_owned(),
                 other_packages: 0,
             },
-            ModeReason::TestRunner {
+            ModeReason::RootScopePackage {
                 change: modified("yarn.lock"),
                 package: "vite".to_owned(),
                 detail: "5.0.0 -> 5.0.1".to_owned(),
@@ -815,16 +815,16 @@ mod tests {
                     "message": "tsconfig.json (modified) changes \"compilerOptions.target\", which may affect every test",
                 },
                 {
-                    "kind": "test_runner",
+                    "kind": "root_scope",
                     "file": "package.json",
                     "package": "vitest",
-                    "message": "package.json (modified) changes test runner package vitest (^3.2.0 -> ^3.2.1)",
+                    "message": "package.json (modified) changes package vitest (^3.2.0 -> ^3.2.1), which every test loads",
                 },
                 {
-                    "kind": "test_runner",
+                    "kind": "root_scope",
                     "file": "yarn.lock",
                     "package": "vite",
-                    "message": "yarn.lock (modified) changes test runner package vite (5.0.0 -> 5.0.1) and 2 more",
+                    "message": "yarn.lock (modified) changes package vite (5.0.0 -> 5.0.1) and 2 more that every test loads",
                 },
             ])
         );

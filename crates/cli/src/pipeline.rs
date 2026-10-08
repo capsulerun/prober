@@ -126,11 +126,11 @@ impl Workspace {
 
         let linker = self.linker(&config)?;
         let graph = self.link(&linker, &manifest_changes)?;
-        let test_runner_reasons =
-            linker.test_runner_reasons(&graph, &self.repo_files, &manifest_changes)?;
+        let root_scope_reasons =
+            linker.root_scope_reasons(&graph, &self.repo_files, &manifest_changes)?;
 
-        if !test_runner_reasons.is_empty() {
-            let report = Report::all(&graph, test_runner_reasons, config_hash)
+        if !root_scope_reasons.is_empty() {
+            let report = Report::all(&graph, root_scope_reasons, config_hash)
                 .with_revisions(resolved_revisions);
 
             return Ok(report);

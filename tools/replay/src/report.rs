@@ -763,8 +763,8 @@ mod tests {
                 "`global_field` `compilerOptions.target`",
             ),
             (
-                json!({ "kind": "test_runner", "file": "pnpm-lock.yaml", "package": "vitest" }),
-                "`test_runner` `vitest`",
+                json!({ "kind": "root_scope", "file": "pnpm-lock.yaml", "package": "vitest" }),
+                "`root_scope` `vitest`",
             ),
             (
                 json!({ "kind": "unparsable_manifest", "file": "yarn.lock" }),

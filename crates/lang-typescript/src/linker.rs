@@ -120,7 +120,7 @@ impl TypeScriptLinker {
         Ok(())
     }
 
-    pub fn test_runner_reasons(
+    pub fn root_scope_reasons(
         &self,
         graph: &Graph,
         repo_files: &[RepoPath],
@@ -130,21 +130,21 @@ impl TypeScriptLinker {
             return Ok(Vec::new());
         }
 
-        let runner_scope_packages = self.runner_scope_packages(graph, repo_files)?;
-        let mut runner_changes: BTreeMap<&RepoPath, Vec<&PackageChange>> = BTreeMap::new();
+        let root_scope_packages = self.root_scope_packages(graph, repo_files)?;
+        let mut root_scope_changes: BTreeMap<&RepoPath, Vec<&PackageChange>> = BTreeMap::new();
 
         for package_change in manifest_changes.packages() {
             if is_test_runner_package(&package_change.name)
-                || runner_scope_packages.contains(&package_change.name)
+                || root_scope_packages.contains(&package_change.name)
             {
-                runner_changes
+                root_scope_changes
                     .entry(&package_change.change.path)
                     .or_default()
                     .push(package_change);
             }
         }
 
-        let test_runner_reasons = runner_changes
+        let root_scope_reasons = root_scope_changes
             .into_values()
             .filter_map(|package_changes| {
                 let first_change = package_changes.iter().min_by_key(|package_change| {
@@ -155,7 +155,7 @@ impl TypeScriptLinker {
                     Some(dependency) => format!("through {dependency} {}", first_change.detail),
                 };
 
-                Some(ModeReason::TestRunner {
+                Some(ModeReason::RootScopePackage {
                     change: first_change.change.clone(),
                     package: first_change.name.clone(),
                     detail,
@@ -164,10 +164,10 @@ impl TypeScriptLinker {
             })
             .collect();
 
-        Ok(test_runner_reasons)
+        Ok(root_scope_reasons)
     }
 
-    fn runner_scope_packages(
+    fn root_scope_packages(
         &self,
         graph: &Graph,
         repo_files: &[RepoPath],
