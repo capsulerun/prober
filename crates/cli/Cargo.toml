@@ -16,5 +16,9 @@ prober-lang-typescript.workspace = true
 prober-lang-python.workspace = true
 prober-lang-rust.workspace = true
 
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+
 [lints]
 workspace = true

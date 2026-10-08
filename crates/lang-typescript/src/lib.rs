@@ -1,5 +1,3 @@
-//! TypeScript and JavaScript frontend: test files, imports, and their resolution to repo files.
-
 mod conventions;
 mod imports;
 mod linker;

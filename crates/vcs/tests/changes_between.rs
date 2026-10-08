@@ -1,4 +1,4 @@
-//! Changes between two revisions, checked on real repositories built with the git command line.
+//! Files and changes between revisions, checked on real repositories built with the git command line.
 
 use std::fs;
 use std::path::Path;
@@ -64,11 +64,12 @@ impl TestRepository {
     }
 
     fn error_between(&self, base: &str, head: &str) -> String {
-        GitRepository::discover(self.path())
+        let error = GitRepository::discover(self.path())
             .unwrap()
             .changes_between(base, head)
-            .unwrap_err()
-            .to_string()
+            .unwrap_err();
+
+        format!("{error:#}")
     }
 }
 
@@ -341,5 +342,65 @@ fn shallow_clone_error_suggests_fetching_the_full_history() {
     assert_eq!(
         error.to_string(),
         r#"unknown revision "HEAD~1" (shallow clone: fetch the full history, e.g. actions/checkout with fetch-depth: 0)"#
+    );
+}
+
+#[test]
+fn files_at_lists_the_files_of_the_revision_not_of_the_working_tree() {
+    let repository = TestRepository::new();
+
+    repository.write("src/a.ts", "a");
+    repository.write("src/nested/b.ts", "b");
+    repository.commit_all("first");
+    repository.write("src/c.ts", "c");
+    repository.commit_all("second");
+    repository.write("src/untracked.ts", "untracked");
+
+    let git_repository = GitRepository::discover(repository.path()).unwrap();
+    let file_paths = |revision| -> Vec<String> {
+        git_repository
+            .files_at(revision)
+            .unwrap()
+            .iter()
+            .map(|file| file.as_str().to_owned())
+            .collect()
+    };
+
+    assert_eq!(file_paths("HEAD~1"), ["src/a.ts", "src/nested/b.ts"]);
+    assert_eq!(
+        file_paths("HEAD"),
+        ["src/a.ts", "src/c.ts", "src/nested/b.ts"]
+    );
+}
+
+#[test]
+fn only_the_checked_out_commit_is_checked_out() {
+    let repository = TestRepository::new();
+
+    repository.write("src/a.ts", "a");
+    repository.commit_all("base");
+    repository.start_branch("feature");
+    repository.write("src/b.ts", "b");
+    repository.commit_all("feature");
+
+    let git_repository = GitRepository::discover(repository.path()).unwrap();
+
+    assert!(git_repository.is_checked_out("feature").unwrap());
+    assert!(git_repository.is_checked_out("HEAD").unwrap());
+    assert!(!git_repository.is_checked_out("main").unwrap());
+}
+
+#[test]
+fn work_dir_is_the_repository_root() {
+    let repository = TestRepository::new();
+
+    repository.write("src/a.ts", "a");
+    repository.commit_all("base");
+
+    let git_repository = GitRepository::discover(&repository.path().join("src")).unwrap();
+
+    assert_eq!(
+        git_repository.work_dir().unwrap().canonicalize().unwrap(),
+        repository.path().canonicalize().unwrap()
     );
 }
