@@ -18,6 +18,8 @@ const SHORT_COMMIT_LENGTH: usize = 9;
 
 const RECURRING_FAILURE_CHANGES: usize = 3;
 
+const LISTED_WIDENING_SITES: usize = 10;
+
 #[derive(Debug, Args)]
 pub struct ReportArguments {
     #[arg(
@@ -45,6 +47,20 @@ pub struct ReportArguments {
         help = "failures.jsonl written by `failures`"
     )]
     failures: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "merges",
+        help = "Records of the same merged changes replayed with inference off, compared in the report"
+    )]
+    merges_without_inference: Option<PathBuf>,
+
+    #[arg(
+        long,
+        requires = "failed_changes",
+        help = "Records of the same failed changes replayed with inference off, compared in the report"
+    )]
+    failed_changes_without_inference: Option<PathBuf>,
 
     #[arg(
         long,
@@ -82,8 +98,34 @@ struct MissAnalysis<'a> {
     selected_failures_by_distance: BTreeMap<usize, usize>,
     selected_failures_without_distance: usize,
     misses: Vec<Miss<'a>>,
+    caught_only_by_widening: usize,
     selected_ratios: Vec<f64>,
+    selected_ratios_without_widening: Vec<f64>,
     failed_change_count_by_file: HashMap<&'a str, usize>,
+}
+
+struct SelectionFigures {
+    ratios: Vec<f64>,
+    ratios_without_widening: Vec<f64>,
+}
+
+impl SelectionFigures {
+    fn of(records: &[&ReplayRecord]) -> Self {
+        Self {
+            ratios: sorted(records.iter().filter_map(|record| record.selected_ratio())),
+            ratios_without_widening: sorted(
+                records
+                    .iter()
+                    .filter_map(|record| record.selected_ratio_without_widening()),
+            ),
+        }
+    }
+}
+
+struct ConfigurationRow {
+    label: &'static str,
+    ratios: Option<Vec<f64>>,
+    misses: Option<usize>,
 }
 
 pub fn run(arguments: &ReportArguments) -> Result<String> {
@@ -93,21 +135,32 @@ pub fn run(arguments: &ReportArguments) -> Result<String> {
 
     let mut markdown = format!("# Prober benchmark: {}\n", arguments.title);
     let mut summary_parts = Vec::new();
+    let merge_records = read_optional_json_lines::<ReplayRecord>(arguments.merges.as_deref())?;
+    let merge_records_without_inference =
+        read_optional_json_lines::<ReplayRecord>(arguments.merges_without_inference.as_deref())?;
+    let failed_change_records =
+        read_optional_json_lines::<ReplayRecord>(arguments.failed_changes.as_deref())?;
+    let failed_change_records_without_inference = read_optional_json_lines::<ReplayRecord>(
+        arguments.failed_changes_without_inference.as_deref(),
+    )?;
+    let failures = read_optional_json_lines::<RecordedFailure>(arguments.failures.as_deref())?;
+    let miss_analysis = failed_change_records
+        .as_deref()
+        .zip(failures.as_deref())
+        .map(|(records, failures)| MissAnalysis::analyze(records, failures))
+        .transpose()?;
+    let miss_analysis_without_inference = failed_change_records_without_inference
+        .as_deref()
+        .zip(failures.as_deref())
+        .map(|(records, failures)| MissAnalysis::analyze(records, failures))
+        .transpose()?;
 
-    if let Some(merges_path) = &arguments.merges {
-        let merge_records: Vec<ReplayRecord> = read_json_lines(merges_path)?;
-
-        markdown.push_str(&savings_section(&merge_records));
+    if let Some(merge_records) = &merge_records {
+        markdown.push_str(&savings_section(merge_records));
         summary_parts.push(format!("{} merged changes", merge_records.len()));
     }
 
-    if let (Some(failed_changes_path), Some(failures_path)) =
-        (&arguments.failed_changes, &arguments.failures)
-    {
-        let failed_change_records: Vec<ReplayRecord> = read_json_lines(failed_changes_path)?;
-        let failures: Vec<RecordedFailure> = read_json_lines(failures_path)?;
-        let miss_analysis = MissAnalysis::analyze(&failed_change_records, &failures)?;
-
+    if let Some(miss_analysis) = &miss_analysis {
         markdown.push_str(&miss_analysis.section());
         summary_parts.push(format!(
             "{} failed changes with {} misses",
@@ -115,6 +168,13 @@ pub fn run(arguments: &ReportArguments) -> Result<String> {
             miss_analysis.misses.len()
         ));
     }
+
+    markdown.push_str(&configurations_section(
+        merge_records.as_deref(),
+        merge_records_without_inference.as_deref(),
+        miss_analysis.as_ref(),
+        miss_analysis_without_inference.as_ref(),
+    ));
 
     match &arguments.output {
         Some(output_path) => fs::write(output_path, &markdown)
@@ -139,26 +199,25 @@ fn savings_section(records: &[ReplayRecord]) -> String {
             .filter(|record| record.mode() == Some(mode))
             .count()
     };
-    let selected_ratios = sorted(
-        replayed_records
-            .iter()
-            .filter_map(|record| record.selected_ratio()),
-    );
+    let selection_figures = SelectionFigures::of(&replayed_records);
     let replay_seconds = sorted(replayed_records.iter().filter_map(|record| record.seconds));
     let mut section = format!(
-        "\n## Savings on {} merged changes\n\n| | |\n| --- | --- |\n| Replayed | {} ({} failed to replay) |\n| Mode | {} selected, {} all, {} none |\n| Test files selected | median {}, mean {}, 90th percentile {} |\n| Time per change | median {}, 90th percentile {} |\n",
+        "\n## Savings on {} merged changes\n\n| | |\n| --- | --- |\n| Replayed | {} ({} failed to replay) |\n| Mode | {} selected, {} all, {} none |\n| Test files selected | {} |\n| Without widening | {} |\n| Widening | {} |\n| Time per change | median {}, 90th percentile {} |\n",
         records.len(),
         replayed_records.len(),
         records.len() - replayed_records.len(),
         count_of_mode("selected"),
         count_of_mode("all"),
         count_of_mode("none"),
-        format_ratio(percentile(&selected_ratios, 50.0)),
-        format_ratio(mean(&selected_ratios)),
-        format_ratio(percentile(&selected_ratios, 90.0)),
+        format_distribution(&selection_figures.ratios),
+        format_distribution(&selection_figures.ratios_without_widening),
+        widening_summary(&replayed_records),
         format_seconds(percentile(&replay_seconds, 50.0)),
         format_seconds(percentile(&replay_seconds, 90.0)),
     );
+    let widening_sites = widening_sites_table(&replayed_records);
+
+    section.push_str(&widening_sites);
     let full_run_causes = full_run_causes(&replayed_records);
 
     if !full_run_causes.is_empty() {
@@ -167,6 +226,157 @@ fn savings_section(records: &[ReplayRecord]) -> String {
         for (cause, change_count) in &full_run_causes {
             section.push_str(&format!("| {cause} | {change_count} |\n"));
         }
+    }
+
+    section
+}
+
+fn widening_summary(records: &[&ReplayRecord]) -> String {
+    let widened_records: Vec<&&ReplayRecord> = records
+        .iter()
+        .filter(|record| record.tests_added_by_widening() > 0)
+        .collect();
+
+    if widened_records.is_empty() {
+        return format!("no change widened, of {}", records.len());
+    }
+
+    let added_test_files = sorted(
+        widened_records
+            .iter()
+            .map(|record| record.tests_added_by_widening() as f64),
+    );
+    let shares_of_selection = sorted(widened_records.iter().map(|record| {
+        record.tests_added_by_widening() as f64 / record.tests_selected().max(1) as f64
+    }));
+
+    format!(
+        "{} of {} changes widened, adding median {} test files (mean {:.0}), {} of their selection",
+        widened_records.len(),
+        records.len(),
+        percentile(&added_test_files, 50.0).unwrap_or_default(),
+        mean(&added_test_files).unwrap_or_default(),
+        format_ratio(percentile(&shares_of_selection, 50.0)),
+    )
+}
+
+fn widening_sites_table(records: &[&ReplayRecord]) -> String {
+    let mut added_by_site: BTreeMap<String, (String, Vec<f64>)> = BTreeMap::new();
+
+    for record in records {
+        for widened_site in record.widened_sites() {
+            let (_, added) = added_by_site
+                .entry(widened_site.site)
+                .or_insert_with(|| (widened_site.cause, Vec::new()));
+
+            added.push(widened_site.added as f64);
+        }
+    }
+
+    if added_by_site.is_empty() {
+        return String::new();
+    }
+
+    let mut sites: Vec<(String, String, Vec<f64>)> = added_by_site
+        .into_iter()
+        .map(|(site, (cause, added))| (site, cause, sorted(added.into_iter())))
+        .collect();
+
+    sites.sort_by(|left, right| {
+        let total_added = |added: &[f64]| added.iter().sum::<f64>();
+
+        total_added(&right.2).total_cmp(&total_added(&left.2))
+    });
+
+    let mut table = String::from(
+        "\n### Sites that add the most tests by widening\n\n| Site | Cause | Changes widened | Test files added (median, total) |\n| --- | --- | --- | --- |\n",
+    );
+
+    for (site, cause, added) in sites.iter().take(LISTED_WIDENING_SITES) {
+        table.push_str(&format!(
+            "| `{site}` | {cause} | {} | {}, {} |\n",
+            added.len(),
+            percentile(added, 50.0).unwrap_or_default(),
+            added.iter().sum::<f64>()
+        ));
+    }
+
+    if sites.len() > LISTED_WIDENING_SITES {
+        table.push_str(&format!(
+            "\n{} more sites widened at least one change.\n",
+            sites.len() - LISTED_WIDENING_SITES
+        ));
+    }
+
+    table
+}
+
+fn configurations_section(
+    merge_records: Option<&[ReplayRecord]>,
+    merge_records_without_inference: Option<&[ReplayRecord]>,
+    miss_analysis: Option<&MissAnalysis>,
+    miss_analysis_without_inference: Option<&MissAnalysis>,
+) -> String {
+    let figures_of = |records: Option<&[ReplayRecord]>| {
+        records.map(|records| {
+            let replayed_records: Vec<&ReplayRecord> = records
+                .iter()
+                .filter(|record| record.selection.is_some())
+                .collect();
+
+            SelectionFigures::of(&replayed_records)
+        })
+    };
+    let figures = figures_of(merge_records);
+    let figures_without_inference = figures_of(merge_records_without_inference);
+    let has_inference_off =
+        figures_without_inference.is_some() || miss_analysis_without_inference.is_some();
+    let mut rows = Vec::new();
+
+    if has_inference_off {
+        rows.push(ConfigurationRow {
+            label: "Inference off, widening off (phase 1)",
+            ratios: figures_without_inference
+                .as_ref()
+                .map(|figures| figures.ratios_without_widening.clone()),
+            misses: miss_analysis_without_inference.map(MissAnalysis::misses_without_widening),
+        });
+        rows.push(ConfigurationRow {
+            label: "Inference off, widening on",
+            ratios: figures_without_inference
+                .as_ref()
+                .map(|figures| figures.ratios.clone()),
+            misses: miss_analysis_without_inference.map(|analysis| analysis.misses.len()),
+        });
+    }
+
+    rows.push(ConfigurationRow {
+        label: "Inference on, widening off",
+        ratios: figures
+            .as_ref()
+            .map(|figures| figures.ratios_without_widening.clone()),
+        misses: miss_analysis.map(MissAnalysis::misses_without_widening),
+    });
+    rows.push(ConfigurationRow {
+        label: "**Inference on, widening on (default)**",
+        ratios: figures.as_ref().map(|figures| figures.ratios.clone()),
+        misses: miss_analysis.map(|analysis| analysis.misses.len()),
+    });
+
+    let mut section = String::from(
+        "\n## Inference and widening\n\n| Configuration | Test files selected on merged changes | Misses on failed changes |\n| --- | --- | --- |\n",
+    );
+
+    for row in rows {
+        section.push_str(&format!(
+            "| {} | {} | {} |\n",
+            row.label,
+            row.ratios
+                .as_deref()
+                .map_or_else(|| "n/a".to_owned(), format_median_and_mean),
+            row.misses
+                .map_or_else(|| "n/a".to_owned(), |misses| misses.to_string()),
+        ));
     }
 
     section
@@ -265,12 +475,25 @@ impl<'a> MissAnalysis<'a> {
             miss_analysis
                 .selected_ratios
                 .extend(record.selected_ratio());
+            miss_analysis
+                .selected_ratios_without_widening
+                .extend(record.selected_ratio_without_widening());
             miss_analysis.compare(change, record, selection_value, &counted_failures)?;
         }
 
         miss_analysis.selected_ratios = sorted(miss_analysis.selected_ratios.iter().copied());
+        miss_analysis.selected_ratios_without_widening = sorted(
+            miss_analysis
+                .selected_ratios_without_widening
+                .iter()
+                .copied(),
+        );
 
         Ok(miss_analysis)
+    }
+
+    fn misses_without_widening(&self) -> usize {
+        self.misses.len() + self.caught_only_by_widening
     }
 
     fn compare(
@@ -312,6 +535,10 @@ impl<'a> MissAnalysis<'a> {
 
             self.counted_failures += 1;
 
+            if failed_test_file.selected && failed_test_file.widened {
+                self.caught_only_by_widening += 1;
+            }
+
             match (failed_test_file.selected, failed_test_file.distance) {
                 (true, Some(distance)) => {
                     *self
@@ -344,20 +571,22 @@ impl<'a> MissAnalysis<'a> {
         let replayed_changes = self.changes - self.unreplayed_changes.len();
         let selected_failures = self.counted_failures - self.misses.len();
         let mut section = format!(
-            "\n## Misses on {} failed pull request changes\n\n| | |\n| --- | --- |\n| Replayed | {replayed_changes} ({} could not be replayed) |\n| Failed test files | {} counted, {} pre-existing on the base branch (not counted), {} not found in the repository (not counted), {} on changes that could not be replayed |\n| Selected | {selected_failures} |\n| **Misses** | **{}** ({} on tests that failed on {RECURRING_FAILURE_CHANGES} or more changes, likely flaky) |\n| Test files selected | median {}, mean {} |\n",
+            "\n## Misses on {} failed pull request changes\n\n| | |\n| --- | --- |\n| Replayed | {replayed_changes} ({} could not be replayed) |\n| Failed test files | {} counted, {} pre-existing on the base branch (not counted), {} not found in the repository (not counted), {} on changes that could not be replayed |\n| Selected | {selected_failures} ({} only through widening) |\n| **Misses** | **{}** ({} on tests that failed on {RECURRING_FAILURE_CHANGES} or more changes, likely flaky); {} without widening |\n| Test files selected | {}; without widening {} |\n",
             self.changes,
             self.unreplayed_changes.len(),
             self.counted_failures,
             self.pre_existing_failures,
             self.failures_not_in_repository,
             self.failures_on_unreplayed_changes,
+            self.caught_only_by_widening,
             self.misses.len(),
             self.misses
                 .iter()
                 .filter(|miss| miss.failed_on_changes >= RECURRING_FAILURE_CHANGES)
                 .count(),
-            format_ratio(percentile(&self.selected_ratios, 50.0)),
-            format_ratio(mean(&self.selected_ratios)),
+            self.misses_without_widening(),
+            format_median_and_mean(&self.selected_ratios),
+            format_median_and_mean(&self.selected_ratios_without_widening),
         );
 
         if selected_failures > 0 {
@@ -421,6 +650,10 @@ fn in_repository_when_unknown() -> bool {
     true
 }
 
+fn read_optional_json_lines<T: DeserializeOwned>(path: Option<&Path>) -> Result<Option<Vec<T>>> {
+    path.map(read_json_lines).transpose()
+}
+
 fn read_json_lines<T: DeserializeOwned>(path: &Path) -> Result<Vec<T>> {
     let text =
         fs::read_to_string(path).with_context(|| format!("cannot read {}", path.display()))?;
@@ -465,6 +698,23 @@ fn format_ratio(ratio: Option<f64>) -> String {
     ratio.map_or_else(
         || "n/a".to_owned(),
         |ratio| format!("{:.1}%", ratio * 100.0),
+    )
+}
+
+fn format_distribution(sorted_ratios: &[f64]) -> String {
+    format!(
+        "median {}, mean {}, 90th percentile {}",
+        format_ratio(percentile(sorted_ratios, 50.0)),
+        format_ratio(mean(sorted_ratios)),
+        format_ratio(percentile(sorted_ratios, 90.0)),
+    )
+}
+
+fn format_median_and_mean(sorted_ratios: &[f64]) -> String {
+    format!(
+        "median {}, mean {}",
+        format_ratio(percentile(sorted_ratios, 50.0)),
+        format_ratio(mean(sorted_ratios)),
     )
 }
 

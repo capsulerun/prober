@@ -14,6 +14,8 @@ const SCHEMA_VERSION: u32 = 1;
 
 const UNRESOLVED_DYNAMIC_IMPORT: &str = "unresolved-dynamic-import";
 
+pub(crate) const WIDENED_HOP_PREFIX: &str = "-> widened: ";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Mode {
     Selected,
@@ -460,7 +462,7 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             let unresolved_site = &graph.unresolved_sites()[site_index];
 
             format!(
-                "-> widened: unresolved dynamic import at {dependent}:{} ({})",
+                "{WIDENED_HOP_PREFIX}unresolved dynamic import at {dependent}:{} ({})",
                 unresolved_site.line, unresolved_site.expression
             )
         }
