@@ -28,19 +28,27 @@ pub struct Revisions {
     pub head: String,
 }
 
-pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<Report> {
+pub struct SelectionRun {
+    pub report: Report,
+    pub warnings: Vec<String>,
+}
+
+pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<SelectionRun> {
     let workspace = Workspace::open(directory, &revisions.head)?;
     let config_text = workspace.read_config();
     let config_hash = config_hash(config_text.as_deref().unwrap_or_default());
 
     match workspace.select(config_text, revisions, config_hash.clone()) {
-        Ok(report) => Ok(report),
+        Ok(selection_run) => Ok(selection_run),
         Err(error) if on_error == OnError::All => {
             let error_reason = ModeReason::Error {
                 message: format!("{error:#}"),
             };
 
-            Ok(workspace.run_all(vec![error_reason], config_hash))
+            Ok(SelectionRun {
+                report: workspace.run_all(vec![error_reason], config_hash),
+                warnings: Vec::new(),
+            })
         }
         Err(error) => Err(error),
     }
@@ -78,24 +86,35 @@ impl Workspace {
         config_text: Result<String>,
         revisions: &Revisions,
         config_hash: String,
-    ) -> Result<Report> {
+    ) -> Result<SelectionRun> {
         let config = Config::parse(&config_text?)?;
         let changes = self.changes(revisions)?;
+        let resolved_revisions = self
+            .repository
+            .resolve_revisions(&revisions.base, &revisions.head)?;
         let always_all_reasons = always_all_reasons(&config, &changes)?;
 
         if !always_all_reasons.is_empty() {
-            return Ok(self.run_all(always_all_reasons, config_hash));
+            let report = self
+                .run_all(always_all_reasons, config_hash)
+                .with_revisions(resolved_revisions);
+
+            return Ok(SelectionRun {
+                report,
+                warnings: Vec::new(),
+            });
         }
 
-        let graph = self.link_graph()?;
+        let linker = TypeScriptLinker::new(&self.repo_root)?;
+        let graph = self.link_graph(&linker)?;
         let selected_tests = select_tests(&graph, &changes);
+        let report = Report::from_selection(&graph, &changes, &selected_tests, config_hash)
+            .with_revisions(resolved_revisions);
 
-        Ok(Report::from_selection(
-            &graph,
-            &changes,
-            &selected_tests,
-            config_hash,
-        ))
+        Ok(SelectionRun {
+            report,
+            warnings: linker.missing_dependencies_warning().into_iter().collect(),
+        })
     }
 
     fn changes(&self, revisions: &Revisions) -> Result<Vec<FileChange>> {
@@ -110,10 +129,10 @@ impl Workspace {
             .changes_between(&revisions.base, &revisions.head)
     }
 
-    fn link_graph(&self) -> Result<Graph> {
+    fn link_graph(&self, linker: &TypeScriptLinker) -> Result<Graph> {
         let mut builder = GraphBuilder::default();
 
-        TypeScriptLinker::new(&self.repo_root)?.link(&self.repo_files, &mut builder)?;
+        linker.link(&self.repo_files, &mut builder)?;
 
         Ok(builder.build())
     }

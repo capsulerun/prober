@@ -1,16 +1,16 @@
-//! The prober command line: prints the test files impacted by the changes between two revisions.
-
 mod pipeline;
+mod shadow;
 
 use std::env;
 use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
-use clap::{CommandFactory, Parser, ValueEnum};
-use prober_core::report::{ListSeparator, Report};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use prober_core::report::ListSeparator;
 
-use crate::pipeline::{OnError, Revisions};
+use crate::pipeline::{OnError, Revisions, SelectionRun};
+use crate::shadow::ShadowArguments;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -22,11 +22,28 @@ enum Format {
 #[command(
     name = "prober",
     version,
-    about = "Selects the test files impacted by the changes between two revisions"
+    about = "Selects the test files impacted by the changes between two revisions",
+    args_conflicts_with_subcommands = true,
+    subcommand_negates_reqs = true
 )]
 struct Arguments {
-    #[arg(long, help = "Base revision, e.g. origin/main")]
-    base: String,
+    #[command(subcommand)]
+    command: Option<Command>,
+
+    #[command(flatten)]
+    selection: SelectionArguments,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    #[command(about = "Compares a recorded selection with the JUnit reports of a full test run")]
+    Shadow(ShadowArguments),
+}
+
+#[derive(Debug, Args)]
+struct SelectionArguments {
+    #[arg(long, required = true, help = "Base revision, e.g. origin/main")]
+    base: Option<String>,
 
     #[arg(
         long,
@@ -57,6 +74,13 @@ struct Arguments {
 fn main() -> ExitCode {
     let arguments = Arguments::parse();
 
+    match &arguments.command {
+        Some(Command::Shadow(shadow_arguments)) => shadow::run(shadow_arguments),
+        None => select(&arguments.selection),
+    }
+}
+
+fn select(arguments: &SelectionArguments) -> ExitCode {
     if arguments.nul_separated && arguments.format != Format::List {
         Arguments::command()
             .error(
@@ -67,17 +91,21 @@ fn main() -> ExitCode {
     }
 
     let revisions = Revisions {
-        base: arguments.base.clone(),
+        base: arguments
+            .base
+            .clone()
+            .expect("clap requires --base without a subcommand"),
         head: arguments.head.clone(),
     };
-    let report = env::current_dir()
-        .map_err(anyhow::Error::from)
-        .and_then(|current_directory| {
-            pipeline::run(&current_directory, &revisions, arguments.on_error)
-        });
+    let selection_run =
+        env::current_dir()
+            .map_err(anyhow::Error::from)
+            .and_then(|current_directory| {
+                pipeline::run(&current_directory, &revisions, arguments.on_error)
+            });
 
-    match report {
-        Ok(report) => print_report(&report, &arguments),
+    match selection_run {
+        Ok(selection_run) => print_selection(&selection_run, arguments),
         Err(error) => {
             eprintln!("prober: {error:#}");
 
@@ -86,20 +114,29 @@ fn main() -> ExitCode {
     }
 }
 
-fn print_report(report: &Report, arguments: &Arguments) -> ExitCode {
+fn print_selection(selection_run: &SelectionRun, arguments: &SelectionArguments) -> ExitCode {
+    let report = &selection_run.report;
     let output = match arguments.format {
         Format::Json => report.to_json(),
         Format::List if arguments.nul_separated => report.to_list(ListSeparator::Nul),
         Format::List => report.to_list(ListSeparator::Newline),
     };
 
+    for warning in &selection_run.warnings {
+        eprintln!("prober: warning: {warning}");
+    }
+
     eprintln!("{}", report.summary_line());
 
+    write_to_stdout(&output)
+}
+
+fn write_to_stdout(output: &str) -> ExitCode {
     match io::stdout().lock().write_all(output.as_bytes()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) if error.kind() == io::ErrorKind::BrokenPipe => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("prober: cannot write the report: {error}");
+            eprintln!("prober: cannot write the output: {error}");
 
             ExitCode::FAILURE
         }

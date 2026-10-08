@@ -68,6 +68,16 @@ impl TypeScriptLinker {
         Ok(())
     }
 
+    pub fn missing_dependencies_warning(&self) -> Option<String> {
+        let has_package_manifest = self.repo_root.join("package.json").is_file();
+        let has_installed_dependencies = self.repo_root.join("node_modules").is_dir();
+
+        (has_package_manifest && !has_installed_dependencies).then(|| {
+            "node_modules not found: imports between workspace packages cannot be resolved, run prober after installing dependencies"
+                .to_owned()
+        })
+    }
+
     fn link_file(&self, path: &RepoPath) -> Result<LinkedFile> {
         let source_bytes = fs::read(self.repo_root.join(path.as_str()))
             .with_context(|| format!("cannot read {path}"))?;

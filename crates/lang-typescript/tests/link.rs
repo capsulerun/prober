@@ -320,3 +320,27 @@ fn listed_file_missing_on_disk_is_an_error() {
 
     assert_eq!(error.to_string(), "cannot read src/gone.ts");
 }
+
+#[test]
+fn missing_node_modules_next_to_a_package_manifest_is_warned_about() {
+    let project = TestProject::new(&[("package.json", r#"{ "name": "app" }"#)]);
+    let linker = TypeScriptLinker::new(project.root()).unwrap();
+    let warning_without_dependencies = linker.missing_dependencies_warning();
+
+    fs::create_dir(project.root().join("node_modules")).unwrap();
+
+    assert!(
+        warning_without_dependencies
+            .unwrap()
+            .starts_with("node_modules not found")
+    );
+    assert_eq!(linker.missing_dependencies_warning(), None);
+}
+
+#[test]
+fn repository_without_package_manifest_needs_no_node_modules() {
+    let project = TestProject::new(&[("src/a.ts", "export const a = 1;")]);
+    let linker = TypeScriptLinker::new(project.root()).unwrap();
+
+    assert_eq!(linker.missing_dependencies_warning(), None);
+}

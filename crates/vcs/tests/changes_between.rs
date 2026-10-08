@@ -4,7 +4,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
-use prober_core::changes::{ChangeKind, FileChange};
+use prober_core::changes::{ChangeKind, FileChange, ResolvedRevisions};
 use prober_core::files::RepoPath;
 use prober_vcs::GitRepository;
 use tempfile::TempDir;
@@ -402,5 +402,34 @@ fn work_dir_is_the_repository_root() {
     assert_eq!(
         git_repository.work_dir().unwrap().canonicalize().unwrap(),
         repository.path().canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn resolved_revisions_are_the_commit_ids_and_their_merge_base() {
+    let repository = TestRepository::new();
+
+    repository.write("src/a.ts", "a");
+    repository.commit_all("base");
+    repository.start_branch("feature");
+    repository.write("src/b.ts", "b");
+    repository.commit_all("feature");
+    repository.git(&["switch", "--quiet", "main"]);
+    repository.write("src/c.ts", "c");
+    repository.commit_all("main moves on");
+
+    let commit_id = |revision: &str| repository.git(&["rev-parse", revision]).trim().to_owned();
+    let resolved_revisions = GitRepository::discover(repository.path())
+        .unwrap()
+        .resolve_revisions("main", "feature")
+        .unwrap();
+
+    assert_eq!(
+        resolved_revisions,
+        ResolvedRevisions {
+            base: commit_id("main"),
+            head: commit_id("feature"),
+            merge_base: commit_id("feature~1"),
+        }
     );
 }
