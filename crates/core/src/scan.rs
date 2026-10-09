@@ -14,7 +14,7 @@ use crate::ratios::format_percentage;
 use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
 use crate::symbols::FallbackCause;
 
-pub use crate::scan::cycles::{CycleSize, ImportCycle, SymbolCycles, SymbolSummary};
+pub use crate::scan::cycles::{ImportCycle, SymbolCycle, SymbolCycles, SymbolSummary};
 pub use crate::scan::hubs::{HubFile, SmokeSet};
 pub use crate::scan::suggestions::Suggestion;
 
@@ -255,9 +255,11 @@ impl ScanReport {
                         .as_ref()
                         .map(|symbol_cycles| JsonSymbolCycles {
                             symbols: symbol_cycles.symbols,
-                            cycle: symbol_cycles.cycle.map(JsonCycleSize::from),
-                            leading_in: symbol_cycles.leading_in,
-                            next_cycle: symbol_cycles.next_cycle.map(JsonCycleSize::from),
+                            cycles: symbol_cycles
+                                .cycles
+                                .iter()
+                                .map(|&cycle| JsonSymbolCycle::from(cycle))
+                                .collect(),
                             file_level: json_file_level(&symbol_cycles.file_level),
                         }),
                 })
@@ -887,29 +889,35 @@ fn cycle_directories(modules: &[RepoPath]) -> String {
 }
 
 fn symbol_cycles_text(symbol_cycles: &SymbolCycles) -> String {
-    let cycles = match symbol_cycles.cycle {
-        Some(cycle) => {
-            let next_cycle = match symbol_cycles.next_cycle {
+    let leading_in = |cycle: &SymbolCycle| {
+        format!(
+            "{} symbols lead into it ({})",
+            cycle.leading_in,
+            format_percentage(cycle.leading_in as f64, symbol_cycles.symbols as f64)
+        )
+    };
+    let cycles = match symbol_cycles.cycles.as_slice() {
+        [] => "no cycle left".to_owned(),
+        [cycle, next_cycles @ ..] => {
+            let next_cycle = match next_cycles.first() {
                 Some(next_cycle) => format!(
-                    "; next: {} symbols in {} modules, {} tests",
-                    next_cycle.symbols, next_cycle.modules, next_cycle.tests
+                    "; next: {} symbols in {} modules, {} tests, {}",
+                    next_cycle.symbols,
+                    next_cycle.modules,
+                    next_cycle.tests,
+                    leading_in(next_cycle)
                 ),
                 None => String::new(),
             };
 
             format!(
-                "{} symbols in {} modules still form a cycle pulling in {} tests, {} symbols lead into it ({}){next_cycle}",
+                "{} symbols in {} modules still form a cycle pulling in {} tests, {}{next_cycle}",
                 cycle.symbols,
                 cycle.modules,
                 cycle.tests,
-                symbol_cycles.leading_in,
-                format_percentage(
-                    symbol_cycles.leading_in as f64,
-                    symbol_cycles.symbols as f64
-                )
+                leading_in(cycle)
             )
         }
-        None => "no cycle left".to_owned(),
     };
     let file_level = if symbol_cycles.file_level.is_empty() {
         String::new()
@@ -1044,25 +1052,25 @@ struct JsonImportCycle<'a> {
 #[derive(Serialize)]
 struct JsonSymbolCycles<'a> {
     symbols: usize,
-    cycle: Option<JsonCycleSize>,
-    leading_in: usize,
-    next_cycle: Option<JsonCycleSize>,
+    cycles: Vec<JsonSymbolCycle>,
     file_level: Vec<JsonFileLevelModule<'a>>,
 }
 
 #[derive(Serialize)]
-struct JsonCycleSize {
+struct JsonSymbolCycle {
     symbols: usize,
     modules: usize,
     tests: usize,
+    leading_in: usize,
 }
 
-impl From<CycleSize> for JsonCycleSize {
-    fn from(cycle_size: CycleSize) -> Self {
+impl From<SymbolCycle> for JsonSymbolCycle {
+    fn from(cycle: SymbolCycle) -> Self {
         Self {
-            symbols: cycle_size.symbols,
-            modules: cycle_size.modules,
-            tests: cycle_size.tests,
+            symbols: cycle.symbols,
+            modules: cycle.modules,
+            tests: cycle.tests,
+            leading_in: cycle.leading_in,
         }
     }
 }
@@ -1442,9 +1450,7 @@ Suggestions: 0
                 "tests": 1,
                 "symbols": {
                     "symbols": 6,
-                    "cycle": { "symbols": 2, "modules": 3, "tests": 1 },
-                    "leading_in": 4,
-                    "next_cycle": null,
+                    "cycles": [{ "symbols": 2, "modules": 3, "tests": 1, "leading_in": 4 }],
                     "file_level": [{ "file": "src/c.cjs", "cause": "commonjs" }],
                 },
             }])

@@ -12,18 +12,17 @@ use crate::symbols::{FallbackCause, SymbolId, SymbolTarget, WholeModuleCause};
 const MEASURED_SYMBOL_CYCLES: usize = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CycleSize {
+pub struct SymbolCycle {
     pub symbols: usize,
     pub modules: usize,
     pub tests: usize,
+    pub leading_in: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SymbolCycles {
     pub symbols: usize,
-    pub cycle: Option<CycleSize>,
-    pub leading_in: usize,
-    pub next_cycle: Option<CycleSize>,
+    pub cycles: Vec<SymbolCycle>,
     pub file_level: Vec<(RepoPath, FallbackCause)>,
 }
 
@@ -176,29 +175,7 @@ fn symbol_cycles(graph: &Graph, files: &[FileId]) -> Option<SymbolCycles> {
     components.retain(|component| symbol_count(component) > 1);
     components.truncate(MEASURED_SYMBOL_CYCLES);
 
-    let mut cycles: Vec<(CycleSize, Vec<usize>)> = components
-        .into_iter()
-        .map(|component| {
-            let modules: HashSet<FileId> = component
-                .iter()
-                .map(|&index| match nodes[index] {
-                    Node::Symbol(symbol) => graph.symbol(symbol).file,
-                    Node::File(file) => file,
-                })
-                .collect();
-            let cycle_size = CycleSize {
-                symbols: symbol_count(&component),
-                modules: modules.len(),
-                tests: tests_at_symbol_level(graph, component.iter().map(|&index| nodes[index])),
-            };
-
-            (cycle_size, component)
-        })
-        .collect();
-
-    cycles.sort_by_key(|(cycle_size, _)| Reverse((cycle_size.tests, cycle_size.symbols)));
-
-    let leading_in = cycles.first().map_or(0, |(_, cycle)| {
+    let leading_into = |cycle: &[usize]| {
         let mut reached: HashSet<usize> = cycle.iter().copied().collect();
         let mut queue: VecDeque<usize> = cycle.iter().copied().collect();
         let mut successor_indices = Vec::new();
@@ -218,16 +195,35 @@ fn symbol_cycles(graph: &Graph, files: &[FileId]) -> Option<SymbolCycles> {
             .into_iter()
             .filter(|&index| matches!(nodes[index], Node::Symbol(_)))
             .count()
-    });
+    };
+    let mut cycles: Vec<SymbolCycle> = components
+        .into_iter()
+        .map(|component| {
+            let modules: HashSet<FileId> = component
+                .iter()
+                .map(|&index| match nodes[index] {
+                    Node::Symbol(symbol) => graph.symbol(symbol).file,
+                    Node::File(file) => file,
+                })
+                .collect();
+
+            SymbolCycle {
+                symbols: symbol_count(&component),
+                modules: modules.len(),
+                tests: tests_at_symbol_level(graph, component.iter().map(|&index| nodes[index])),
+                leading_in: leading_into(&component),
+            }
+        })
+        .collect();
+
+    cycles.sort_by_key(|cycle| Reverse((cycle.tests, cycle.symbols)));
 
     Some(SymbolCycles {
         symbols: nodes
             .iter()
             .filter(|node| matches!(node, Node::Symbol(_)))
             .count(),
-        cycle: cycles.first().map(|(cycle_size, _)| *cycle_size),
-        leading_in,
-        next_cycle: cycles.get(1).map(|(cycle_size, _)| *cycle_size),
+        cycles,
         file_level: file_level_modules(graph, |file| in_cycle.contains(&file)),
     })
 }
