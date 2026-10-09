@@ -1999,6 +1999,7 @@ dependencies = [
  "anyhow",
  "globset",
  "quick-xml",
+ "regex",
  "serde",
  "serde_json",
  "toml",

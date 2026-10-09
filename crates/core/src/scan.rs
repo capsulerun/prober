@@ -1,3 +1,6 @@
+mod hubs;
+mod suggestions;
+
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write;
@@ -5,8 +8,12 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use crate::files::{FileId, RepoPath};
-use crate::graph::{ContentChange, Graph, UnresolvedCause};
+use crate::graph::{ContentChange, EdgeKind, Graph, RootScope, UnresolvedCause};
 use crate::ratios::format_percentage;
+use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
+
+pub use crate::scan::hubs::{HubFile, SmokeSet};
+pub use crate::scan::suggestions::Suggestion;
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -50,6 +57,12 @@ pub struct ScanReport {
     pub tests_reached_by_unresolved_sites: usize,
     pub unreachable_modules: Vec<RepoPath>,
     pub unreachable_other_files: Vec<RepoPath>,
+    pub root_scopes: Vec<RootScope>,
+    pub hub_files: Vec<HubFile>,
+    pub smoke_set: SmokeSet,
+    pub suggestions: Vec<Suggestion>,
+    pub rule_effects: Vec<RuleEffect>,
+    pub config_warnings: Vec<ConfigWarning>,
     pub test_count: usize,
     pub config_hash: String,
 }
@@ -60,6 +73,14 @@ impl ScanReport {
         let (unresolved_sites, tests_reached_by_unresolved_sites) = unresolved_sites(graph);
         let missing_file_sites = missing_file_sites(graph);
         let (unreachable_modules, unreachable_other_files) = unreachable_files(graph, repo_files);
+        let (hub_files, smoke_set) = hubs::hubs_and_smoke_set(graph, repo_files);
+        let test_count = graph.test_files_by_path().len();
+        let suggestions = suggestions::suggestions(
+            &unresolved_sites,
+            &inferred_sites,
+            test_count,
+            repo_files.len(),
+        );
 
         Self {
             inferred_sites,
@@ -69,8 +90,24 @@ impl ScanReport {
             tests_reached_by_unresolved_sites,
             unreachable_modules,
             unreachable_other_files,
-            test_count: graph.test_files_by_path().len(),
+            root_scopes: graph.root_scopes().to_vec(),
+            hub_files,
+            smoke_set,
+            suggestions,
+            rule_effects: Vec::new(),
+            config_warnings: Vec::new(),
+            test_count,
             config_hash,
+        }
+    }
+
+    pub fn with_config(self, rule_report: RuleReport, mut warnings: Vec<ConfigWarning>) -> Self {
+        warnings.extend(rule_report.warnings);
+
+        Self {
+            rule_effects: rule_report.effects,
+            config_warnings: warnings,
+            ..self
         }
     }
 
@@ -92,6 +129,17 @@ impl ScanReport {
         self.write_missing_file_sites(&mut text);
         text.push('\n');
         self.write_unreachable_files(&mut text);
+        text.push('\n');
+        self.write_root_scopes(&mut text);
+        text.push('\n');
+        self.write_hub_files(&mut text);
+        text.push('\n');
+        self.write_suggestions(&mut text);
+
+        if !self.rule_effects.is_empty() || !self.config_warnings.is_empty() {
+            text.push('\n');
+            self.write_config(&mut text);
+        }
 
         text
     }
@@ -138,6 +186,54 @@ impl ScanReport {
                     .map(RepoPath::as_str)
                     .collect(),
             },
+            root_scopes: self
+                .root_scopes
+                .iter()
+                .map(|root_scope| JsonRootScope {
+                    directory: &root_scope.directory,
+                    configs: root_scope.configs.iter().map(RepoPath::as_str).collect(),
+                    files: root_scope.files.iter().map(RepoPath::as_str).collect(),
+                    packages: root_scope.packages,
+                    tests: root_scope.tests,
+                })
+                .collect(),
+            hub_files: self
+                .hub_files
+                .iter()
+                .map(|hub_file| JsonHubFile {
+                    file: hub_file.path.as_str(),
+                    tests: hub_file.tests,
+                })
+                .collect(),
+            smoke_set: JsonSmokeSet {
+                tests: self.smoke_set.tests.iter().map(RepoPath::as_str).collect(),
+                covered_hub_files: self.smoke_set.covered_hub_files,
+            },
+            suggestions: self
+                .suggestions
+                .iter()
+                .map(|suggestion| JsonSuggestion {
+                    reason: &suggestion.reason,
+                    toml: &suggestion.toml,
+                })
+                .collect(),
+            config: JsonConfig {
+                rules: self
+                    .rule_effects
+                    .iter()
+                    .map(|rule_effect| JsonRuleEffect {
+                        line: rule_effect.line,
+                        rule: &rule_effect.rule,
+                        links: rule_effect.links,
+                        sites: rule_effect.sites,
+                    })
+                    .collect(),
+                warnings: self
+                    .config_warnings
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
+            },
             stats: JsonScanStats {
                 inferred_sites: self.inferred_sites.len(),
                 inferred_links: self.inferred_link_count(),
@@ -159,7 +255,7 @@ impl ScanReport {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "prober scan: {} links inferred from {} sites; {} unresolved sites reach {}/{} test files ({}); {} sites load missing files; {} files reach no test",
+            "prober scan: {} links inferred from {} sites; {} unresolved sites reach {}/{} test files ({}); {} sites load missing files; {} files reach no test; {} suggestions",
             self.inferred_link_count(),
             self.inferred_sites.len(),
             self.unresolved_sites.len(),
@@ -170,8 +266,112 @@ impl ScanReport {
                 self.test_count as f64
             ),
             self.missing_file_sites.len(),
-            self.unreachable_file_count()
+            self.unreachable_file_count(),
+            self.suggestions.len()
         )
+    }
+
+    fn write_root_scopes(&self, text: &mut String) {
+        let _ = writeln!(
+            text,
+            "Root scope: {} runner projects, the files loaded before their tests",
+            self.root_scopes.len()
+        );
+
+        let rows: Vec<(usize, String)> = self
+            .root_scopes
+            .iter()
+            .map(|root_scope| {
+                let directory = if root_scope.directory.is_empty() {
+                    REPOSITORY_ROOT
+                } else {
+                    &root_scope.directory
+                };
+                let configs = match root_scope.configs.as_slice() {
+                    [config] => config.to_string(),
+                    [first, rest @ ..] => format!("{first} and {} more configs", rest.len()),
+                    [] => "no config".to_owned(),
+                };
+
+                (
+                    root_scope.files.len(),
+                    format!(
+                        "{directory}  {configs}; {} test files, {} packages",
+                        root_scope.tests, root_scope.packages
+                    ),
+                )
+            })
+            .collect();
+
+        write_rows(text, "files", "project", &rows, "projects");
+    }
+
+    fn write_hub_files(&self, text: &mut String) {
+        let _ = writeln!(
+            text,
+            "Hub files: the {} files most test files depend on",
+            self.hub_files.len()
+        );
+
+        let rows: Vec<(usize, String)> = self
+            .hub_files
+            .iter()
+            .map(|hub_file| (hub_file.tests, hub_file.path.to_string()))
+            .collect();
+
+        write_rows(text, "tests", "file", &rows, "files");
+
+        if self.smoke_set.tests.is_empty() {
+            return;
+        }
+
+        let tests: Vec<String> = self
+            .smoke_set
+            .tests
+            .iter()
+            .map(|test| format!("{:?}", test.as_str()))
+            .collect();
+        let _ = writeln!(
+            text,
+            "Suggested smoke set: {} test files within two links of {} of these {} files; run them on every change with\n  [always_run]\n  tests = [{}]",
+            self.smoke_set.tests.len(),
+            self.smoke_set.covered_hub_files,
+            self.hub_files.len(),
+            tests.join(", ")
+        );
+    }
+
+    fn write_suggestions(&self, text: &mut String) {
+        let _ = writeln!(text, "Suggestions: {}", self.suggestions.len());
+
+        for suggestion in &self.suggestions {
+            let _ = writeln!(text, "  # {}", suggestion.reason);
+
+            for toml_line in suggestion.toml.lines() {
+                let _ = writeln!(text, "  {toml_line}");
+            }
+        }
+    }
+
+    fn write_config(&self, text: &mut String) {
+        let _ = writeln!(
+            text,
+            "Config rules: {}, {} warnings",
+            self.rule_effects.len(),
+            self.config_warnings.len()
+        );
+
+        for rule_effect in &self.rule_effects {
+            let _ = writeln!(
+                text,
+                "  prober.toml:{}  {}: {} links, {} unresolved sites",
+                rule_effect.line, rule_effect.rule, rule_effect.links, rule_effect.sites
+            );
+        }
+
+        for warning in &self.config_warnings {
+            let _ = writeln!(text, "  warning: {warning}");
+        }
     }
 
     fn write_inferred_sites(&self, text: &mut String) {
@@ -299,6 +499,10 @@ fn inferred_sites(graph: &Graph) -> (Vec<InferredSite>, BTreeMap<&'static str, u
     let mut links_by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
 
     for (inferred_edge, inference) in graph.inferred_edges() {
+        if inferred_edge.kind == EdgeKind::Rule {
+            continue;
+        }
+
         let site = (graph.path(inferred_edge.dependent), inference.line);
         let (patterns, links) = patterns_by_site.entry(site).or_default();
 
@@ -333,7 +537,7 @@ fn unresolved_sites(graph: &Graph) -> (Vec<UnresolvedSiteReach>, usize) {
         .map(|unresolved_site| {
             let tests = *tests_by_file
                 .entry(unresolved_site.file)
-                .or_insert_with(|| tests_depending_on(graph, [unresolved_site.file]));
+                .or_insert_with(|| tests_depending_on(graph, [unresolved_site.file]).len());
 
             UnresolvedSiteReach {
                 site: format!(
@@ -352,7 +556,7 @@ fn unresolved_sites(graph: &Graph) -> (Vec<UnresolvedSiteReach>, usize) {
         .iter()
         .filter(|unresolved_site| unresolved_site.cause.widens())
         .map(|unresolved_site| unresolved_site.file);
-    let tests_reached = tests_depending_on(graph, site_files);
+    let tests_reached = tests_depending_on(graph, site_files).len();
 
     unresolved_sites.sort_by_key(|unresolved_site| Reverse(unresolved_site.tests));
 
@@ -375,7 +579,10 @@ fn missing_file_sites(graph: &Graph) -> Vec<MissingFileSite> {
         .collect()
 }
 
-fn tests_depending_on(graph: &Graph, files: impl IntoIterator<Item = FileId>) -> usize {
+pub(crate) fn tests_depending_on(
+    graph: &Graph,
+    files: impl IntoIterator<Item = FileId>,
+) -> HashSet<FileId> {
     let mut reached = HashSet::new();
     let mut files_to_visit = VecDeque::new();
 
@@ -399,7 +606,7 @@ fn tests_depending_on(graph: &Graph, files: impl IntoIterator<Item = FileId>) ->
     reached
         .into_iter()
         .filter(|&file| graph.is_test(file))
-        .count()
+        .collect()
 }
 
 fn unreachable_files(graph: &Graph, repo_files: &[RepoPath]) -> (Vec<RepoPath>, Vec<RepoPath>) {
@@ -505,7 +712,53 @@ struct JsonScan<'a> {
     unresolved: Vec<JsonUnresolvedSite<'a>>,
     missing: Vec<JsonMissingFileSite<'a>>,
     unreachable: JsonUnreachableFiles<'a>,
+    root_scopes: Vec<JsonRootScope<'a>>,
+    hub_files: Vec<JsonHubFile<'a>>,
+    smoke_set: JsonSmokeSet<'a>,
+    suggestions: Vec<JsonSuggestion<'a>>,
+    config: JsonConfig<'a>,
     stats: JsonScanStats<'a>,
+}
+
+#[derive(Serialize)]
+struct JsonRootScope<'a> {
+    directory: &'a str,
+    configs: Vec<&'a str>,
+    files: Vec<&'a str>,
+    packages: usize,
+    tests: usize,
+}
+
+#[derive(Serialize)]
+struct JsonHubFile<'a> {
+    file: &'a str,
+    tests: usize,
+}
+
+#[derive(Serialize)]
+struct JsonSmokeSet<'a> {
+    tests: Vec<&'a str>,
+    covered_hub_files: usize,
+}
+
+#[derive(Serialize)]
+struct JsonSuggestion<'a> {
+    reason: &'a str,
+    toml: &'a str,
+}
+
+#[derive(Serialize)]
+struct JsonConfig<'a> {
+    rules: Vec<JsonRuleEffect<'a>>,
+    warnings: Vec<String>,
+}
+
+#[derive(Serialize)]
+struct JsonRuleEffect<'a> {
+    line: usize,
+    rule: &'a str,
+    links: usize,
+    sites: usize,
 }
 
 #[derive(Serialize)]
@@ -683,6 +936,20 @@ Unreachable files: 3 (1 modules, 2 other files)
       1  (root)
       1  docs
       1  src
+
+Root scope: 0 runner projects, the files loaded before their tests
+
+Hub files: the 4 files most test files depend on
+  tests  file
+      1  src/loader.ts
+      1  src/plugins/slack.ts
+      1  src/plugins/telegram.ts
+      1  src/worker.ts
+Suggested smoke set: 2 test files within two links of 4 of these 4 files; run them on every change with
+  [always_run]
+  tests = [\"src/loader.test.ts\", \"src/worker.test.ts\"]
+
+Suggestions: 0
 "
         );
     }
@@ -737,7 +1004,7 @@ Unreachable files: 3 (1 modules, 2 other files)
     fn scan_summary_line_counts_links_unresolved_sites_and_unreachable_files() {
         assert_eq!(
             scanned_project().summary_line(),
-            "prober scan: 2 links inferred from 1 sites; 1 unresolved sites reach 1/2 test files (50.0%); 1 sites load missing files; 3 files reach no test"
+            "prober scan: 2 links inferred from 1 sites; 1 unresolved sites reach 1/2 test files (50.0%); 1 sites load missing files; 3 files reach no test; 0 suggestions"
         );
     }
 

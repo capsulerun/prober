@@ -1,5 +1,6 @@
-//! The selection pipeline: config, changes, global files and manifests, graph, selection, and the fallback to every test on error.
+//! The selection pipeline: kill switch, config, changes, global files and manifests, graph and config rules, selection, and the fallback to every test on error.
 
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -9,17 +10,21 @@ use clap::ValueEnum;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{AlwaysAll, Config, Presets, config_hash};
 use prober_core::files::RepoPath;
-use prober_core::graph::GraphBuilder;
-use prober_core::report::{ModeReason, Report};
+use prober_core::graph::{Graph, GraphBuilder};
+use prober_core::report::{
+    AlwaysRunTest, CONFIG_FILE_NAME, ModeReason, Report, SELECTION_VARIABLE,
+};
+use prober_core::rules::ConfigWarning;
 use prober_core::scan::ScanReport;
 use prober_core::select::{Widening, select_tests};
+use prober_core::unhandled::unhandled_changes;
 use prober_lang_typescript::{
     ALWAYS_ALL_DEFAULTS, LANGUAGE, LinkChanges, MANIFEST_DEFAULTS, ManifestChanges,
     TypeScriptLinker, is_test_file,
 };
 use prober_vcs::GitRepository;
 
-const CONFIG_FILE_NAME: &str = "prober.toml";
+const FORCED_SELECTION: &str = "all";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OnError {
@@ -32,19 +37,63 @@ pub struct Revisions {
     pub head: String,
 }
 
-pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<Report> {
+pub struct Selection {
+    pub report: Report,
+    pub warnings: Vec<ConfigWarning>,
+    pub analysis: Option<GraphAnalysis>,
+}
+
+pub struct GraphAnalysis {
+    pub graph: Graph,
+    pub changes: Vec<FileChange>,
+    pub widening: Widening,
+    pub always_run: Vec<AlwaysRunTest>,
+}
+
+impl Selection {
+    fn of(report: Report) -> Self {
+        Self {
+            report,
+            warnings: Vec::new(),
+            analysis: None,
+        }
+    }
+}
+
+pub fn run(directory: &Path, revisions: &Revisions, on_error: OnError) -> Result<Selection> {
     let workspace = Workspace::open(directory, &revisions.head)?;
     let config_text = workspace.read_config();
     let config_hash = config_hash(config_text.as_deref().unwrap_or_default());
+    let forced = forced_selection();
 
-    match workspace.select(config_text, revisions, config_hash.clone()) {
-        Ok(report) => Ok(report),
+    if let Ok(true) = forced {
+        let report = workspace.run_all(None, vec![ModeReason::Forced], config_hash);
+        let report = match workspace
+            .repository
+            .resolve_revisions(&revisions.base, &revisions.head)
+        {
+            Ok(resolved_revisions) => report.with_revisions(resolved_revisions),
+            Err(_) => report,
+        };
+
+        return Ok(Selection::of(report));
+    }
+
+    let selection =
+        forced.and_then(|_| workspace.select(config_text, revisions, config_hash.clone()));
+
+    match selection {
+        Ok(selection) => Ok(selection),
         Err(error) if on_error == OnError::All => {
             let error_reason = ModeReason::Error {
                 message: format!("{error:#}"),
             };
 
-            Ok(workspace.run_all(None, vec![error_reason], config_hash))
+            Ok(Selection::of(workspace.run_all(
+                None,
+                vec![error_reason],
+                config_hash,
+            )))
         }
         Err(error) => Err(error),
     }
@@ -59,13 +108,26 @@ pub fn scan(directory: &Path) -> Result<ScanReport> {
 
     linker.link(&workspace.repo_files, &mut builder)?;
 
+    let rule_report = config.rules.apply(&mut builder, &workspace.repo_files, &[]);
     let graph = builder.build();
 
-    Ok(ScanReport::new(
-        &graph,
-        &workspace.repo_files,
-        config_hash(&config_text),
-    ))
+    Ok(
+        ScanReport::new(&graph, &workspace.repo_files, config_hash(&config_text)).with_config(
+            rule_report,
+            config.always_all.warnings(&workspace.repo_files),
+        ),
+    )
+}
+
+fn forced_selection() -> Result<bool> {
+    match env::var(SELECTION_VARIABLE) {
+        Ok(value) if value == FORCED_SELECTION => Ok(true),
+        Ok(value) if value.is_empty() => Ok(false),
+        Ok(value) => {
+            bail!("{SELECTION_VARIABLE} must be \"{FORCED_SELECTION}\" or unset, not {value:?}")
+        }
+        Err(_) => Ok(false),
+    }
 }
 
 struct Workspace {
@@ -100,8 +162,9 @@ impl Workspace {
         config_text: Result<String>,
         revisions: &Revisions,
         config_hash: String,
-    ) -> Result<Report> {
+    ) -> Result<Selection> {
         let config = Config::parse(&config_text?)?;
+        let mut warnings = config.always_all.warnings(&self.repo_files);
         let changes = self.changes(revisions)?;
         let resolved_revisions = self
             .repository
@@ -124,9 +187,14 @@ impl Workspace {
         if !global_reasons.is_empty() {
             let report = self
                 .run_all(Some(&linker), global_reasons, config_hash)
-                .with_revisions(resolved_revisions);
+                .with_revisions(resolved_revisions)
+                .with_unhandled(unhandled_changes(None, &changes), changes.len());
 
-            return Ok(report);
+            return Ok(Selection {
+                report,
+                warnings,
+                analysis: None,
+            });
         }
 
         let link_changes = LinkChanges {
@@ -137,25 +205,40 @@ impl Workspace {
         let mut builder = GraphBuilder::default();
         let root_scope_reasons =
             linker.link_changes(&self.repo_files, &link_changes, &mut builder)?;
+        let rule_report = config.rules.apply(&mut builder, &self.repo_files, &changes);
+
+        warnings.extend(rule_report.warnings);
+
         let graph = builder.build();
-
-        if !root_scope_reasons.is_empty() {
-            let report = Report::all(&graph, root_scope_reasons, config_hash)
-                .with_revisions(resolved_revisions);
-
-            return Ok(report);
-        }
-
+        let unhandled = unhandled_changes(Some(&graph), &changes);
         let widening = if config.inference.widening {
             Widening::Scoped
         } else {
             Widening::Off
         };
-        let selected_tests = select_tests(&graph, &changes, widening);
-        let report = Report::from_selection(&graph, &changes, &selected_tests, config_hash)
-            .with_revisions(resolved_revisions);
+        let always_run = config.rules.always_run_tests(&graph);
+        let report = if root_scope_reasons.is_empty() {
+            let selected_tests = select_tests(&graph, &changes, widening);
 
-        Ok(report)
+            Report::from_selection(&graph, &changes, &selected_tests, config_hash)
+                .with_always_run(always_run.clone())
+        } else {
+            Report::all(&graph, root_scope_reasons, config_hash)
+        };
+        let report = report
+            .with_revisions(resolved_revisions)
+            .with_unhandled(unhandled, changes.len());
+
+        Ok(Selection {
+            report,
+            warnings,
+            analysis: Some(GraphAnalysis {
+                graph,
+                changes,
+                widening,
+                always_run,
+            }),
+        })
     }
 
     fn changes(&self, revisions: &Revisions) -> Result<Vec<FileChange>> {

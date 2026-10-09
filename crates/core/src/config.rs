@@ -1,10 +1,12 @@
 use anyhow::{Result, anyhow, bail};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use serde::Deserialize;
+use toml::Spanned;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::changes::FileChange;
 use crate::files::RepoPath;
+use crate::rules::{AlwaysRunSection, ConfigWarning, IgnoreTable, LinkTable, Rules, is_broad};
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -14,6 +16,15 @@ struct ConfigFile {
 
     #[serde(default)]
     always_all: AlwaysAllSection,
+
+    #[serde(default)]
+    always_run: AlwaysRunSection,
+
+    #[serde(default)]
+    link: Vec<Spanned<LinkTable>>,
+
+    #[serde(default)]
+    ignore: Vec<Spanned<IgnoreTable>>,
 
     #[serde(default)]
     inference: InferenceSettings,
@@ -109,6 +120,7 @@ impl Presets {
 pub struct Config {
     pub presets: Presets,
     pub always_all: AlwaysAll,
+    pub rules: Rules,
     pub inference: InferenceSettings,
 }
 
@@ -118,10 +130,17 @@ impl Config {
             .map_err(|toml_error| anyhow!(describe_toml_error(config_text, &toml_error)))?;
         let always_all = AlwaysAll::new(config_file.always_all.files)
             .map_err(|pattern_error| anyhow!("invalid prober.toml: {pattern_error}"))?;
+        let rules = Rules::parse(
+            config_text,
+            config_file.link,
+            config_file.ignore,
+            config_file.always_run,
+        )?;
 
         Ok(Self {
             presets: Presets::from_field(config_file.presets)?,
             always_all,
+            rules,
             inference: config_file.inference,
         })
     }
@@ -183,6 +202,37 @@ impl AlwaysAll {
             .map_err(|glob_error| anyhow!("cannot compile always_all patterns: {glob_error}"))?;
 
         Ok(Self { patterns, matcher })
+    }
+
+    pub fn warnings(&self, repo_files: &[RepoPath]) -> Vec<ConfigWarning> {
+        let mut warnings = Vec::new();
+        let mut matched_counts = vec![0; self.patterns.len()];
+
+        for path in repo_files {
+            for index in self.matcher.matches(path.as_str()) {
+                matched_counts[index] += 1;
+            }
+        }
+
+        for (pattern, matched) in self.patterns.iter().zip(matched_counts) {
+            let message = if matched == 0 {
+                format!("[always_all] file {pattern:?} matches no file")
+            } else if is_broad(matched, repo_files.len()) {
+                format!(
+                    "[always_all] file {pattern:?} matches {matched} of {} files, which then run every test",
+                    repo_files.len()
+                )
+            } else {
+                continue;
+            };
+
+            warnings.push(ConfigWarning {
+                line: None,
+                message,
+            });
+        }
+
+        warnings
     }
 
     pub fn matching_changes<'a>(&'a self, changes: &'a [FileChange]) -> Vec<AlwaysAllMatch<'a>> {
@@ -376,7 +426,7 @@ mod tests {
             ),
             (
                 "anchors = true\n",
-                "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
+                "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
             ),
             (
                 "presets = [\"vitest\", \"pytest\"]\n",

@@ -14,6 +14,10 @@ const SCHEMA_VERSION: u32 = 1;
 
 const UNRESOLVED_DYNAMIC_IMPORT: &str = "unresolved-dynamic-import";
 
+pub const SELECTION_VARIABLE: &str = "PROBER_SELECTION";
+
+pub const CONFIG_FILE_NAME: &str = "prober.toml";
+
 pub(crate) const WIDENED_HOP_PREFIX: &str = "-> widened: ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,7 +69,11 @@ pub enum ModeReason {
         detail: String,
         other_packages: usize,
     },
+    Forced,
     NoImpact {
+        changed_file_count: usize,
+    },
+    OnlyUnhandled {
         changed_file_count: usize,
     },
     Error {
@@ -80,7 +88,9 @@ impl ModeReason {
             ModeReason::UnparsableManifest { .. } => "unparsable_manifest",
             ModeReason::GlobalField { .. } => "global_field",
             ModeReason::RootScope { .. } | ModeReason::RootScopePackage { .. } => "root_scope",
+            ModeReason::Forced => "forced",
             ModeReason::NoImpact { .. } => "no_impact",
+            ModeReason::OnlyUnhandled { .. } => "only_unhandled",
             ModeReason::Error { .. } => "error",
         }
     }
@@ -127,6 +137,13 @@ impl ModeReason {
             ModeReason::NoImpact { changed_file_count } => {
                 format!("{changed_file_count} changed files reach no test file")
             }
+            ModeReason::Forced => format!("forced by {SELECTION_VARIABLE}=all"),
+            ModeReason::OnlyUnhandled {
+                changed_file_count: 1,
+            } => "1 changed file is in a language Prober does not analyse".to_owned(),
+            ModeReason::OnlyUnhandled { changed_file_count } => format!(
+                "{changed_file_count} changed files are in languages Prober does not analyse"
+            ),
             ModeReason::Error { message } => message.clone(),
         }
     }
@@ -144,8 +161,15 @@ impl From<AlwaysAllMatch<'_>> for ModeReason {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Impact {
-    pub distance: usize,
+    pub distance: Option<usize>,
     pub reason: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlwaysRunTest {
+    pub path: RepoPath,
+    pub language: &'static str,
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -174,6 +198,8 @@ pub struct Report {
     pub mode: Mode,
     pub targets: Vec<Target>,
     pub widened: Vec<WidenedSite>,
+    pub unhandled: Vec<RepoPath>,
+    pub always_run_count: usize,
     pub test_count_by_language: BTreeMap<&'static str, usize>,
     pub config_hash: String,
 }
@@ -200,7 +226,7 @@ impl Report {
                 path: graph.path(selected_test.file).clone(),
                 language: selected_test_language(graph, selected_test.file),
                 impact: Some(Impact {
-                    distance: selected_test.distance(),
+                    distance: Some(selected_test.distance()),
                     reason: describe_reason(graph, &selected_test.reason),
                 }),
             })
@@ -211,6 +237,8 @@ impl Report {
             mode,
             targets,
             widened: widened_sites(graph, selected_tests),
+            unhandled: Vec::new(),
+            always_run_count: 0,
             test_count_by_language: count_by_language(&graph.test_files_by_path()),
             config_hash,
         }
@@ -232,9 +260,53 @@ impl Report {
             mode: Mode::All { reasons },
             targets,
             widened: Vec::new(),
+            unhandled: Vec::new(),
+            always_run_count: 0,
             test_count_by_language: count_by_language(&test_files),
             config_hash,
         }
+    }
+
+    pub fn with_always_run(mut self, always_run_tests: Vec<AlwaysRunTest>) -> Self {
+        if self.mode != Mode::Selected {
+            return self;
+        }
+
+        for always_run_test in always_run_tests {
+            if self
+                .targets
+                .iter()
+                .any(|target| target.path == always_run_test.path)
+            {
+                continue;
+            }
+
+            self.targets.push(Target {
+                path: always_run_test.path,
+                language: always_run_test.language,
+                impact: Some(Impact {
+                    distance: None,
+                    reason: vec![always_run_test.reason],
+                }),
+            });
+            self.always_run_count += 1;
+        }
+
+        self
+    }
+
+    pub fn with_unhandled(mut self, unhandled: Vec<RepoPath>, changed_file_count: usize) -> Self {
+        let only_unhandled = !unhandled.is_empty() && unhandled.len() == changed_file_count;
+
+        if let Mode::None { reasons } = &mut self.mode
+            && only_unhandled
+        {
+            *reasons = vec![ModeReason::OnlyUnhandled { changed_file_count }];
+        }
+
+        self.unhandled = unhandled;
+
+        self
     }
 
     pub fn with_revisions(self, revisions: ResolvedRevisions) -> Self {
@@ -267,7 +339,10 @@ impl Report {
 
             if let Some(impact) = &target.impact {
                 reasons.insert(path, impact.reason.as_slice());
-                distances.insert(path, impact.distance);
+
+                if let Some(distance) = impact.distance {
+                    distances.insert(path, distance);
+                }
             }
         }
 
@@ -284,6 +359,7 @@ impl Report {
             reasons,
             distances,
             widened: self.widened.iter().map(JsonWidenedSite::new).collect(),
+            unhandled: self.unhandled.iter().map(RepoPath::as_str).collect(),
             stats: self.json_stats(),
         };
         let mut json =
@@ -314,15 +390,25 @@ impl Report {
         let selected_count = self.targets.len();
 
         match &self.mode {
-            Mode::Selected if self.widened.is_empty() => format!(
-                "prober: selected {selected_count}/{test_count} test files ({})",
-                format_percentage(selected_count as f64, test_count as f64)
-            ),
-            Mode::Selected => format!(
-                "prober: selected {selected_count}/{test_count} test files ({}), {} added by widening",
-                format_percentage(selected_count as f64, test_count as f64),
-                self.tests_added_by_widening()
-            ),
+            Mode::Selected => {
+                let mut summary_line = format!(
+                    "prober: selected {selected_count}/{test_count} test files ({})",
+                    format_percentage(selected_count as f64, test_count as f64)
+                );
+
+                if !self.widened.is_empty() {
+                    summary_line.push_str(&format!(
+                        ", {} added by widening",
+                        self.tests_added_by_widening()
+                    ));
+                }
+
+                if self.always_run_count > 0 {
+                    summary_line.push_str(&format!(", {} always run", self.always_run_count));
+                }
+
+                summary_line
+            }
             Mode::All { reasons } => format!(
                 "prober: all {test_count} test files — {}",
                 join_messages(reasons)
@@ -366,6 +452,7 @@ impl Report {
             tests_selected: self.targets.len(),
             selected_ratio: rounded_ratio(self.targets.len() as f64, self.test_count() as f64),
             tests_added_by_widening: self.tests_added_by_widening(),
+            tests_always_run: self.always_run_count,
             by_language,
             config_hash: &self.config_hash,
         }
@@ -382,6 +469,7 @@ struct JsonReport<'a> {
     reasons: BTreeMap<&'a str, &'a [String]>,
     distances: BTreeMap<&'a str, usize>,
     widened: Vec<JsonWidenedSite<'a>>,
+    unhandled: Vec<&'a str>,
     stats: JsonStats<'a>,
 }
 
@@ -458,7 +546,10 @@ impl<'a> JsonModeReason<'a> {
                 package: Some(package),
                 ..json_mode_reason
             },
-            ModeReason::NoImpact { .. } | ModeReason::Error { .. } => json_mode_reason,
+            ModeReason::Forced
+            | ModeReason::NoImpact { .. }
+            | ModeReason::OnlyUnhandled { .. }
+            | ModeReason::Error { .. } => json_mode_reason,
         }
     }
 }
@@ -469,6 +560,7 @@ struct JsonStats<'a> {
     tests_selected: usize,
     selected_ratio: f64,
     tests_added_by_widening: usize,
+    tests_always_run: usize,
     by_language: BTreeMap<&'static str, JsonLanguageStats>,
     config_hash: &'a str,
 }
@@ -498,7 +590,7 @@ fn count_by_language(test_files: &[TestFile]) -> BTreeMap<&'static str, usize> {
     test_count_by_language
 }
 
-fn describe_reason(graph: &Graph, reason: &Reason) -> Vec<String> {
+pub(crate) fn describe_reason(graph: &Graph, reason: &Reason) -> Vec<String> {
     let hop_descriptions = reason.hops.iter().map(|hop| describe_hop(graph, hop));
 
     std::iter::once(reason.change.to_string())
@@ -530,6 +622,26 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             kind: EdgeKind::Family,
             ..
         } => format!("-> paired by name with {dependent}"),
+        Link::Edge {
+            kind: EdgeKind::Rule,
+            dependency,
+        } => {
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind: EdgeKind::Rule,
+            };
+
+            match graph.inference(&edge) {
+                Some(inference) => {
+                    format!(
+                        "-> linked to {dependent} by {CONFIG_FILE_NAME}:{}",
+                        inference.line
+                    )
+                }
+                None => format!("-> linked to {dependent} by {CONFIG_FILE_NAME}"),
+            }
+        }
         Link::Edge {
             kind: EdgeKind::Build,
             dependency,
@@ -581,6 +693,16 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             format!(
                 "{WIDENED_HOP_PREFIX}unresolved dynamic import at {dependent}:{} ({})",
                 unresolved_site.line, unresolved_site.expression
+            )
+        }
+        Link::SetAsideSite(site_index) => {
+            let set_aside_site = &graph.set_aside_sites()[site_index];
+
+            format!(
+                "{WIDENED_HOP_PREFIX}unresolved dynamic import at {dependent}:{} ({}), set aside by {CONFIG_FILE_NAME}:{}",
+                set_aside_site.site.line,
+                set_aside_site.site.expression,
+                set_aside_site.set_aside.line()
             )
         }
     }
@@ -751,11 +873,13 @@ mod tests {
     "src/b.test.ts": 2
   },
   "widened": [],
+  "unhandled": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 2,
     "selected_ratio": 0.6667,
     "tests_added_by_widening": 0,
+    "tests_always_run": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -918,6 +1042,104 @@ mod tests {
                 "-> loaded by bin/cli.mjs:3 (inferred path dist/entry.js)",
                 "-> spawned by test/cli.e2e.test.ts:12 (inferred spawn bin/cli.mjs)",
             ])
+        );
+    }
+
+    #[test]
+    fn always_run_tests_join_a_selection_without_a_distance_but_never_an_empty_one() {
+        let graph = polyglot_graph();
+        let smoke_test = AlwaysRunTest {
+            path: repo_path("tests/test_api.py"),
+            language: "python",
+            reason: "always run by prober.toml:2 (\"tests/**\")".to_owned(),
+        };
+        let selected = report_for_changes(&graph, &[modified("src/b.ts")])
+            .with_always_run(vec![smoke_test.clone()]);
+        let json_report: serde_json::Value = serde_json::from_str(&selected.to_json()).unwrap();
+        let none = report_for_changes(&graph, &[modified("docs/guide.md")])
+            .with_always_run(vec![smoke_test]);
+
+        assert_eq!(
+            json_report["targets"],
+            serde_json::json!({ "python": ["tests/test_api.py"], "typescript": ["src/b.test.ts"] })
+        );
+        assert_eq!(
+            json_report["reasons"]["tests/test_api.py"],
+            serde_json::json!(["always run by prober.toml:2 (\"tests/**\")"])
+        );
+        assert_eq!(
+            json_report["distances"],
+            serde_json::json!({ "src/b.test.ts": 1 })
+        );
+        assert_eq!(json_report["stats"]["tests_always_run"], 1);
+        assert_eq!(
+            selected.summary_line(),
+            "prober: selected 2/3 test files (66.7%), 1 always run"
+        );
+        assert_eq!(none.targets, []);
+    }
+
+    #[test]
+    fn only_unhandled_changes_select_none_with_their_own_reason() {
+        let graph = polyglot_graph();
+        let changes = [modified("apps/ios/ChatView.swift")];
+        let report = report_for_changes(&graph, &changes)
+            .with_unhandled(vec![repo_path("apps/ios/ChatView.swift")], changes.len());
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["mode_reasons"],
+            serde_json::json!([{
+                "kind": "only_unhandled",
+                "message": "1 changed file is in a language Prober does not analyse",
+            }])
+        );
+        assert_eq!(
+            json_report["unhandled"],
+            serde_json::json!(["apps/ios/ChatView.swift"])
+        );
+    }
+
+    #[test]
+    fn forced_selection_runs_every_test() {
+        let report = Report::all(&polyglot_graph(), vec![ModeReason::Forced], String::new());
+
+        assert_eq!(
+            report.summary_line(),
+            "prober: all 3 test files — forced by PROBER_SELECTION=all"
+        );
+        assert_eq!(ModeReason::Forced.kind(), "forced");
+    }
+
+    #[test]
+    fn config_link_hop_names_the_rule_line() {
+        let mut builder = GraphBuilder::default();
+        let golden_test = builder.add_test_file(repo_path("test/golden.test.ts"), "typescript");
+        let fixture = builder.add_file(repo_path("fixtures/golden/a.json"));
+
+        builder.add_inferred_edge(
+            Edge {
+                dependent: golden_test,
+                dependency: fixture,
+                kind: EdgeKind::Rule,
+            },
+            Inference {
+                line: 6,
+                kind: "link",
+                pattern: "fixtures/golden/**".to_owned(),
+                detail: None,
+            },
+        );
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("fixtures/golden/a.json")]);
+
+        assert_eq!(
+            report.targets[0].impact.as_ref().unwrap().reason,
+            [
+                "fixtures/golden/a.json (modified)",
+                "-> linked to test/golden.test.ts by prober.toml:6",
+            ]
         );
     }
 
@@ -1154,11 +1376,13 @@ mod tests {
   "reasons": {},
   "distances": {},
   "widened": [],
+  "unhandled": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 3,
     "selected_ratio": 1.0,
     "tests_added_by_widening": 0,
+    "tests_always_run": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -1199,11 +1423,13 @@ mod tests {
   "reasons": {},
   "distances": {},
   "widened": [],
+  "unhandled": [],
   "stats": {
     "tests_total": 3,
     "tests_selected": 0,
     "selected_ratio": 0.0,
     "tests_added_by_widening": 0,
+    "tests_always_run": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -1316,12 +1542,12 @@ mod tests {
             json_report["mode_reasons"],
             serde_json::json!([{
                 "kind": "error",
-                "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
+                "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
             }])
         );
         assert_eq!(
             report.summary_line(),
-            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`"
+            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`"
         );
     }
 }

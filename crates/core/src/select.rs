@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::changes::FileChange;
 use crate::files::FileId;
-use crate::graph::{ContentChange, EdgeKind, Graph};
+use crate::graph::{ContentChange, Edge, EdgeKind, Graph, UnresolvedSite};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Widening {
@@ -12,10 +12,20 @@ pub enum Widening {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Relaxation {
+    Ignores,
+    Mocks,
+    Content,
+    TypeOnly,
+    Assets,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     Edge { kind: EdgeKind, dependency: FileId },
     ChangedPart(usize),
     UnresolvedSite(usize),
+    SetAsideSite(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,7 +44,7 @@ impl Reason {
     pub fn widening_site(&self) -> Option<usize> {
         match self.hops.first()?.link {
             Link::UnresolvedSite(site_index) => Some(site_index),
-            Link::Edge { .. } | Link::ChangedPart(_) => None,
+            Link::Edge { .. } | Link::ChangedPart(_) | Link::SetAsideSite(_) => None,
         }
     }
 }
@@ -48,6 +58,61 @@ pub struct SelectedTest {
 impl SelectedTest {
     pub fn distance(&self) -> usize {
         self.reason.hops.len()
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Traversal<'g> {
+    graph: &'g Graph,
+    relaxation: Option<Relaxation>,
+}
+
+impl<'g> Traversal<'g> {
+    fn is_relaxed(self, relaxation: Relaxation) -> bool {
+        self.relaxation == Some(relaxation)
+    }
+
+    fn follows(self, kind: EdgeKind, content: ContentChange) -> bool {
+        let selects = kind.selects_tests()
+            || kind == EdgeKind::TypeOnly && self.is_relaxed(Relaxation::TypeOnly);
+
+        selects && (kind.follows(content) || self.is_relaxed(Relaxation::Content))
+    }
+
+    fn dependents(self, file: FileId) -> impl Iterator<Item = Edge> + 'g {
+        let ignored = if self.is_relaxed(Relaxation::Ignores) {
+            self.graph.ignored_dependents(file)
+        } else {
+            &[]
+        };
+
+        self.graph
+            .dependents(file)
+            .iter()
+            .copied()
+            .chain(ignored.iter().map(|ignored_edge| ignored_edge.edge))
+    }
+
+    fn widening_sites(self) -> impl Iterator<Item = (Link, &'g UnresolvedSite)> {
+        let set_aside = if self.is_relaxed(Relaxation::Ignores) {
+            self.graph.set_aside_sites()
+        } else {
+            &[]
+        };
+
+        self.graph
+            .unresolved_sites()
+            .iter()
+            .enumerate()
+            .map(|(site_index, site)| (Link::UnresolvedSite(site_index), site))
+            .chain(
+                set_aside
+                    .iter()
+                    .enumerate()
+                    .map(|(site_index, set_aside_site)| {
+                        (Link::SetAsideSite(site_index), &set_aside_site.site)
+                    }),
+            )
     }
 }
 
@@ -81,18 +146,28 @@ pub fn select_tests(
     changes: &[FileChange],
     widening: Widening,
 ) -> Vec<SelectedTest> {
-    let (asset_changes, code_changes): (Vec<FileChange>, Vec<FileChange>) = changes
-        .iter()
-        .cloned()
-        .partition(|change| is_asset_change(graph, change));
-    let code_discoveries = discover_dependents(graph, &code_changes, widening);
-    let asset_discoveries = discover_dependents(graph, &asset_changes, Widening::Off);
-    let mut selected_tests = tests_reached(graph, &code_discoveries, |_| true);
+    select_relaxed(graph, changes, widening, None)
+}
+
+pub fn select_relaxed(
+    graph: &Graph,
+    changes: &[FileChange],
+    widening: Widening,
+    relaxation: Option<Relaxation>,
+) -> Vec<SelectedTest> {
+    let traversal = Traversal { graph, relaxation };
+    let (asset_changes, code_changes): (Vec<FileChange>, Vec<FileChange>) =
+        changes.iter().cloned().partition(|change| {
+            !traversal.is_relaxed(Relaxation::Assets) && is_asset_change(graph, change)
+        });
+    let code_discoveries = discover_dependents(traversal, &code_changes, widening);
+    let asset_discoveries = discover_dependents(traversal, &asset_changes, Widening::Off);
+    let mut selected_tests = tests_reached(traversal, &code_discoveries, |_| true);
     let selected_files: HashSet<FileId> = selected_tests
         .iter()
         .map(|selected_test| selected_test.file)
         .collect();
-    let asset_tests = tests_reached(graph, &asset_discoveries, |test| {
+    let asset_tests = tests_reached(traversal, &asset_discoveries, |test| {
         !graph.is_asset_blind(test) && !selected_files.contains(&test)
     });
 
@@ -116,16 +191,16 @@ fn is_asset_change(graph: &Graph, change: &FileChange) -> bool {
 }
 
 fn tests_reached(
-    graph: &Graph,
+    traversal: Traversal,
     discoveries: &Discoveries,
     keeps: impl Fn(FileId) -> bool,
 ) -> Vec<SelectedTest> {
     discoveries
         .files
         .keys()
-        .filter(|&&file| graph.is_test(file) && keeps(file))
+        .filter(|&&file| traversal.graph.is_test(file) && keeps(file))
         .filter_map(|&test_file| {
-            let reason = reason_past_mocks(graph, discoveries, test_file)?;
+            let reason = reason_past_mocks(traversal, discoveries, test_file)?;
 
             Some(SelectedTest {
                 file: test_file,
@@ -136,13 +211,16 @@ fn tests_reached(
 }
 
 fn reason_past_mocks(
-    graph: &Graph,
+    traversal: Traversal,
     discoveries: &Discoveries,
     test_file: FileId,
 ) -> Option<Reason> {
+    let graph = traversal.graph;
     let mocked_modules = graph.mocked_modules(test_file);
     let is_mocked = |file: FileId| {
-        mocked_modules.binary_search(&file).is_ok() && !graph.has_changed_contract(file)
+        !traversal.is_relaxed(Relaxation::Mocks)
+            && mocked_modules.binary_search(&file).is_ok()
+            && !graph.has_changed_contract(file)
     };
 
     if trace_avoids(test_file, &discoveries.files, &is_mocked) {
@@ -161,14 +239,14 @@ fn reason_past_mocks(
         let test_selecting_edges = graph
             .dependencies(file)
             .iter()
-            .filter(|edge| edge.kind.selects_tests());
+            .filter(|edge| traversal.follows(edge.kind, ContentChange::Direct));
 
         for edge in test_selecting_edges {
             let dependency = edge.dependency;
             let carries_the_change = discoveries
                 .files
                 .get(&dependency)
-                .is_some_and(|discovery| edge.kind.follows(discovery.content));
+                .is_some_and(|discovery| traversal.follows(edge.kind, discovery.content));
             let is_unexplored = dependency != test_file
                 && !dependents_on_path.contains_key(&dependency)
                 && carries_the_change
@@ -191,7 +269,7 @@ fn reason_past_mocks(
             if let Some(origin) = discoveries
                 .origins
                 .get(&dependency)
-                .filter(|origin| edge.kind.follows(origin.content))
+                .filter(|origin| traversal.follows(edge.kind, origin.content))
             {
                 return Some(reason_from_origin(dependency, origin, &dependents_on_path));
             }
@@ -217,7 +295,9 @@ fn trace_avoids(
 
         match discoveries[&file].reached_via {
             Some(Link::Edge { dependency, .. }) => file = dependency,
-            Some(Link::ChangedPart(_) | Link::UnresolvedSite(_)) | None => return true,
+            Some(Link::ChangedPart(_) | Link::UnresolvedSite(_) | Link::SetAsideSite(_)) | None => {
+                return true;
+            }
         }
     }
 }
@@ -271,10 +351,11 @@ fn extended_to_the_test(
 }
 
 fn discover_dependents<'a>(
-    graph: &Graph,
+    traversal: Traversal,
     changes: &'a [FileChange],
     widening: Widening,
 ) -> Discoveries<'a> {
+    let graph = traversal.graph;
     let mut discoveries = Discoveries::default();
     let mut files_to_visit = VecDeque::new();
     let mut changes_by_path: Vec<&FileChange> = changes.iter().collect();
@@ -316,19 +397,17 @@ fn discover_dependents<'a>(
         );
     }
 
-    visit_dependents(graph, &mut discoveries.files, &mut files_to_visit);
+    visit_dependents(traversal, &mut discoveries.files, &mut files_to_visit);
 
     if widening == Widening::Off {
         return discoveries;
     }
 
-    let widening_sites = graph
-        .unresolved_sites()
-        .iter()
-        .enumerate()
+    let widening_sites = traversal
+        .widening_sites()
         .filter(|(_, unresolved_site)| unresolved_site.cause.widens());
 
-    for (site_index, unresolved_site) in widening_sites {
+    for (site_link, unresolved_site) in widening_sites {
         let loadable_change = changes_by_path.iter().find(|change| {
             change
                 .touched_paths()
@@ -341,14 +420,14 @@ fn discover_dependents<'a>(
                 unresolved_site.file,
                 Discovery {
                     change,
-                    reached_via: Some(Link::UnresolvedSite(site_index)),
+                    reached_via: Some(site_link),
                     content: ContentChange::None,
                 },
             );
         }
     }
 
-    visit_dependents(graph, &mut discoveries.files, &mut files_to_visit);
+    visit_dependents(traversal, &mut discoveries.files, &mut files_to_visit);
 
     discoveries
 }
@@ -373,16 +452,15 @@ fn discover<'a>(
 }
 
 fn visit_dependents<'a>(
-    graph: &Graph,
+    traversal: Traversal,
     discoveries: &mut HashMap<FileId, Discovery<'a>>,
     files_to_visit: &mut VecDeque<FileId>,
 ) {
     while let Some(file) = files_to_visit.pop_front() {
         let discovery = discoveries[&file];
-        let test_selecting_edges = graph
+        let test_selecting_edges = traversal
             .dependents(file)
-            .iter()
-            .filter(|edge| edge.kind.selects_tests() && edge.kind.follows(discovery.content));
+            .filter(|edge| traversal.follows(edge.kind, discovery.content));
 
         for edge in test_selecting_edges {
             let reached_via = Link::Edge {
@@ -416,7 +494,7 @@ fn trace_reason(reached_file: FileId, discoveries: &HashMap<FileId, Discovery>) 
 
         match link {
             Link::Edge { dependency, .. } => file = dependency,
-            Link::ChangedPart(_) | Link::UnresolvedSite(_) => break,
+            Link::ChangedPart(_) | Link::UnresolvedSite(_) | Link::SetAsideSite(_) => break,
         }
     }
 
