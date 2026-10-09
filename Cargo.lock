@@ -2045,20 +2045,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "prober-replay"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "globset",
- "prober-core",
- "serde",
- "serde_json",
- "tempfile",
- "toml",
-]
-
-[[package]]
 name = "prober-vcs"
 version = "0.1.0"
 dependencies = [
