@@ -12,6 +12,7 @@ use crate::files::{FileId, RepoPath};
 use crate::graph::{ContentChange, Graph, RootScope, UnresolvedCause};
 use crate::ratios::format_percentage;
 use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
+use crate::symbols::FallbackCause;
 
 pub use crate::scan::cycles::{CycleSize, ImportCycle, SymbolCycles, SymbolSummary};
 pub use crate::scan::hubs::{HubFile, SmokeSet};
@@ -931,9 +932,7 @@ fn symbol_cycles_text(symbol_cycles: &SymbolCycles) -> String {
     )
 }
 
-fn json_file_level(
-    file_level: &[(RepoPath, crate::symbols::FallbackCause)],
-) -> Vec<JsonFileLevelModule<'_>> {
+fn json_file_level(file_level: &[(RepoPath, FallbackCause)]) -> Vec<JsonFileLevelModule<'_>> {
     file_level
         .iter()
         .map(|(file, cause)| JsonFileLevelModule {

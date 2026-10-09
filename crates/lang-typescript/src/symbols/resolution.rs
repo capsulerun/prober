@@ -283,10 +283,9 @@ impl Resolver<'_> {
             kept.sort_unstable();
 
             for (module, symbol, parameter) in kept {
-                let passed =
-                    &self.modules[module].symbols.symbols[symbol].parameters[parameter].passed;
+                let symbols = self.modules[module].symbols;
+                let passed = &symbols.symbols[symbol].parameters[parameter].passed;
                 let still_kept = passed
-                    .clone()
                     .iter()
                     .all(|(callee, argument)| self.keeps(module, callee, *argument));
 

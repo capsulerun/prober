@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use crate::files::{FileId, FileTable, RepoPath};
 use crate::patterns::Captures;
 use crate::symbols::{
-    LineRange, ModuleFallback, Symbol, SymbolEdge, SymbolId, SymbolKind, SymbolTable,
-    SymbolTableBuilder, SymbolTarget,
+    ModuleFallback, Symbol, SymbolEdge, SymbolId, SymbolKind, SymbolTable, SymbolTableBuilder,
+    SymbolTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -750,10 +750,7 @@ impl Graph {
                 let symbol = self.symbol(symbol);
 
                 symbol.kind != SymbolKind::ModuleInit
-                    && symbol
-                        .lines
-                        .iter()
-                        .any(|lines: &LineRange| lines.contains(line))
+                    && symbol.lines.iter().any(|lines| lines.contains(line))
             })
             .collect();
 

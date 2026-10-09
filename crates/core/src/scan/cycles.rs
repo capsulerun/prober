@@ -1,5 +1,6 @@
 //! Import cycles: modules that reach each other through imports, the tests they pull in, and what is left of them at symbol level.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use crate::cycles::strongly_connected_components;
@@ -171,7 +172,7 @@ fn symbol_cycles(graph: &Graph, files: &[FileId]) -> Option<SymbolCycles> {
             .count()
     };
 
-    components.sort_by_key(|component| std::cmp::Reverse(symbol_count(component)));
+    components.sort_by_key(|component| Reverse(symbol_count(component)));
     components.retain(|component| symbol_count(component) > 1);
     components.truncate(MEASURED_SYMBOL_CYCLES);
 
@@ -195,7 +196,7 @@ fn symbol_cycles(graph: &Graph, files: &[FileId]) -> Option<SymbolCycles> {
         })
         .collect();
 
-    cycles.sort_by_key(|(cycle_size, _)| std::cmp::Reverse((cycle_size.tests, cycle_size.symbols)));
+    cycles.sort_by_key(|(cycle_size, _)| Reverse((cycle_size.tests, cycle_size.symbols)));
 
     let leading_in = cycles.first().map_or(0, |(_, cycle)| {
         let mut reached: HashSet<usize> = cycle.iter().copied().collect();
@@ -293,17 +294,10 @@ fn file_dependents_at_symbol_level(graph: &Graph, file: FileId) -> Vec<Node> {
             continue;
         }
 
-        let dependent_symbols = graph.symbols_of(edge.dependent);
-
-        if dependent_symbols.is_empty() {
+        if graph.symbols_of(edge.dependent).is_empty() {
             dependents.push(Node::File(edge.dependent));
         } else if !matches!(edge.kind, EdgeKind::Import | EdgeKind::Asset) {
-            let symbols = match graph.inference(&edge) {
-                Some(inference) => graph.symbols_at(edge.dependent, inference.line),
-                None => dependent_symbols.to_vec(),
-            };
-
-            dependents.extend(symbols.into_iter().map(Node::Symbol));
+            dependents.extend(linking_symbols(graph, &edge).into_iter().map(Node::Symbol));
         }
     }
 
@@ -327,7 +321,7 @@ fn attributed_dynamic_loads(
             .filter(|edge| edge.kind == EdgeKind::Dynamic && in_cycle.contains(&edge.dependency));
 
         for edge in loads {
-            for symbol in loading_symbols(graph, &edge) {
+            for symbol in linking_symbols(graph, &edge) {
                 dynamic_loads
                     .entry(symbol)
                     .or_default()
@@ -339,10 +333,10 @@ fn attributed_dynamic_loads(
     dynamic_loads
 }
 
-fn loading_symbols(graph: &Graph, edge: &Edge) -> Vec<SymbolId> {
+fn linking_symbols(graph: &Graph, edge: &Edge) -> Vec<SymbolId> {
     match graph.inference(edge) {
         Some(inference) => graph.symbols_at(edge.dependent, inference.line),
-        None => graph.module_init(edge.dependent).into_iter().collect(),
+        None => graph.symbols_of(edge.dependent).to_vec(),
     }
 }
 
