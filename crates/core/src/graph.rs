@@ -138,24 +138,10 @@ pub struct UnresolvedSite {
     pub language: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SetAside {
-    Ignored { line: usize },
-    Resolved { line: usize },
-}
-
-impl SetAside {
-    pub fn line(self) -> usize {
-        match self {
-            SetAside::Ignored { line } | SetAside::Resolved { line } => line,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SetAsideSite {
     pub site: UnresolvedSite,
-    pub set_aside: SetAside,
+    pub line: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -386,7 +372,7 @@ impl GraphBuilder {
 
     pub(crate) fn set_aside_sites(
         &mut self,
-        set_aside: SetAside,
+        line: usize,
         matches: impl Fn(&UnresolvedSite, &RepoPath) -> bool,
     ) -> usize {
         let files = &self.files;
@@ -397,11 +383,8 @@ impl GraphBuilder {
         let set_aside_count = matching.len();
 
         self.unresolved_sites = kept;
-        self.set_aside_sites.extend(
-            matching
-                .into_iter()
-                .map(|site| SetAsideSite { site, set_aside }),
-        );
+        self.set_aside_sites
+            .extend(matching.into_iter().map(|site| SetAsideSite { site, line }));
 
         set_aside_count
     }

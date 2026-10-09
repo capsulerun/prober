@@ -1,4 +1,4 @@
-//! Config lines worth writing, as ready-to-paste TOML: links declaring what the most widening unresolved sites load, and ignores of the widest inferred links.
+//! Config lines worth writing, as ready-to-paste TOML: links declaring what the most widening unresolved sites load with ignores setting those sites aside, and ignores of the widest inferred links.
 
 use std::collections::BTreeMap;
 
@@ -62,14 +62,14 @@ fn link_suggestions(
         .take(SUGGESTED_RULES)
         .map(|(file, unresolved_site)| Suggestion {
             reason: format!(
-                "{} widens to {} test files: {} {}; declare what it loads and the unresolved sites of {file} stop widening",
+                "{} widens to {} test files: {} {}; declare what {file} loads, then set its unresolved sites aside",
                 unresolved_site.site,
                 unresolved_site.tests,
                 unresolved_site.expression,
                 unresolved_site.cause.description()
             ),
             toml: format!(
-                "[[link]]\nfrom = \"path/to/what/it/loads/**\"\nto = {file:?}\n"
+                "[[link]]\nfrom = \"path/to/what/it/loads/**\"\nto = {file:?}\n\n[[ignore]]\nsite = {file:?}\n"
             ),
         })
         .collect()
@@ -150,8 +150,8 @@ mod tests {
             suggestions,
             [
                 Suggestion {
-                    reason: "src/plugins/loader.ts:12 widens to 900 test files: import(entry) comes from a function parameter; declare what it loads and the unresolved sites of src/plugins/loader.ts stop widening".to_owned(),
-                    toml: "[[link]]\nfrom = \"path/to/what/it/loads/**\"\nto = \"src/plugins/loader.ts\"\n".to_owned(),
+                    reason: "src/plugins/loader.ts:12 widens to 900 test files: import(entry) comes from a function parameter; declare what src/plugins/loader.ts loads, then set its unresolved sites aside".to_owned(),
+                    toml: "[[link]]\nfrom = \"path/to/what/it/loads/**\"\nto = \"src/plugins/loader.ts\"\n\n[[ignore]]\nsite = \"src/plugins/loader.ts\"\n".to_owned(),
                 },
                 Suggestion {
                     reason: "test/inventory.test-support.ts:4 links 1200 files (file glob **/*.test.ts); if test/inventory.test-support.ts does not depend on all of them".to_owned(),

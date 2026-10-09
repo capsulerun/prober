@@ -1,4 +1,4 @@
-//! The rules a team writes in prober.toml: links the code does not show, ignores of inferred links and unresolved sites, the tests every selection runs, and warnings for rules that match nothing or almost everything.
+//! The rules a team writes in prober.toml: links the code does not show, ignores of links and unresolved sites, the tests every selection runs, and warnings for rules that match nothing or almost everything.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -9,7 +9,7 @@ use toml::Spanned;
 
 use crate::changes::FileChange;
 use crate::files::{FileId, RepoPath};
-use crate::graph::{Graph, GraphBuilder, RuleLink, SetAside};
+use crate::graph::{Graph, GraphBuilder, RuleLink};
 use crate::patterns::{Captures, PathPattern, describe_captures};
 use crate::report::{AlwaysRunTest, CONFIG_FILE_NAME};
 
@@ -293,7 +293,6 @@ fn apply_link(
         );
     }
 
-    let mut linked_paths: HashSet<&RepoPath> = HashSet::new();
     let mut unlinked = Vec::new();
     let mut links = 0;
 
@@ -336,29 +335,20 @@ fn apply_link(
             .iter()
             .map(|&path| builder.add_file(path.clone()))
             .collect();
-        let group_links = builder.add_rule_link(RuleLink {
+        links += builder.add_rule_link(RuleLink {
             line: link.line,
             pattern: link.from.text().to_owned(),
             captures: from_captures.clone(),
             from,
             to,
         });
-
-        if group_links > 0 {
-            linked_paths.extend(to_paths);
-            links += group_links;
-        }
     }
-
-    let sites = builder.set_aside_sites(SetAside::Resolved { line: link.line }, |_, path| {
-        linked_paths.contains(path)
-    });
 
     rule_report.effects.push(RuleEffect {
         line: link.line,
         rule,
         links,
-        sites,
+        sites: 0,
         unlinked,
     });
 }
@@ -448,10 +438,9 @@ fn apply_ignore(
                 Some(line) => format!("[[ignore]] site \"{}:{line}\"", file.text()),
                 None => format!("[[ignore]] site {:?}", file.text()),
             };
-            let sites =
-                builder.set_aside_sites(SetAside::Ignored { line: ignore.line }, |site, path| {
-                    file.is_match(path.as_str()) && line.is_none_or(|line| site.line == line)
-                });
+            let sites = builder.set_aside_sites(ignore.line, |site, path| {
+                file.is_match(path.as_str()) && line.is_none_or(|line| site.line == line)
+            });
 
             if sites == 0 {
                 rule_report.warnings.push(ConfigWarning {
@@ -744,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn links_connect_captured_files_and_resolve_the_unresolved_sites_they_declare() {
+    fn links_connect_captured_files_and_only_add_to_the_selection() {
         let (mut builder, files) = plugin_project();
         let rules = rules(
             "[[link]]\nfrom = \"extensions/{id}/**\"\nto = \"test/plugins/{id}.test.ts\"\n\n[[link]]\nfrom = \"extensions/*/index.ts\"\nto = \"src/loader.ts\"\n",
@@ -759,11 +748,8 @@ mod tests {
                 ("test/plugins/slack.test.ts".to_owned(), EdgeKind::Rule),
             ]
         );
-        assert_eq!(graph.unresolved_sites(), []);
-        assert_eq!(
-            graph.set_aside_sites()[0].set_aside,
-            SetAside::Resolved { line: 5 }
-        );
+        assert_eq!(graph.unresolved_sites().len(), 1);
+        assert_eq!(graph.set_aside_sites(), []);
         assert_eq!(
             rule_report.effects,
             [
@@ -779,7 +765,7 @@ mod tests {
                     line: 5,
                     rule: "[[link]] from \"extensions/*/index.ts\" to \"src/loader.ts\"".to_owned(),
                     links: 2,
-                    sites: 1,
+                    sites: 0,
                     unlinked: Vec::new(),
                 },
             ]
@@ -884,10 +870,7 @@ mod tests {
             [(EdgeKind::Rule, 12)]
         );
         assert_eq!(graph.unresolved_sites(), []);
-        assert_eq!(
-            graph.set_aside_sites()[0].set_aside,
-            SetAside::Ignored { line: 9 }
-        );
+        assert_eq!(graph.set_aside_sites()[0].line, 9);
         assert_eq!(
             rule_report
                 .effects

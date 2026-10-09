@@ -705,9 +705,7 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
 
             format!(
                 "{WIDENED_HOP_PREFIX}unresolved dynamic import at {dependent}:{} ({}), set aside by {CONFIG_FILE_NAME}:{}",
-                set_aside_site.site.line,
-                set_aside_site.site.expression,
-                set_aside_site.set_aside.line()
+                set_aside_site.site.line, set_aside_site.site.expression, set_aside_site.line
             )
         }
     }

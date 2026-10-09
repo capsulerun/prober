@@ -212,7 +212,7 @@ fn ignoring_lines(graph: &Graph, reason: &Reason) -> Vec<usize> {
         match hop.link {
             Link::Edge { .. } => lines.extend(ignored_edge_line(graph, hop)),
             Link::SetAsideSite(site_index) => {
-                lines.insert(graph.set_aside_sites()[site_index].set_aside.line());
+                lines.insert(graph.set_aside_sites()[site_index].line);
             }
             Link::ChangedPart(_) | Link::UnresolvedSite(_) => {}
         }

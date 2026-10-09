@@ -351,7 +351,11 @@ impl ScanReport {
             let _ = writeln!(text, "  # {}", suggestion.reason);
 
             for toml_line in suggestion.toml.lines() {
-                let _ = writeln!(text, "  {toml_line}");
+                if toml_line.is_empty() {
+                    text.push('\n');
+                } else {
+                    let _ = writeln!(text, "  {toml_line}");
+                }
             }
         }
     }
