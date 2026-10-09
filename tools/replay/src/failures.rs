@@ -10,6 +10,7 @@ use prober_core::outcomes::{TestOutcomes, TestStatus};
 use serde::Serialize;
 
 use crate::base_branches::BaseBranches;
+use crate::commands::fetch_missing_commits;
 use crate::config::HarnessConfig;
 use crate::logs::failed_test_file_paths;
 use crate::repository_files::RepositoryFiles;
@@ -100,6 +101,11 @@ pub fn run(arguments: &FailuresArguments) -> Result<String> {
         .filter(|run_failures| run_failures.failed_files.is_empty())
         .count();
     let change_failures = group_by_change(&pull_request_failures);
+
+    if let Some(repository) = arguments.repo.as_deref() {
+        fetch_missing_commits(repository, change_failures.iter().map(|change| change.head));
+    }
+
     let pre_existing_window_seconds = config.pre_existing_window_hours as i64 * SECONDS_PER_HOUR;
     let mut changes_lines = String::new();
     let mut failures_lines = String::new();

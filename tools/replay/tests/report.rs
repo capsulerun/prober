@@ -79,6 +79,10 @@ fn write_lines(path: &Path, lines: &[String]) {
     fs::write(path, lines.join("\n") + "\n").unwrap();
 }
 
+fn labelled(label: &str, path: &Path) -> String {
+    format!("{label}={}", path.display())
+}
+
 #[test]
 fn report_gives_savings_misses_and_the_effect_of_inference_and_widening() {
     let directory = TempDir::new().unwrap();
@@ -251,10 +255,10 @@ fn report_gives_savings_misses_and_the_effect_of_inference_and_widening() {
         .arg(&failed_changes)
         .arg("--failures")
         .arg(&failures)
-        .arg("--merges-without-inference")
-        .arg(&merges_without_inference)
-        .arg("--failed-changes-without-inference")
-        .arg(&failed_changes_without_inference)
+        .arg("--compare-merges")
+        .arg(labelled("Inference off", &merges_without_inference))
+        .arg("--compare-failed-changes")
+        .arg(labelled("Inference off", &failed_changes_without_inference))
         .output()
         .unwrap();
 
@@ -286,9 +290,10 @@ const EXPECTED_REPORT: &str = "# Prober benchmark: acme/app
 
 ### Why every test ran
 
-| Cause | Changes |
-| --- | --- |
-| `always_all` `**/vitest.*` | 1 |
+| Cause | Default | Inference off |
+| --- | --- | --- |
+| `always_all` `**/vitest.*` | 1 | 0 |
+| **Changes running every test** | 1 | 0 |
 
 ## Misses on 5 failed pull request changes
 
@@ -321,12 +326,118 @@ const EXPECTED_REPORT: &str = "# Prober benchmark: acme/app
 | --- | --- |
 | `c4` | git fetch --quiet origin c4 failed: not our ref |
 
-## Inference and widening
+## Configurations
 
 | Configuration | Test files selected on merged changes | Misses on failed changes |
 | --- | --- | --- |
-| Inference off, widening off (phase 1) | median 10.0%, mean 10.0% | 3 |
+| Inference off, widening off | median 10.0%, mean 10.0% | 3 |
 | Inference off, widening on | median 10.0%, mean 25.0% | 2 |
-| Inference on, widening off | median 10.0%, mean 30.0% | 2 |
-| **Inference on, widening on (default)** | median 10.0%, mean 35.0% | 1 |
+| Default, widening off | median 10.0%, mean 30.0% | 2 |
+| **Default, widening on** | median 10.0%, mean 35.0% | 1 |
 ";
+
+#[test]
+fn report_gives_the_files_and_listed_tests_probed_changes_reach() {
+    let directory = TempDir::new().unwrap();
+    let probes = directory.path().join("probes.jsonl");
+    let contract_tests = directory.path().join("contract-tests.txt");
+
+    write_lines(
+        &probes,
+        &[
+            record(
+                "extensions/a/index.ts",
+                1.0,
+                Some(selection(
+                    "selected",
+                    &["contract/a.test.ts", "src/other.test.ts"],
+                    &[],
+                    0.2,
+                )),
+                None,
+            ),
+            record(
+                "extensions/b/index.ts",
+                1.0,
+                Some(widened_selection(
+                    &["src/other.test.ts"],
+                    &["contract/b.test.ts"],
+                    10,
+                )),
+                None,
+            ),
+            record(
+                "extensions/c/index.ts",
+                0.0,
+                None,
+                Some("extensions/c/index.ts is not a file at abc"),
+            ),
+            record(
+                "extensions/d/index.ts",
+                1.0,
+                Some(selection("all", &["contract/a.test.ts"], &[], 1.0)),
+                None,
+            ),
+        ],
+    );
+    write_lines(
+        &contract_tests,
+        &[
+            "contract/a.test.ts".to_owned(),
+            "contract/b.test.ts".to_owned(),
+            "# the contract tests of the plugin registry".to_owned(),
+            "contract/c.test.ts".to_owned(),
+        ],
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_prober-replay"))
+        .args(["report", "--title", "acme/app", "--probes"])
+        .arg(labelled("Plugin entries", &probes))
+        .arg("--probe-tests")
+        .arg(labelled("Plugin entries", &contract_tests))
+        .output()
+        .unwrap();
+
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "prober-replay: report for 1 probe sets\n"
+    );
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "# Prober benchmark: acme/app
+
+## Probed changes
+
+Each probe adds a line to one file at one commit and replays that change. A listed test counts as reached when its reason does not go through widening.
+
+| Probes | Files probed | Files reaching a listed test | Listed tests reached | Reached only by widening |
+| --- | --- | --- | --- | --- |
+| Plugin entries | 4 (1 failed, 1 ran every test) | 1 (33.3%) | 1 of 3 (33.3%) | 1 |
+
+### Plugin entries
+
+- Files reaching no listed test: `extensions/b/index.ts`
+- Listed tests not reached: `contract/b.test.ts`, `contract/c.test.ts`
+"
+    );
+}
+
+#[test]
+fn probes_need_the_tests_of_their_label() {
+    let directory = TempDir::new().unwrap();
+    let probes = directory.path().join("probes.jsonl");
+
+    write_lines(&probes, &[record("src/a.ts", 1.0, None, Some("boom"))]);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_prober-replay"))
+        .args(["report", "--title", "acme/app", "--probes"])
+        .arg(labelled("e2e", &probes))
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "prober-replay: --probes \"e2e\" has no --probe-tests\n"
+    );
+}

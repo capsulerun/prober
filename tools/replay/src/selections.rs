@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use clap::Args;
 
 use crate::changes::{Change, last_commits, read_changes};
+use crate::commands::fetch_missing_commits;
 use crate::record::{RecordWriter, ReplayRecord, recorded_ids};
 use crate::worktree::Worktree;
 
@@ -20,6 +21,9 @@ pub struct SelectionsArguments {
 
     #[arg(long, help = "JSON lines file the records are appended to")]
     output: PathBuf,
+
+    #[command(flatten)]
+    prober: ProberArguments,
 
     #[arg(
         long,
@@ -42,6 +46,15 @@ pub struct SelectionsArguments {
     )]
     changes: Option<PathBuf>,
 
+    #[arg(
+        long,
+        help = "Fetch heads missing from the repository from its origin remote"
+    )]
+    fetch: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct ProberArguments {
     #[arg(long, default_value = "prober", help = "prober binary to run")]
     prober: PathBuf,
 
@@ -59,21 +72,49 @@ pub struct SelectionsArguments {
 
     #[arg(
         long,
-        help = "Fetch heads missing from the repository from its origin remote"
-    )]
-    fetch: bool,
-
-    #[arg(
-        long,
         help = "prober.toml placed in the worktree for every change, e.g. to switch an inference off"
     )]
     prober_config: Option<PathBuf>,
+
+    #[arg(
+        long,
+        help = "Keep every hop of each reason in the records; by default they keep the change and the first hop, all the report reads"
+    )]
+    full_reasons: bool,
 }
 
-struct ReplaySettings<'a> {
+impl ProberArguments {
+    pub fn open_worktree(&self, repository: &Path) -> Result<Worktree> {
+        let worktree_path = self
+            .worktree
+            .clone()
+            .unwrap_or_else(|| default_worktree_path(repository));
+
+        Worktree::open(repository, &worktree_path, self.setup.as_deref())
+    }
+
+    pub fn settings(&self) -> Result<ReplaySettings<'_>> {
+        let prober_config = self
+            .prober_config
+            .as_ref()
+            .map(|config_path| {
+                fs::read_to_string(config_path)
+                    .with_context(|| format!("cannot read {}", config_path.display()))
+            })
+            .transpose()?;
+
+        Ok(ReplaySettings {
+            prober: &self.prober,
+            prober_config,
+            full_reasons: self.full_reasons,
+        })
+    }
+}
+
+pub struct ReplaySettings<'a> {
     prober: &'a Path,
     prober_config: Option<String>,
-    fetch_missing_heads: bool,
+    full_reasons: bool,
 }
 
 pub fn run(arguments: &SelectionsArguments) -> Result<String> {
@@ -95,29 +136,20 @@ pub fn run(arguments: &SelectionsArguments) -> Result<String> {
         ));
     }
 
-    let worktree_path = arguments
-        .worktree
-        .clone()
-        .unwrap_or_else(|| default_worktree_path(&arguments.repo));
-    let prober_config = arguments
-        .prober_config
-        .as_ref()
-        .map(|config_path| {
-            fs::read_to_string(config_path)
-                .with_context(|| format!("cannot read {}", config_path.display()))
-        })
-        .transpose()?;
-    let replay_settings = ReplaySettings {
-        prober: &arguments.prober,
-        prober_config,
-        fetch_missing_heads: arguments.fetch,
-    };
-    let worktree = Worktree::open(&arguments.repo, &worktree_path, arguments.setup.as_deref())?;
+    let replay_settings = arguments.prober.settings()?;
+    let worktree = arguments.prober.open_worktree(&arguments.repo)?;
     let mut record_writer = RecordWriter::append_to(&arguments.output)?;
     let mut records = Vec::new();
 
+    if arguments.fetch {
+        fetch_missing_commits(
+            worktree.path(),
+            pending_changes.iter().map(|change| change.head.as_str()),
+        );
+    }
+
     for change in pending_changes {
-        let record = replay_change(&worktree, &replay_settings, change);
+        let record = replay_change(&worktree, &replay_settings, arguments.fetch, change);
 
         record_writer.write(&record)?;
         records.push(record);
@@ -126,8 +158,13 @@ pub fn run(arguments: &SelectionsArguments) -> Result<String> {
     Ok(summary_line(&records, already_recorded_count))
 }
 
-fn replay_change(worktree: &Worktree, settings: &ReplaySettings, change: &Change) -> ReplayRecord {
-    if settings.fetch_missing_heads
+fn replay_change(
+    worktree: &Worktree,
+    settings: &ReplaySettings,
+    fetch_missing_heads: bool,
+    change: &Change,
+) -> ReplayRecord {
+    if fetch_missing_heads
         && !worktree.has_commit(&change.head)
         && let Err(error) = worktree.fetch(&change.head)
     {
@@ -138,10 +175,14 @@ fn replay_change(worktree: &Worktree, settings: &ReplaySettings, change: &Change
         return ReplayRecord::failed(change, format!("{error:#}"));
     }
 
+    run_prober(worktree, settings, change)
+}
+
+pub fn run_prober(worktree: &Worktree, settings: &ReplaySettings, change: &Change) -> ReplayRecord {
     let config_path = worktree.path().join(PROBER_CONFIG_FILE_NAME);
 
     if let Some(prober_config) = &settings.prober_config {
-        if config_path.exists() {
+        if worktree.tracks(PROBER_CONFIG_FILE_NAME) {
             return ReplayRecord::failed(
                 change,
                 "the repository has its own prober.toml, which --prober-config would replace"
@@ -167,7 +208,15 @@ fn replay_change(worktree: &Worktree, settings: &ReplaySettings, change: &Change
     }
 
     match prober_output {
-        Ok(prober_output) => ReplayRecord::completed(change, elapsed, &prober_output),
+        Ok(prober_output) => {
+            let mut record = ReplayRecord::completed(change, elapsed, &prober_output);
+
+            if !settings.full_reasons {
+                record.keep_first_hops();
+            }
+
+            record
+        }
         Err(error) => ReplayRecord::failed(
             change,
             format!("cannot run {}: {error}", settings.prober.display()),
@@ -188,7 +237,7 @@ fn default_worktree_path(repository: &Path) -> PathBuf {
     env::temp_dir().join(format!("prober-replay-{repository_name}"))
 }
 
-fn summary_line(records: &[ReplayRecord], already_recorded_count: usize) -> String {
+pub fn summary_line(records: &[ReplayRecord], already_recorded_count: usize) -> String {
     let count_of_mode = |mode: &str| {
         records
             .iter()

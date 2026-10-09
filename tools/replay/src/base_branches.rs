@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::commands::git;
+use crate::commands::{git, has_commit};
 
 pub struct BaseBranches {
     repository: PathBuf,
@@ -35,7 +35,7 @@ impl BaseBranches {
     pub fn nearest_to(&self, head: &str) -> String {
         let primary_branch = self.remote_branches[0].clone();
 
-        if !self.has_commit(head)
+        if !has_commit(&self.repository, head)
             && git(&self.repository, &["fetch", "--quiet", "origin", head]).is_err()
         {
             return primary_branch;
@@ -46,14 +46,6 @@ impl BaseBranches {
             .filter_map(|branch| Some((self.commits_since_fork(branch, head)?, branch)))
             .min_by_key(|(commits_since_fork, _)| *commits_since_fork)
             .map_or(primary_branch, |(_, branch)| branch.clone())
-    }
-
-    fn has_commit(&self, commit: &str) -> bool {
-        git(
-            &self.repository,
-            &["cat-file", "-e", &format!("{commit}^{{commit}}")],
-        )
-        .is_ok()
     }
 
     fn commits_since_fork(&self, branch: &str, head: &str) -> Option<usize> {
