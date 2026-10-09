@@ -1,3 +1,4 @@
+mod changes;
 mod extractor;
 mod fingerprint;
 mod parameters;
@@ -45,7 +46,7 @@ pub(crate) struct LoadArgument {
     pub uses: Vec<Use>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum Imported {
     Name(String),
     Namespace,

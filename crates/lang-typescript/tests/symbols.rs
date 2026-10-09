@@ -77,8 +77,11 @@ fn imported_names_resolve_through_barrels_aliases_and_star_exports() {
     assert_eq!(
         uses_of(&graph, "src/app.ts", "run"),
         [
+            "src/channel.ts (missing_export)",
             "src/channel.ts#Channel",
+            "src/deep.ts (missing_export)",
             "src/deep.ts#helper",
+            "src/helpers.ts (missing_export)",
             "src/index.ts (missing_export)",
             "src/main.ts#main",
             "src/server.ts#start",

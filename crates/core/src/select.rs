@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::changes::FileChange;
 use crate::files::FileId;
 use crate::graph::{ContentChange, Edge, EdgeKind, Graph, UnresolvedSite};
+use crate::symbols::{SymbolEdge, SymbolId, SymbolTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Widening {
@@ -18,11 +19,21 @@ pub enum Relaxation {
     Content,
     TypeOnly,
     Assets,
+    FileLevel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
-    Edge { kind: EdgeKind, dependency: FileId },
+    Edge {
+        kind: EdgeKind,
+        dependency: FileId,
+    },
+    Uses(SymbolEdge),
+    Loads {
+        dependency: FileId,
+        dependent: SymbolId,
+    },
+    ChangedSymbol(usize),
     ChangedPart(usize),
     UnresolvedSite(usize),
     SetAsideSite(usize),
@@ -44,7 +55,12 @@ impl Reason {
     pub fn widening_site(&self) -> Option<usize> {
         match self.hops.first()?.link {
             Link::UnresolvedSite(site_index) => Some(site_index),
-            Link::Edge { .. } | Link::ChangedPart(_) | Link::SetAsideSite(_) => None,
+            Link::Edge { .. }
+            | Link::Uses(_)
+            | Link::Loads { .. }
+            | Link::ChangedSymbol(_)
+            | Link::ChangedPart(_)
+            | Link::SetAsideSite(_) => None,
         }
     }
 }
@@ -53,12 +69,35 @@ impl Reason {
 pub struct SelectedTest {
     pub file: FileId,
     pub reason: Reason,
+    distance: usize,
 }
 
 impl SelectedTest {
     pub fn distance(&self) -> usize {
-        self.reason.hops.len()
+        self.distance
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+enum Node {
+    Symbol(SymbolId),
+    Module(FileId),
+    File(FileId),
+    Content(FileId),
+}
+
+#[derive(Clone, Copy)]
+enum Via {
+    Origin,
+    Seed(Link),
+    Step { from: Node, link: Option<Link> },
+}
+
+#[derive(Clone, Copy)]
+struct Step {
+    node: Node,
+    link: Option<Link>,
+    content: ContentChange,
 }
 
 #[derive(Clone, Copy)]
@@ -79,15 +118,54 @@ impl<'g> Traversal<'g> {
         selects && (kind.follows(content) || self.is_relaxed(Relaxation::Content))
     }
 
-    fn dependents(self, file: FileId) -> impl Iterator<Item = Edge> + 'g {
+    fn is_analysed(self, file: FileId) -> bool {
+        !self.is_relaxed(Relaxation::FileLevel) && !self.graph.symbols_of(file).is_empty()
+    }
+
+    fn module_changes(self, file: FileId) -> Option<&'g [usize]> {
+        if self.is_relaxed(Relaxation::FileLevel) {
+            return None;
+        }
+
+        self.graph.module_changes(file)
+    }
+
+    fn file_of(self, node: Node) -> FileId {
+        match node {
+            Node::Symbol(symbol) => self.graph.symbol(symbol).file,
+            Node::Module(file) | Node::File(file) | Node::Content(file) => file,
+        }
+    }
+
+    fn cost(self, from: Option<Node>, to: Node, link: Option<Link>) -> usize {
+        match link {
+            None | Some(Link::ChangedSymbol(_)) => 0,
+            Some(Link::Uses(_)) => {
+                usize::from(from.map(|from| self.file_of(from)) != Some(self.file_of(to)))
+            }
+            Some(_) => 1,
+        }
+    }
+
+    fn carries(self, content: ContentChange, link: Option<Link>) -> bool {
+        match link {
+            Some(Link::Edge { kind, .. }) => self.follows(kind, content),
+            _ => true,
+        }
+    }
+
+    fn dependents(self, file: FileId) -> impl Iterator<Item = (Edge, bool)> + 'g {
         let ignored = self
             .is_relaxed(Relaxation::Ignores)
             .then(|| self.graph.ignored_dependents(file))
             .into_iter()
             .flatten()
-            .map(|ignored_edge| ignored_edge.edge);
+            .map(|ignored_edge| (ignored_edge.edge, true));
 
-        self.graph.dependents(file).chain(ignored)
+        self.graph
+            .dependents(file)
+            .map(|edge| (edge, false))
+            .chain(ignored)
     }
 
     fn widening_sites(self) -> impl Iterator<Item = (Link, &'g UnresolvedSite)> {
@@ -111,30 +189,273 @@ impl<'g> Traversal<'g> {
                     }),
             )
     }
+
+    fn successors(self, node: Node, content: ContentChange, steps: &mut Vec<Step>) {
+        match node {
+            Node::Symbol(symbol) => {
+                let users = self
+                    .graph
+                    .symbol_dependents(symbol)
+                    .filter(|edge| edge.kind.selects_tests())
+                    .map(|edge| Step {
+                        node: Node::Symbol(edge.dependent),
+                        link: Some(Link::Uses(*edge)),
+                        content: ContentChange::None,
+                    });
+
+                steps.extend(users);
+                steps.push(Step {
+                    node: Node::Module(self.graph.symbol(symbol).file),
+                    link: None,
+                    content: ContentChange::None,
+                });
+            }
+            Node::Module(file) => self.module_successors(file, content, steps),
+            Node::File(file) => {
+                if self.is_analysed(file) {
+                    steps.extend(self.graph.symbols_of(file).iter().map(|&symbol| Step {
+                        node: Node::Symbol(symbol),
+                        link: None,
+                        content: ContentChange::None,
+                    }));
+                }
+
+                steps.push(Step {
+                    node: Node::Module(file),
+                    link: None,
+                    content,
+                });
+            }
+            Node::Content(file) => {
+                let readers = self.dependents(file).filter(|(edge, _)| {
+                    matches!(edge.kind, EdgeKind::Reads | EdgeKind::Lists)
+                        && self.follows(edge.kind, content)
+                });
+
+                steps.extend(readers.map(|(edge, _)| file_step(file, edge)));
+            }
+        }
+    }
+
+    fn module_successors(self, file: FileId, content: ContentChange, steps: &mut Vec<Step>) {
+        if !self.is_relaxed(Relaxation::FileLevel) {
+            let whole_module_users = self
+                .graph
+                .module_dependents(file)
+                .filter(|edge| edge.kind.selects_tests())
+                .map(|edge| Step {
+                    node: Node::Symbol(edge.dependent),
+                    link: Some(Link::Uses(*edge)),
+                    content: ContentChange::None,
+                });
+
+            steps.extend(whole_module_users);
+        }
+
+        for (edge, ignored) in self.dependents(file) {
+            if !self.follows(edge.kind, content) {
+                continue;
+            }
+
+            let in_code = !ignored && self.is_analysed(edge.dependent);
+
+            match edge.kind {
+                EdgeKind::Import | EdgeKind::Asset if in_code => {}
+                EdgeKind::Dynamic if in_code => {
+                    let Some(inference) = self.graph.inference(&edge) else {
+                        continue;
+                    };
+
+                    for symbol in self.graph.symbols_at(edge.dependent, inference.line) {
+                        steps.push(Step {
+                            node: Node::Symbol(symbol),
+                            link: Some(Link::Loads {
+                                dependency: file,
+                                dependent: symbol,
+                            }),
+                            content: ContentChange::None,
+                        });
+                    }
+                }
+                _ => steps.push(file_step(file, edge)),
+            }
+        }
+    }
+
+    fn predecessors(self, node: Node, steps: &mut Vec<(Node, Option<Link>)>) {
+        match node {
+            Node::Symbol(symbol) => {
+                let file = self.graph.symbol(symbol).file;
+                let used = self
+                    .graph
+                    .symbol_dependencies(symbol)
+                    .iter()
+                    .filter(|edge| edge.kind.selects_tests())
+                    .map(|edge| {
+                        let dependency = match edge.dependency {
+                            SymbolTarget::Symbol(dependency) => Node::Symbol(dependency),
+                            SymbolTarget::Module { file, .. } => Node::Module(file),
+                        };
+
+                        (dependency, Some(Link::Uses(*edge)))
+                    });
+
+                steps.extend(used);
+
+                for edge in self
+                    .graph
+                    .dependencies(file)
+                    .filter(|edge| edge.kind == EdgeKind::Dynamic)
+                {
+                    let loads_here = self.graph.inference(&edge).is_some_and(|inference| {
+                        self.graph
+                            .symbols_at(file, inference.line)
+                            .contains(&symbol)
+                    });
+
+                    if loads_here {
+                        let link = Link::Loads {
+                            dependency: edge.dependency,
+                            dependent: symbol,
+                        };
+
+                        steps.push((Node::Module(edge.dependency), Some(link)));
+                    }
+                }
+
+                steps.push((Node::File(file), None));
+            }
+            Node::Module(file) => {
+                if self.is_analysed(file) {
+                    steps.extend(
+                        self.graph
+                            .symbols_of(file)
+                            .iter()
+                            .map(|&symbol| (Node::Symbol(symbol), None)),
+                    );
+                }
+
+                steps.push((Node::File(file), None));
+            }
+            Node::File(file) => {
+                let in_code = self.is_analysed(file);
+
+                for edge in self.graph.dependencies(file) {
+                    if in_code
+                        && matches!(
+                            edge.kind,
+                            EdgeKind::Import | EdgeKind::Asset | EdgeKind::Dynamic
+                        )
+                    {
+                        continue;
+                    }
+
+                    let link = Some(Link::Edge {
+                        kind: edge.kind,
+                        dependency: edge.dependency,
+                    });
+
+                    steps.push((Node::Module(edge.dependency), link));
+
+                    if matches!(edge.kind, EdgeKind::Reads | EdgeKind::Lists) {
+                        steps.push((Node::Content(edge.dependency), link));
+                    }
+                }
+            }
+            Node::Content(_) => {}
+        }
+    }
+}
+
+fn file_step(dependency: FileId, edge: Edge) -> Step {
+    Step {
+        node: Node::File(edge.dependent),
+        link: Some(Link::Edge {
+            kind: edge.kind,
+            dependency,
+        }),
+        content: edge.kind.dependent_content(),
+    }
 }
 
 #[derive(Clone, Copy)]
 struct Discovery<'a> {
     change: &'a FileChange,
-    reached_via: Option<Link>,
+    via: Via,
     content: ContentChange,
+    distance: usize,
+    widened: bool,
+}
+
+impl Discovery<'_> {
+    fn improves_on(&self, earlier: &Discovery) -> bool {
+        self.content > earlier.content
+            || self.content == earlier.content
+                && self.widened == earlier.widened
+                && self.distance < earlier.distance
+    }
 }
 
 #[derive(Default)]
 struct Discoveries<'a> {
-    files: HashMap<FileId, Discovery<'a>>,
-    origins: HashMap<FileId, Discovery<'a>>,
+    nodes: HashMap<Node, Discovery<'a>>,
+    origins: HashMap<Node, Discovery<'a>>,
+    queue: VecDeque<(Node, usize)>,
 }
 
 impl<'a> Discoveries<'a> {
-    fn discover_origin(
-        &mut self,
-        files_to_visit: &mut VecDeque<FileId>,
-        file: FileId,
-        discovery: Discovery<'a>,
-    ) {
-        self.origins.entry(file).or_insert(discovery);
-        discover(&mut self.files, files_to_visit, file, discovery);
+    fn discover_origin(&mut self, node: Node, discovery: Discovery<'a>) {
+        self.origins.entry(node).or_insert(discovery);
+        self.discover(node, discovery, false);
+    }
+
+    fn discover(&mut self, node: Node, discovery: Discovery<'a>, at_front: bool) {
+        match self.nodes.entry(node) {
+            Entry::Vacant(entry) => {
+                entry.insert(discovery);
+            }
+            Entry::Occupied(mut entry) if discovery.improves_on(entry.get()) => {
+                entry.insert(discovery);
+            }
+            Entry::Occupied(_) => return,
+        }
+
+        if at_front {
+            self.queue.push_front((node, discovery.distance));
+        } else {
+            self.queue.push_back((node, discovery.distance));
+        }
+    }
+
+    fn visit(&mut self, traversal: Traversal) {
+        let mut steps = Vec::new();
+
+        while let Some((node, distance)) = self.queue.pop_front() {
+            let discovery = self.nodes[&node];
+
+            if discovery.distance != distance {
+                continue;
+            }
+
+            steps.clear();
+            traversal.successors(node, discovery.content, &mut steps);
+
+            for step in &steps {
+                let cost = traversal.cost(Some(node), step.node, step.link);
+                let reached = Discovery {
+                    change: discovery.change,
+                    via: Via::Step {
+                        from: node,
+                        link: step.link,
+                    },
+                    content: step.content,
+                    distance: distance + cost,
+                    widened: discovery.widened,
+                };
+
+                self.discover(step.node, reached, cost == 0);
+            }
+        }
     }
 }
 
@@ -173,8 +494,8 @@ pub fn select_relaxed(
         let left_path = graph.path(left.file);
         let right_path = graph.path(right.file);
 
-        left.distance()
-            .cmp(&right.distance())
+        left.distance
+            .cmp(&right.distance)
             .then(left_path.cmp(right_path))
     });
 
@@ -187,165 +508,6 @@ fn is_asset_change(graph: &Graph, change: &FileChange) -> bool {
         .is_some_and(|changed_file| graph.is_asset(changed_file))
 }
 
-fn tests_reached(
-    traversal: Traversal,
-    discoveries: &Discoveries,
-    keeps: impl Fn(FileId) -> bool,
-) -> Vec<SelectedTest> {
-    discoveries
-        .files
-        .keys()
-        .filter(|&&file| traversal.graph.is_test(file) && keeps(file))
-        .filter_map(|&test_file| {
-            let reason = reason_past_mocks(traversal, discoveries, test_file)?;
-
-            Some(SelectedTest {
-                file: test_file,
-                reason,
-            })
-        })
-        .collect()
-}
-
-fn reason_past_mocks(
-    traversal: Traversal,
-    discoveries: &Discoveries,
-    test_file: FileId,
-) -> Option<Reason> {
-    let graph = traversal.graph;
-    let mocked_modules = graph.mocked_modules(test_file);
-    let is_mocked = |file: FileId| {
-        !traversal.is_relaxed(Relaxation::Mocks)
-            && mocked_modules.binary_search(&file).is_ok()
-            && !graph.has_changed_contract(file)
-    };
-
-    if trace_avoids(test_file, &discoveries.files, &is_mocked) {
-        return Some(trace_reason(test_file, &discoveries.files));
-    }
-
-    let mut dependents_on_path: HashMap<FileId, (FileId, EdgeKind)> = HashMap::new();
-
-    if let Some(origin) = discoveries.origins.get(&test_file) {
-        return Some(reason_from_origin(test_file, origin, &dependents_on_path));
-    }
-
-    let mut files_to_visit = VecDeque::from([test_file]);
-
-    while let Some(file) = files_to_visit.pop_front() {
-        let test_selecting_edges = graph
-            .dependencies(file)
-            .filter(|edge| traversal.follows(edge.kind, ContentChange::Direct));
-
-        for edge in test_selecting_edges {
-            let dependency = edge.dependency;
-            let carries_the_change = discoveries
-                .files
-                .get(&dependency)
-                .is_some_and(|discovery| traversal.follows(edge.kind, discovery.content));
-            let is_unexplored = dependency != test_file
-                && !dependents_on_path.contains_key(&dependency)
-                && carries_the_change
-                && !is_mocked(dependency);
-
-            if !is_unexplored {
-                continue;
-            }
-
-            dependents_on_path.insert(dependency, (file, edge.kind));
-
-            if trace_avoids(dependency, &discoveries.files, &is_mocked) {
-                return Some(reason_through(
-                    dependency,
-                    &dependents_on_path,
-                    &discoveries.files,
-                ));
-            }
-
-            if let Some(origin) = discoveries
-                .origins
-                .get(&dependency)
-                .filter(|origin| traversal.follows(edge.kind, origin.content))
-            {
-                return Some(reason_from_origin(dependency, origin, &dependents_on_path));
-            }
-
-            files_to_visit.push_back(dependency);
-        }
-    }
-
-    None
-}
-
-fn trace_avoids(
-    file: FileId,
-    discoveries: &HashMap<FileId, Discovery>,
-    is_mocked: &impl Fn(FileId) -> bool,
-) -> bool {
-    let mut file = file;
-
-    loop {
-        if is_mocked(file) {
-            return false;
-        }
-
-        match discoveries[&file].reached_via {
-            Some(Link::Edge { dependency, .. }) => file = dependency,
-            Some(Link::ChangedPart(_) | Link::UnresolvedSite(_) | Link::SetAsideSite(_)) | None => {
-                return true;
-            }
-        }
-    }
-}
-
-fn reason_through(
-    file: FileId,
-    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
-    discoveries: &HashMap<FileId, Discovery>,
-) -> Reason {
-    let reason = trace_reason(file, discoveries);
-
-    extended_to_the_test(reason, file, dependents_on_path)
-}
-
-fn reason_from_origin(
-    file: FileId,
-    origin: &Discovery,
-    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
-) -> Reason {
-    let reason = Reason {
-        change: origin.change.clone(),
-        hops: origin
-            .reached_via
-            .map(|link| Hop {
-                dependent: file,
-                link,
-            })
-            .into_iter()
-            .collect(),
-    };
-
-    extended_to_the_test(reason, file, dependents_on_path)
-}
-
-fn extended_to_the_test(
-    mut reason: Reason,
-    file: FileId,
-    dependents_on_path: &HashMap<FileId, (FileId, EdgeKind)>,
-) -> Reason {
-    let mut dependency = file;
-
-    while let Some(&(dependent, kind)) = dependents_on_path.get(&dependency) {
-        reason.hops.push(Hop {
-            dependent,
-            link: Link::Edge { kind, dependency },
-        });
-        dependency = dependent;
-    }
-
-    reason
-}
-
 fn discover_dependents<'a>(
     traversal: Traversal,
     changes: &'a [FileChange],
@@ -353,7 +515,6 @@ fn discover_dependents<'a>(
 ) -> Discoveries<'a> {
     let graph = traversal.graph;
     let mut discoveries = Discoveries::default();
-    let mut files_to_visit = VecDeque::new();
     let mut changes_by_path: Vec<&FileChange> = changes.iter().collect();
 
     changes_by_path.sort_by(|left, right| left.path.cmp(&right.path));
@@ -362,16 +523,38 @@ fn discover_dependents<'a>(
         let Some(changed_file) = graph.file_id(&change.path) else {
             continue;
         };
+        let origin = Discovery {
+            change,
+            via: Via::Origin,
+            content: ContentChange::Direct,
+            distance: 0,
+            widened: false,
+        };
 
-        discoveries.discover_origin(
-            &mut files_to_visit,
-            changed_file,
-            Discovery {
-                change,
-                reached_via: None,
-                content: ContentChange::Direct,
-            },
-        );
+        match traversal.module_changes(changed_file) {
+            None => discoveries.discover_origin(Node::File(changed_file), origin),
+            Some([]) => discoveries.discover_origin(Node::Content(changed_file), origin),
+            Some(symbol_changes) => {
+                discoveries.discover_origin(Node::Module(changed_file), origin);
+
+                for &change_index in symbol_changes {
+                    let seed = Discovery {
+                        via: Via::Seed(Link::ChangedSymbol(change_index)),
+                        content: ContentChange::None,
+                        ..origin
+                    };
+
+                    for &target in &graph.symbol_changes()[change_index].reaches {
+                        let node = match target {
+                            SymbolTarget::Symbol(symbol) => Node::Symbol(symbol),
+                            SymbolTarget::Module { file, .. } => Node::Module(file),
+                        };
+
+                        discoveries.discover_origin(node, seed);
+                    }
+                }
+            }
+        }
     }
 
     for (part_index, changed_part) in graph.changed_parts().iter().enumerate() {
@@ -383,17 +566,18 @@ fn discover_dependents<'a>(
         };
 
         discoveries.discover_origin(
-            &mut files_to_visit,
-            changed_part.node,
+            Node::File(changed_part.node),
             Discovery {
                 change,
-                reached_via: Some(Link::ChangedPart(part_index)),
+                via: Via::Seed(Link::ChangedPart(part_index)),
                 content: ContentChange::None,
+                distance: 1,
+                widened: false,
             },
         );
     }
 
-    visit_dependents(traversal, &mut discoveries.files, &mut files_to_visit);
+    discoveries.visit(traversal);
 
     if widening == Widening::Off {
         return discoveries;
@@ -409,97 +593,276 @@ fn discover_dependents<'a>(
                 .touched_paths()
                 .any(|path| graph.can_load(unresolved_site.language, path))
         });
+        let Some(&change) = loadable_change else {
+            continue;
+        };
+        let seed = Discovery {
+            change,
+            via: Via::Seed(site_link),
+            content: ContentChange::None,
+            distance: 1,
+            widened: true,
+        };
 
-        if let Some(&change) = loadable_change {
-            discoveries.discover_origin(
-                &mut files_to_visit,
-                unresolved_site.file,
-                Discovery {
-                    change,
-                    reached_via: Some(site_link),
-                    content: ContentChange::None,
-                },
-            );
+        if traversal.is_analysed(unresolved_site.file) {
+            for symbol in graph.symbols_at(unresolved_site.file, unresolved_site.line) {
+                discoveries.discover_origin(Node::Symbol(symbol), seed);
+            }
+        } else {
+            discoveries.discover_origin(Node::File(unresolved_site.file), seed);
         }
     }
 
-    visit_dependents(traversal, &mut discoveries.files, &mut files_to_visit);
+    discoveries.visit(traversal);
 
     discoveries
 }
 
-fn discover<'a>(
-    discoveries: &mut HashMap<FileId, Discovery<'a>>,
-    files_to_visit: &mut VecDeque<FileId>,
-    file: FileId,
-    discovery: Discovery<'a>,
-) {
-    match discoveries.entry(file) {
-        Entry::Vacant(entry) => {
-            entry.insert(discovery);
-            files_to_visit.push_back(file);
-        }
-        Entry::Occupied(mut entry) if discovery.content > entry.get().content => {
-            entry.insert(discovery);
-            files_to_visit.push_back(file);
-        }
-        Entry::Occupied(_) => {}
-    }
-}
-
-fn visit_dependents<'a>(
+fn tests_reached(
     traversal: Traversal,
-    discoveries: &mut HashMap<FileId, Discovery<'a>>,
-    files_to_visit: &mut VecDeque<FileId>,
-) {
-    while let Some(file) = files_to_visit.pop_front() {
-        let discovery = discoveries[&file];
-        let test_selecting_edges = traversal
-            .dependents(file)
-            .filter(|edge| traversal.follows(edge.kind, discovery.content));
+    discoveries: &Discoveries,
+    keeps: impl Fn(FileId) -> bool,
+) -> Vec<SelectedTest> {
+    let graph = traversal.graph;
+    let mut nodes_by_test: HashMap<FileId, Vec<Node>> = HashMap::new();
 
-        for edge in test_selecting_edges {
-            let reached_via = Link::Edge {
-                kind: edge.kind,
-                dependency: file,
-            };
+    for &node in discoveries.nodes.keys() {
+        let file = traversal.file_of(node);
 
-            discover(
-                discoveries,
-                files_to_visit,
-                edge.dependent,
-                Discovery {
-                    change: discovery.change,
-                    reached_via: Some(reached_via),
-                    content: edge.kind.dependent_content(),
-                },
-            );
+        if !matches!(node, Node::Content(_)) && graph.is_test(file) && keeps(file) {
+            nodes_by_test.entry(file).or_default().push(node);
+        }
+    }
+
+    nodes_by_test
+        .into_iter()
+        .filter_map(|(test_file, mut nodes)| {
+            nodes.sort_by_key(|node| {
+                let discovery = &discoveries.nodes[node];
+
+                (discovery.widened, discovery.distance, *node)
+            });
+
+            let (reason, distance) = reason_past_mocks(traversal, discoveries, test_file, &nodes)?;
+
+            Some(SelectedTest {
+                file: test_file,
+                reason,
+                distance,
+            })
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+struct Mocks<'g> {
+    traversal: Traversal<'g>,
+    mocked_modules: &'g [FileId],
+}
+
+impl Mocks<'_> {
+    fn replace(self, file: FileId) -> bool {
+        !self.traversal.is_relaxed(Relaxation::Mocks)
+            && self.mocked_modules.binary_search(&file).is_ok()
+            && !self.traversal.graph.has_changed_contract(file)
+    }
+
+    fn cut(self, node: Node, link: Option<Link>) -> bool {
+        let through = match link {
+            Some(Link::Uses(edge)) => self.traversal.graph.symbol_edge_through(&edge),
+            _ => &[],
+        };
+
+        self.replace(self.traversal.file_of(node)) || through.iter().any(|&file| self.replace(file))
+    }
+}
+
+fn reason_past_mocks(
+    traversal: Traversal,
+    discoveries: &Discoveries,
+    test_file: FileId,
+    test_nodes: &[Node],
+) -> Option<(Reason, usize)> {
+    let mocks = Mocks {
+        traversal,
+        mocked_modules: traversal.graph.mocked_modules(test_file),
+    };
+
+    if let Some(&node) = test_nodes
+        .iter()
+        .find(|&&node| trace_avoids(node, &discoveries.nodes, mocks))
+    {
+        return Some(trace_reason(traversal, node, &discoveries.nodes));
+    }
+
+    let mut dependents_on_path: HashMap<Node, (Node, Option<Link>)> = HashMap::new();
+
+    if let Some((&node, origin)) = test_nodes
+        .iter()
+        .find_map(|node| Some((node, discoveries.origins.get(node)?)))
+    {
+        return Some(reason_from_origin(
+            traversal,
+            node,
+            origin,
+            &dependents_on_path,
+        ));
+    }
+
+    let mut nodes_to_visit: VecDeque<Node> = test_nodes.iter().copied().collect();
+    let mut visited: HashSet<Node> = test_nodes.iter().copied().collect();
+    let mut steps = Vec::new();
+
+    while let Some(node) = nodes_to_visit.pop_front() {
+        steps.clear();
+        traversal.predecessors(node, &mut steps);
+
+        for &(dependency, link) in &steps {
+            let carries_the_change = discoveries
+                .nodes
+                .get(&dependency)
+                .is_some_and(|discovery| traversal.carries(discovery.content, link));
+
+            if !carries_the_change || mocks.cut(dependency, link) || !visited.insert(dependency) {
+                continue;
+            }
+
+            dependents_on_path.insert(dependency, (node, link));
+
+            if trace_avoids(dependency, &discoveries.nodes, mocks) {
+                let (reason, distance) = trace_reason(traversal, dependency, &discoveries.nodes);
+
+                return Some(extended_to_the_test(
+                    traversal,
+                    reason,
+                    distance,
+                    dependency,
+                    &dependents_on_path,
+                ));
+            }
+
+            if let Some(origin) = discoveries
+                .origins
+                .get(&dependency)
+                .filter(|origin| traversal.carries(origin.content, link))
+            {
+                return Some(reason_from_origin(
+                    traversal,
+                    dependency,
+                    origin,
+                    &dependents_on_path,
+                ));
+            }
+
+            nodes_to_visit.push_back(dependency);
+        }
+    }
+
+    None
+}
+
+fn trace_avoids(node: Node, discoveries: &HashMap<Node, Discovery>, mocks: Mocks) -> bool {
+    let mut node = node;
+
+    loop {
+        match discoveries[&node].via {
+            Via::Step { from, link } if !mocks.cut(node, link) => node = from,
+            Via::Step { .. } => return false,
+            Via::Origin | Via::Seed(_) => return !mocks.cut(node, None),
         }
     }
 }
 
-fn trace_reason(reached_file: FileId, discoveries: &HashMap<FileId, Discovery>) -> Reason {
+fn trace_reason(
+    traversal: Traversal,
+    reached: Node,
+    discoveries: &HashMap<Node, Discovery>,
+) -> (Reason, usize) {
     let mut hops = Vec::new();
-    let mut file = reached_file;
+    let mut distance = 0;
+    let mut node = reached;
 
-    while let Some(link) = discoveries[&file].reached_via {
-        hops.push(Hop {
-            dependent: file,
-            link,
-        });
+    loop {
+        match discoveries[&node].via {
+            Via::Origin => break,
+            Via::Seed(link) => {
+                hops.push(Hop {
+                    dependent: traversal.file_of(node),
+                    link,
+                });
+                distance += traversal.cost(None, node, Some(link));
 
-        match link {
-            Link::Edge { dependency, .. } => file = dependency,
-            Link::ChangedPart(_) | Link::UnresolvedSite(_) | Link::SetAsideSite(_) => break,
+                break;
+            }
+            Via::Step { from, link } => {
+                if let Some(link) = link {
+                    hops.push(Hop {
+                        dependent: traversal.file_of(node),
+                        link,
+                    });
+                }
+
+                distance += traversal.cost(Some(from), node, link);
+                node = from;
+            }
         }
     }
 
     hops.reverse();
 
-    Reason {
-        change: discoveries[&reached_file].change.clone(),
+    let reason = Reason {
+        change: discoveries[&reached].change.clone(),
         hops,
+    };
+
+    (reason, distance)
+}
+
+fn reason_from_origin(
+    traversal: Traversal,
+    node: Node,
+    origin: &Discovery,
+    dependents_on_path: &HashMap<Node, (Node, Option<Link>)>,
+) -> (Reason, usize) {
+    let mut reason = Reason {
+        change: origin.change.clone(),
+        hops: Vec::new(),
+    };
+    let mut distance = 0;
+
+    if let Via::Seed(link) = origin.via {
+        reason.hops.push(Hop {
+            dependent: traversal.file_of(node),
+            link,
+        });
+        distance += traversal.cost(None, node, Some(link));
     }
+
+    extended_to_the_test(traversal, reason, distance, node, dependents_on_path)
+}
+
+fn extended_to_the_test(
+    traversal: Traversal,
+    mut reason: Reason,
+    mut distance: usize,
+    node: Node,
+    dependents_on_path: &HashMap<Node, (Node, Option<Link>)>,
+) -> (Reason, usize) {
+    let mut dependency = node;
+
+    while let Some(&(dependent, link)) = dependents_on_path.get(&dependency) {
+        if let Some(link) = link {
+            reason.hops.push(Hop {
+                dependent: traversal.file_of(dependent),
+                link,
+            });
+        }
+
+        distance += traversal.cost(Some(dependency), dependent, link);
+        dependency = dependent;
+    }
+
+    (reason, distance)
 }
 
 #[cfg(test)]
@@ -509,6 +872,11 @@ mod tests {
     use crate::files::RepoPath;
     use crate::graph::EdgeKind::{Asset, Family, Import, Lists, Reads, TypeOnly};
     use crate::graph::{Edge, GraphBuilder, UnresolvedCause, UnresolvedSite};
+    use crate::report::describe_reason;
+    use crate::symbols::{
+        LineRange, MODULE_INIT_NAME, Symbol, SymbolChange, SymbolChangeKind, SymbolKind,
+        WholeModuleCause,
+    };
 
     fn repo_path(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()
@@ -1375,6 +1743,363 @@ mod tests {
         assert_eq!(
             selected_with_distances(&graph, &[modified("src/transport.ts")]),
             []
+        );
+    }
+
+    struct Modules {
+        builder: GraphBuilder,
+        symbols: HashMap<String, SymbolId>,
+    }
+
+    impl Modules {
+        fn new(test_files: &[&str]) -> Self {
+            let mut builder = GraphBuilder::default();
+
+            builder.add_language("typescript", |path| {
+                path.as_str().ends_with(".ts") && !path.as_str().ends_with(".test.ts")
+            });
+
+            for test_file in test_files {
+                builder.add_test_file(repo_path(test_file), "typescript");
+            }
+
+            Self {
+                builder,
+                symbols: HashMap::new(),
+            }
+        }
+
+        fn module(mut self, path: &str, names: &[&str]) -> Self {
+            let file = self.builder.add_file(repo_path(path));
+
+            for (index, name) in std::iter::once(MODULE_INIT_NAME)
+                .chain(names.iter().copied())
+                .enumerate()
+            {
+                let first_line = index as u32 * 10 + 1;
+                let symbol = self.builder.add_symbol(Symbol {
+                    file,
+                    name: name.to_owned(),
+                    kind: if index == 0 {
+                        SymbolKind::ModuleInit
+                    } else {
+                        SymbolKind::Function
+                    },
+                    lines: vec![LineRange {
+                        start: first_line,
+                        end: first_line + 8,
+                    }],
+                    hash: 0,
+                });
+
+                self.symbols.insert(format!("{path}#{name}"), symbol);
+            }
+
+            self
+        }
+
+        fn test(mut self, path: &str) -> Self {
+            self.builder.add_test_file(repo_path(path), "typescript");
+
+            self
+        }
+
+        fn symbol(&self, path: &str, name: &str) -> SymbolId {
+            self.symbols[&format!("{path}#{name}")]
+        }
+
+        fn imports(mut self, dependent: &str, dependency: &str) -> Self {
+            let dependent_file = self.builder.add_file(repo_path(dependent));
+            let dependency_file = self.builder.add_file(repo_path(dependency));
+
+            self.builder.add_edge(Edge {
+                dependent: dependent_file,
+                dependency: dependency_file,
+                kind: Import,
+            });
+            self.uses(dependent, MODULE_INIT_NAME, dependency, MODULE_INIT_NAME)
+        }
+
+        fn uses(mut self, path: &str, name: &str, used_path: &str, used_name: &str) -> Self {
+            let edge = SymbolEdge {
+                dependent: self.symbol(path, name),
+                dependency: SymbolTarget::Symbol(self.symbol(used_path, used_name)),
+                kind: Import,
+            };
+
+            self.builder.add_symbol_edge(edge);
+
+            self
+        }
+
+        fn uses_whole(mut self, path: &str, name: &str, module: &str) -> Self {
+            let file = self.builder.add_file(repo_path(module));
+            let edge = SymbolEdge {
+                dependent: self.symbol(path, name),
+                dependency: SymbolTarget::Module {
+                    file,
+                    cause: WholeModuleCause::EscapingNamespace,
+                },
+                kind: Import,
+            };
+
+            self.builder.add_symbol_edge(edge);
+
+            self
+        }
+
+        fn edge(mut self, dependent: &str, kind: EdgeKind, dependency: &str) -> Self {
+            let dependent = self.builder.add_file(repo_path(dependent));
+            let dependency = self.builder.add_file(repo_path(dependency));
+
+            self.builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+
+            self
+        }
+
+        fn changed(mut self, path: &str, names: &[&str]) -> Self {
+            let file = self.builder.add_file(repo_path(path));
+            let changes = names
+                .iter()
+                .map(|&name| SymbolChange {
+                    file,
+                    name: name.to_owned(),
+                    kind: SymbolChangeKind::Modified,
+                    reaches: vec![SymbolTarget::Symbol(self.symbol(path, name))],
+                })
+                .collect();
+
+            self.builder.add_module_changes(file, changes);
+
+            self
+        }
+
+        fn build(self) -> Graph {
+            self.builder.build()
+        }
+    }
+
+    fn hub_and_its_users() -> Modules {
+        Modules::new(&["src/a.test.ts", "src/b.test.ts", "src/hub.test.ts"])
+            .module("src/hub.ts", &["a", "b", "c"])
+            .module("src/use-a.ts", &["runA"])
+            .module("src/use-b.ts", &["runB"])
+            .module("src/a.test.ts", &[])
+            .module("src/b.test.ts", &[])
+            .module("src/hub.test.ts", &[])
+            .imports("src/use-a.ts", "src/hub.ts")
+            .imports("src/use-b.ts", "src/hub.ts")
+            .imports("src/a.test.ts", "src/use-a.ts")
+            .imports("src/b.test.ts", "src/use-b.ts")
+            .imports("src/hub.test.ts", "src/hub.ts")
+            .uses("src/hub.ts", "c", "src/hub.ts", "a")
+            .uses("src/use-a.ts", "runA", "src/hub.ts", "c")
+            .uses("src/use-b.ts", "runB", "src/hub.ts", "b")
+            .uses("src/a.test.ts", MODULE_INIT_NAME, "src/use-a.ts", "runA")
+            .uses("src/b.test.ts", MODULE_INIT_NAME, "src/use-b.ts", "runB")
+            .uses("src/hub.test.ts", MODULE_INIT_NAME, "src/hub.ts", "b")
+    }
+
+    #[test]
+    fn changed_symbol_selects_the_tests_of_its_users_with_distances_in_files_crossed() {
+        let graph = hub_and_its_users().changed("src/hub.ts", &["a"]).build();
+        let selected_tests = select_tests(&graph, &[modified("src/hub.ts")], Widening::Scoped);
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/hub.ts")]),
+            [("src/a.test.ts", 2)]
+        );
+        assert_eq!(
+            describe_reason(&graph, &selected_tests[0].reason),
+            [
+                "src/hub.ts (modified)",
+                "-> a changed",
+                "-> a used by c in src/hub.ts",
+                "-> c used by runA in src/use-a.ts",
+                "-> runA used at load by src/a.test.ts",
+            ]
+        );
+    }
+
+    #[test]
+    fn changed_initialisation_selects_every_test_loading_the_module() {
+        let graph = hub_and_its_users()
+            .changed("src/hub.ts", &[MODULE_INIT_NAME])
+            .build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/hub.ts")]),
+            [
+                ("src/hub.test.ts", 1),
+                ("src/a.test.ts", 2),
+                ("src/b.test.ts", 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn any_symbol_change_reaches_whole_module_users_and_the_files_linked_to_the_module() {
+        let graph = hub_and_its_users()
+            .test("src/registry.test.ts")
+            .test("src/hub-source.test.ts")
+            .module("src/registry.ts", &["all"])
+            .module("src/registry.test.ts", &[])
+            .imports("src/registry.ts", "src/hub.ts")
+            .imports("src/registry.test.ts", "src/registry.ts")
+            .uses_whole("src/registry.ts", "all", "src/hub.ts")
+            .uses(
+                "src/registry.test.ts",
+                MODULE_INIT_NAME,
+                "src/registry.ts",
+                "all",
+            )
+            .edge("src/hub-source.test.ts", Reads, "src/hub.ts")
+            .changed("src/hub.ts", &["a"])
+            .build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/hub.ts")]),
+            [
+                ("src/hub-source.test.ts", 1),
+                ("src/a.test.ts", 2),
+                ("src/registry.test.ts", 2)
+            ]
+        );
+    }
+
+    #[test]
+    fn change_without_changed_symbols_reaches_only_the_readers_of_the_file() {
+        let mut modules = hub_and_its_users().test("src/source.test.ts");
+        let hub = modules.builder.add_file(repo_path("src/hub.ts"));
+
+        modules.builder.add_module_changes(hub, Vec::new());
+
+        let graph = modules
+            .edge("src/source.test.ts", Reads, "src/hub.ts")
+            .edge("src/hub.test.ts", Family, "src/hub.ts")
+            .build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/hub.ts")]),
+            [("src/source.test.ts", 1)]
+        );
+    }
+
+    #[test]
+    fn file_outside_the_analysis_reaches_the_users_of_every_symbol_of_its_reader() {
+        let graph = hub_and_its_users()
+            .edge("src/hub.ts", Reads, "src/config.json")
+            .build();
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/config.json")]),
+            [
+                ("src/hub.test.ts", 2),
+                ("src/a.test.ts", 3),
+                ("src/b.test.ts", 3)
+            ]
+        );
+    }
+
+    #[test]
+    fn mocked_module_cuts_symbol_paths_unless_another_path_avoids_it() {
+        let mut modules = hub_and_its_users().changed("src/hub.ts", &["a"]);
+        let a_test = modules.builder.add_file(repo_path("src/a.test.ts"));
+        let use_a = modules.builder.add_file(repo_path("src/use-a.ts"));
+
+        modules.builder.add_mock(a_test, use_a);
+
+        let mocked = modules.build();
+        let mut modules = hub_and_its_users()
+            .uses("src/a.test.ts", MODULE_INIT_NAME, "src/hub.ts", "c")
+            .changed("src/hub.ts", &["a"]);
+        let a_test = modules.builder.add_file(repo_path("src/a.test.ts"));
+        let use_a = modules.builder.add_file(repo_path("src/use-a.ts"));
+
+        modules.builder.add_mock(a_test, use_a);
+
+        let mocked_with_a_direct_use = modules.build();
+
+        assert_eq!(
+            selected_with_distances(&mocked, &[modified("src/hub.ts")]),
+            []
+        );
+        assert_eq!(
+            selected_with_distances(&mocked_with_a_direct_use, &[modified("src/hub.ts")]),
+            [("src/a.test.ts", 1)]
+        );
+    }
+
+    #[test]
+    fn widening_reaches_the_users_of_the_symbol_holding_the_site_or_every_importer_at_load() {
+        let site_graph = |line: u32| {
+            let mut modules = Modules::new(&["src/load.test.ts", "src/other.test.ts"])
+                .module("src/loader.ts", &["load", "other"])
+                .module("src/load.test.ts", &[])
+                .module("src/other.test.ts", &[])
+                .imports("src/load.test.ts", "src/loader.ts")
+                .imports("src/other.test.ts", "src/loader.ts")
+                .uses(
+                    "src/load.test.ts",
+                    MODULE_INIT_NAME,
+                    "src/loader.ts",
+                    "load",
+                )
+                .uses(
+                    "src/other.test.ts",
+                    MODULE_INIT_NAME,
+                    "src/loader.ts",
+                    "other",
+                );
+            let file = modules.builder.add_file(repo_path("src/loader.ts"));
+
+            modules.builder.add_file(repo_path("plugins/a.ts"));
+            modules.builder.add_unresolved_site(UnresolvedSite {
+                file,
+                line,
+                expression: "request.moduleUrl".to_owned(),
+                cause: UnresolvedCause::Parameter,
+                language: "typescript",
+            });
+
+            modules.build()
+        };
+        let inside_load = site_graph(15);
+        let at_top_level = site_graph(5);
+
+        assert_eq!(
+            widening_sites(&inside_load, &[modified("plugins/a.ts")]),
+            [("src/load.test.ts".to_owned(), Some(0))]
+        );
+        assert_eq!(
+            widening_sites(&at_top_level, &[modified("plugins/a.ts")]),
+            [
+                ("src/load.test.ts".to_owned(), Some(0)),
+                ("src/other.test.ts".to_owned(), Some(0))
+            ]
+        );
+    }
+
+    #[test]
+    fn file_level_relaxation_follows_imports_whatever_the_symbols() {
+        let graph = hub_and_its_users().changed("src/hub.ts", &["a"]).build();
+        let relaxed: Vec<&str> = select_relaxed(
+            &graph,
+            &[modified("src/hub.ts")],
+            Widening::Scoped,
+            Some(Relaxation::FileLevel),
+        )
+        .iter()
+        .map(|selected_test| graph.path(selected_test.file).as_str())
+        .collect();
+
+        assert_eq!(
+            relaxed,
+            ["src/hub.test.ts", "src/a.test.ts", "src/b.test.ts"]
         );
     }
 }

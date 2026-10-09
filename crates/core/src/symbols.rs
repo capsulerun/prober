@@ -124,11 +124,31 @@ pub struct ModuleFallback {
     pub cause: FallbackCause,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SymbolChangeKind {
+    Modified,
+    Added,
+    Renamed { from: String },
+    Removed,
+    Export,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SymbolChange {
+    pub file: FileId,
+    pub name: String,
+    pub kind: SymbolChangeKind,
+    pub reaches: Vec<SymbolTarget>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct SymbolTableBuilder {
     symbols: Vec<Symbol>,
     edges: Vec<SymbolEdge>,
     fallbacks: Vec<ModuleFallback>,
+    changes: Vec<SymbolChange>,
+    compared_modules: Vec<FileId>,
+    through: HashMap<SymbolEdge, Vec<FileId>>,
 }
 
 impl SymbolTableBuilder {
@@ -147,8 +167,21 @@ impl SymbolTableBuilder {
         }
     }
 
+    pub(crate) fn add_edge_through(&mut self, edge: SymbolEdge, through: Vec<FileId>) {
+        if !through.is_empty() {
+            self.through.insert(edge, through);
+        }
+
+        self.add_edge(edge);
+    }
+
     pub(crate) fn add_fallback(&mut self, fallback: ModuleFallback) {
         self.fallbacks.push(fallback);
+    }
+
+    pub(crate) fn add_module_changes(&mut self, file: FileId, changes: Vec<SymbolChange>) {
+        self.compared_modules.push(file);
+        self.changes.extend(changes);
     }
 
     pub(crate) fn retain_edges(&mut self, mut keep: impl FnMut(FileId, FileId) -> bool) {
@@ -202,6 +235,19 @@ impl SymbolTableBuilder {
             }
         }
 
+        let mut changes_by_module: HashMap<FileId, Vec<usize>> = self
+            .compared_modules
+            .iter()
+            .map(|&file| (file, Vec::new()))
+            .collect();
+
+        for (index, change) in self.changes.iter().enumerate() {
+            changes_by_module
+                .entry(change.file)
+                .or_default()
+                .push(index);
+        }
+
         SymbolTable {
             symbols: self.symbols,
             symbols_by_file,
@@ -210,6 +256,9 @@ impl SymbolTableBuilder {
             dependents_by_symbol,
             dependents_by_module,
             fallbacks: self.fallbacks,
+            changes: self.changes,
+            changes_by_module,
+            through: self.through,
         }
     }
 }
@@ -223,6 +272,9 @@ pub(crate) struct SymbolTable {
     dependents_by_symbol: Vec<Vec<u32>>,
     dependents_by_module: HashMap<FileId, Vec<u32>>,
     fallbacks: Vec<ModuleFallback>,
+    changes: Vec<SymbolChange>,
+    changes_by_module: HashMap<FileId, Vec<usize>>,
+    through: HashMap<SymbolEdge, Vec<FileId>>,
 }
 
 impl SymbolTable {
@@ -268,6 +320,18 @@ impl SymbolTable {
 
     pub(crate) fn fallbacks(&self) -> &[ModuleFallback] {
         &self.fallbacks
+    }
+
+    pub(crate) fn through(&self, edge: &SymbolEdge) -> &[FileId] {
+        self.through.get(edge).map_or(&[], Vec::as_slice)
+    }
+
+    pub(crate) fn changes(&self) -> &[SymbolChange] {
+        &self.changes
+    }
+
+    pub(crate) fn changes_of(&self, file: FileId) -> Option<&[usize]> {
+        self.changes_by_module.get(&file).map(Vec::as_slice)
     }
 }
 

@@ -103,7 +103,7 @@ pub fn scan(directory: &Path) -> Result<ScanReport> {
     let workspace = Workspace::open(directory, "HEAD")?;
     let config_text = workspace.read_config()?;
     let config = Config::parse(&config_text)?;
-    let linker = workspace.linker(&config)?.with_symbol_analysis();
+    let linker = workspace.linker(&config)?;
     let mut builder = GraphBuilder::default();
 
     linker.link(&workspace.repo_files, &mut builder)?;
@@ -254,8 +254,12 @@ impl Workspace {
     }
 
     fn linker(&self, config: &Config) -> Result<TypeScriptLinker> {
-        let linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?
+        let mut linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?
             .with_inference(config.inference);
+
+        if config.inference.symbols {
+            linker = linker.with_symbol_analysis();
+        }
 
         if config.presets == Presets::Auto {
             return Ok(linker);

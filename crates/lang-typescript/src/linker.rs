@@ -7,7 +7,7 @@ use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
 use oxc_parser::{Parser, config::RuntimeParserConfig};
 use oxc_span::SourceType;
-use prober_core::changes::{BaseRevision, FileChange};
+use prober_core::changes::{BaseRevision, ChangeKind, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
 use prober_core::graph::{Edge, EdgeKind, GraphBuilder, RootScope, UnresolvedSite};
@@ -33,7 +33,7 @@ use crate::presets::patterns::join_directory;
 use crate::presets::{RunnerGroup, RunnerPresets, ScopeInputs, imports_node_test, runner_groups};
 use crate::resolver::{ModuleResolver, package_node};
 use crate::root_scope::RootScopeEffects;
-use crate::symbols::{SymbolAnalysis, add_symbols, extract_symbols};
+use crate::symbols::{ModuleSymbols, SymbolAnalysis, add_symbols, extract_symbols};
 use crate::test_links::TestLinks;
 use crate::workspaces::{
     PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest, parent_directory,
@@ -295,7 +295,9 @@ impl TypeScriptLinker {
         }
 
         if self.symbol_analysis {
-            add_symbols(&linked_files, graph);
+            let base_modules = base_modules(&linked_files, link_changes)?;
+
+            add_symbols(&linked_files, &base_modules, graph);
         }
 
         let mocked_modules = TestLinks {
@@ -654,6 +656,58 @@ impl TypeScriptLinker {
             symbols,
         })
     }
+}
+
+fn base_modules(
+    linked_files: &[LinkedFile],
+    link_changes: &LinkChanges,
+) -> Result<HashMap<RepoPath, ModuleSymbols>> {
+    let analysed: HashSet<&RepoPath> = linked_files
+        .iter()
+        .filter(|linked_file| {
+            !linked_file.is_test
+                && linked_file
+                    .symbols
+                    .as_ref()
+                    .is_some_and(|analysis| analysis.module.is_ok())
+        })
+        .map(|linked_file| &linked_file.path)
+        .collect();
+    let mut base_texts = Vec::new();
+
+    for change in link_changes.changes {
+        if change.kind != ChangeKind::Modified || !analysed.contains(&change.path) {
+            continue;
+        }
+
+        let base_bytes = link_changes
+            .base
+            .read_file(&change.path)
+            .with_context(|| format!("cannot read {} at the base revision", change.path))?;
+
+        if let Some(base_text) = base_bytes.and_then(|bytes| String::from_utf8(bytes).ok()) {
+            base_texts.push((&change.path, base_text));
+        }
+    }
+
+    Ok(base_texts
+        .into_par_iter()
+        .filter_map(|(path, base_text)| Some((path.clone(), module_symbols_of(path, &base_text)?)))
+        .collect())
+}
+
+fn module_symbols_of(path: &RepoPath, source_text: &str) -> Option<ModuleSymbols> {
+    let allocator = Allocator::default();
+    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
+    let parsed = Parser::new(&allocator, source_text, source_type)
+        .with_config(RuntimeParserConfig::new(true))
+        .parse();
+
+    if parsed.panicked || parsed.diagnostics.has_errors() {
+        return None;
+    }
+
+    extract_symbols(&parsed.program, source_text, &parsed.tokens).ok()
 }
 
 fn module_seeds(linked_files: &[LinkedFile]) -> Vec<RepoPath> {
