@@ -6,7 +6,7 @@ use crate::changes::FileChange;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{Edge, Graph};
 use crate::report::{AlwaysRunTest, CONFIG_FILE_NAME, describe_reason};
-use crate::select::{Link, Reason, Relaxation, SelectedTest, Widening, select_relaxed};
+use crate::select::{Hop, Link, Reason, Relaxation, SelectedTest, Widening, select_relaxed};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
@@ -178,7 +178,13 @@ pub fn explain(
             Relaxation::Assets => Blocker::AssetBlind,
         };
 
-        return blocked(graph, blocker, &selected_test.reason);
+        let mut reason = describe_reason(graph, &selected_test.reason);
+
+        if relaxation == Relaxation::Ignores {
+            mark_ignored_hops(graph, &selected_test.reason, &mut reason);
+        }
+
+        return Explanation::Blocked { blocker, reason };
     }
 
     Explanation::NoPath {
@@ -204,27 +210,38 @@ fn ignoring_lines(graph: &Graph, reason: &Reason) -> Vec<usize> {
 
     for hop in &reason.hops {
         match hop.link {
-            Link::Edge { kind, dependency } => {
-                let edge = Edge {
-                    dependent: hop.dependent,
-                    dependency,
-                    kind,
-                };
-
-                lines.extend(
-                    graph
-                        .ignored_edge(&edge)
-                        .map(|ignored_edge| ignored_edge.line),
-                );
-            }
+            Link::Edge { .. } => lines.extend(ignored_edge_line(graph, hop)),
             Link::SetAsideSite(site_index) => {
-                lines.insert(graph.set_aside_sites()[site_index].set_aside.line());
+                lines.insert(graph.set_aside_sites()[site_index].line);
             }
             Link::ChangedPart(_) | Link::UnresolvedSite(_) => {}
         }
     }
 
     lines.into_iter().collect()
+}
+
+fn mark_ignored_hops(graph: &Graph, reason: &Reason, described_hops: &mut [String]) {
+    for (hop, described_hop) in reason.hops.iter().zip(described_hops.iter_mut().skip(1)) {
+        if let Some(line) = ignored_edge_line(graph, hop) {
+            described_hop.push_str(&format!(", ignored by {CONFIG_FILE_NAME}:{line}"));
+        }
+    }
+}
+
+fn ignored_edge_line(graph: &Graph, hop: &Hop) -> Option<usize> {
+    let Link::Edge { kind, dependency } = hop.link else {
+        return None;
+    };
+    let edge = Edge {
+        dependent: hop.dependent,
+        dependency,
+        kind,
+    };
+
+    graph
+        .ignored_edge(&edge)
+        .map(|ignored_edge| ignored_edge.line)
 }
 
 fn mocked_modules(graph: &Graph, test_file: FileId, reason: &Reason) -> Vec<RepoPath> {
@@ -376,7 +393,7 @@ mod tests {
             (
                 "test/ignored.test.ts",
                 "src/a.ts",
-                "test/ignored.test.ts is not selected: every path goes through what prober.toml:1 ignores:\n  src/a.ts (modified)\n  -> loaded by test/ignored.test.ts:4 (inferred glob src/*.ts)\n",
+                "test/ignored.test.ts is not selected: every path goes through what prober.toml:1 ignores:\n  src/a.ts (modified)\n  -> loaded by test/ignored.test.ts:4 (inferred glob src/*.ts), ignored by prober.toml:1\n",
             ),
             (
                 "test/button.test.ts",

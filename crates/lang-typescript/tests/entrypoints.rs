@@ -156,7 +156,6 @@ export default defineConfig({
     let daemon_output = graph.file_id(&repo_path("build/cli/daemon.js")).unwrap();
     let build_edge = graph
         .dependencies(daemon_output)
-        .iter()
         .find(|edge| edge.kind == EdgeKind::Build)
         .unwrap();
 
@@ -165,7 +164,7 @@ export default defineConfig({
         "src/cli/daemon-cli.ts"
     );
     assert_eq!(
-        graph.inference(build_edge).unwrap().description(),
+        graph.inference(&build_edge).unwrap().description(),
         "inferred build mapping build/cli/daemon <- src/cli/daemon-cli.ts (tsdown.config.ts)"
     );
 }

@@ -1,4 +1,4 @@
-//! The rules a team writes in prober.toml: links the code does not show, ignores of inferred links and unresolved sites, the tests every selection runs, and warnings for rules that match nothing or almost everything.
+//! The rules a team writes in prober.toml: links the code does not show, ignores of links and unresolved sites, the tests every selection runs, and warnings for rules that match nothing or almost everything.
 
 use std::collections::{BTreeMap, HashSet};
 use std::fmt;
@@ -9,11 +9,11 @@ use toml::Spanned;
 
 use crate::changes::FileChange;
 use crate::files::{FileId, RepoPath};
-use crate::graph::{Edge, EdgeKind, Graph, GraphBuilder, Inference, SetAside};
-use crate::patterns::{Captures, PathPattern};
+use crate::graph::{Graph, GraphBuilder, RuleLink};
+use crate::patterns::{Captures, PathPattern, describe_captures};
 use crate::report::{AlwaysRunTest, CONFIG_FILE_NAME};
 
-const CONFIG_LINK: &str = "link";
+const LITERAL_TARGET: &str = "literal:";
 
 const ALWAYS_RUN_KEY: &str = "always_run";
 
@@ -27,7 +27,14 @@ const MIN_BROAD_CANDIDATES: usize = 10;
 #[serde(deny_unknown_fields)]
 pub(crate) struct LinkTable {
     from: String,
-    to: String,
+    to: Targets,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum Targets {
+    One(String),
+    Many(Vec<String>),
 }
 
 #[derive(Debug, Deserialize)]
@@ -49,7 +56,7 @@ pub(crate) struct AlwaysRunSection {
 pub struct LinkRule {
     pub line: usize,
     pub from: PathPattern,
-    pub to: PathPattern,
+    pub to: Vec<PathPattern>,
 }
 
 #[derive(Debug)]
@@ -99,6 +106,7 @@ pub struct RuleEffect {
     pub rule: String,
     pub links: usize,
     pub sites: usize,
+    pub unlinked: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -248,25 +256,21 @@ fn apply_link(
     removed: &[&RepoPath],
     rule_report: &mut RuleReport,
 ) {
-    let mut from_groups: BTreeMap<Captures, Vec<&RepoPath>> = BTreeMap::new();
-    let mut to_groups: BTreeMap<Captures, Vec<&RepoPath>> = BTreeMap::new();
-
-    for path in repo_files.iter().chain(removed.iter().copied()) {
-        if let Some(captures) = link.from.captures(path.as_str()) {
-            from_groups.entry(captures).or_default().push(path);
-        }
-    }
-
-    for path in repo_files {
-        if let Some(captures) = link.to.captures(path.as_str()) {
-            to_groups.entry(captures).or_default().push(path);
-        }
-    }
-
+    let from_groups = capture_groups(&link.from, repo_files.iter().chain(removed.iter().copied()));
+    let to_groups: Vec<BTreeMap<Captures, Vec<&RepoPath>>> = link
+        .to
+        .iter()
+        .map(|target| capture_groups(target, repo_files))
+        .collect();
+    let targets: Vec<String> = link
+        .to
+        .iter()
+        .map(|target| format!("{:?}", target.text()))
+        .collect();
     let rule = format!(
-        "[[link]] from {:?} to {:?}",
+        "[[link]] from {:?} to {}",
         link.from.text(),
-        link.to.text()
+        targets.join(", ")
     );
 
     lint_matches(
@@ -277,77 +281,91 @@ fn apply_link(
         repo_files,
         rule_report,
     );
-    lint_matches(
-        link.line,
-        "to",
-        &link.to,
-        to_groups.values(),
-        repo_files,
-        rule_report,
-    );
 
-    let to_names = link.to.capture_names();
-    let mut linked_files: HashSet<FileId> = HashSet::new();
-    let mut links = 0;
-
-    for (from_captures, from_files) in &from_groups {
-        let key: Captures = to_names
-            .iter()
-            .filter_map(|name| {
-                from_captures
-                    .iter()
-                    .find(|(captured_name, _)| captured_name == name)
-                    .cloned()
-            })
-            .collect();
-        let Some(to_files) = to_groups.get(&key) else {
-            continue;
-        };
-
-        for &to_file in to_files {
-            let dependent = builder.add_file(to_file.clone());
-
-            for &from_file in from_files {
-                if from_file == to_file {
-                    continue;
-                }
-
-                let dependency = builder.add_file(from_file.clone());
-
-                builder.add_inferred_edge(
-                    Edge {
-                        dependent,
-                        dependency,
-                        kind: EdgeKind::Rule,
-                    },
-                    Inference {
-                        line: u32::try_from(link.line).unwrap_or(u32::MAX),
-                        kind: CONFIG_LINK,
-                        pattern: link.from.text().to_owned(),
-                        detail: None,
-                    },
-                );
-                linked_files.insert(dependent);
-                links += 1;
-            }
-        }
+    for (target, groups) in link.to.iter().zip(&to_groups) {
+        lint_matches(
+            link.line,
+            "to",
+            target,
+            groups.values(),
+            repo_files,
+            rule_report,
+        );
     }
 
-    let resolved_paths: HashSet<RepoPath> = builder
-        .files()
-        .filter(|(file, _)| linked_files.contains(file))
-        .map(|(_, path)| path.clone())
-        .collect();
-    let sites = builder.set_aside_sites(SetAside::Resolved { line: link.line }, |_, path| {
-        resolved_paths.contains(path)
-    });
+    let mut unlinked = Vec::new();
+    let mut links = 0;
+
+    for (from_captures, from_paths) in &from_groups {
+        let to_paths: Vec<&RepoPath> = link
+            .to
+            .iter()
+            .zip(&to_groups)
+            .filter_map(|(target, groups)| {
+                let key: Captures = target
+                    .capture_names()
+                    .iter()
+                    .filter_map(|name| {
+                        from_captures
+                            .iter()
+                            .find(|(captured_name, _)| captured_name == name)
+                            .cloned()
+                    })
+                    .collect();
+
+                groups.get(&key)
+            })
+            .flatten()
+            .copied()
+            .collect();
+
+        if to_paths.is_empty() {
+            if !from_captures.is_empty() {
+                unlinked.push(describe_captures(from_captures));
+            }
+
+            continue;
+        }
+
+        let from: Vec<FileId> = from_paths
+            .iter()
+            .map(|&path| builder.add_file(path.clone()))
+            .collect();
+        let to: Vec<FileId> = to_paths
+            .iter()
+            .map(|&path| builder.add_file(path.clone()))
+            .collect();
+        links += builder.add_rule_link(RuleLink {
+            line: link.line,
+            pattern: link.from.text().to_owned(),
+            captures: from_captures.clone(),
+            from,
+            to,
+        });
+    }
 
     rule_report.effects.push(RuleEffect {
         line: link.line,
         rule,
         links,
-        sites,
+        sites: 0,
+        unlinked,
     });
+}
+
+fn capture_groups<'p>(
+    pattern: &PathPattern,
+    paths: impl IntoIterator<Item = &'p RepoPath>,
+) -> BTreeMap<Captures, Vec<&'p RepoPath>> {
+    let mut groups: BTreeMap<Captures, Vec<&RepoPath>> = BTreeMap::new();
+
+    for path in paths {
+        if let Some(captures) = pattern.captures(path.as_str()) {
+            groups.entry(captures).or_default().push(path);
+        }
+    }
+
+    groups
 }
 
 fn apply_ignore(
@@ -388,22 +406,31 @@ fn apply_ignore(
             );
             lint_pattern(ignore.line, "to", to, to_matched, repo_files, rule_report);
 
-            let links = builder.ignore_edges(ignore.line, |edge| {
-                to_files.contains(&edge.dependent) && from_files.contains(&edge.dependency)
-            });
+            let ignored = builder.ignore_links(ignore.line, from_files, to_files);
 
-            if links == 0 && from_matched > 0 && to_matched > 0 {
+            if ignored.links == 0 && from_matched > 0 && to_matched > 0 {
                 rule_report.warnings.push(ConfigWarning {
                     line: Some(ignore.line),
-                    message: format!("{rule} matches no inferred link"),
+                    message: format!("{rule} matches no link"),
+                });
+            }
+
+            if ignored.imports > 0 {
+                rule_report.warnings.push(ConfigWarning {
+                    line: Some(ignore.line),
+                    message: format!(
+                        "{rule} removes {} import edges written in the code: tests reached only through them are no longer selected",
+                        ignored.imports
+                    ),
                 });
             }
 
             rule_report.effects.push(RuleEffect {
                 line: ignore.line,
                 rule,
-                links,
+                links: ignored.links,
                 sites: 0,
+                unlinked: Vec::new(),
             });
         }
         IgnoreTarget::Sites { file, line } => {
@@ -411,10 +438,9 @@ fn apply_ignore(
                 Some(line) => format!("[[ignore]] site \"{}:{line}\"", file.text()),
                 None => format!("[[ignore]] site {:?}", file.text()),
             };
-            let sites =
-                builder.set_aside_sites(SetAside::Ignored { line: ignore.line }, |site, path| {
-                    file.is_match(path.as_str()) && line.is_none_or(|line| site.line == line)
-                });
+            let sites = builder.set_aside_sites(ignore.line, |site, path| {
+                file.is_match(path.as_str()) && line.is_none_or(|line| site.line == line)
+            });
 
             if sites == 0 {
                 rule_report.warnings.push(ConfigWarning {
@@ -428,6 +454,7 @@ fn apply_ignore(
                 rule,
                 links: 0,
                 sites,
+                unlinked: Vec::new(),
             });
         }
     }
@@ -477,16 +504,37 @@ pub(crate) fn is_broad(matched: usize, candidates: usize) -> bool {
 
 fn link_rule(line: usize, link_table: &LinkTable) -> Result<LinkRule> {
     let from = PathPattern::new(&link_table.from).map_err(rule_error(Some(line), "[[link]]"))?;
-    let to = PathPattern::new(&link_table.to).map_err(rule_error(Some(line), "[[link]]"))?;
+    let targets = match &link_table.to {
+        Targets::One(target) => std::slice::from_ref(target),
+        Targets::Many(targets) => targets.as_slice(),
+    };
 
-    if let Some(name) = to
-        .capture_names()
-        .iter()
-        .find(|name| !from.capture_names().contains(name))
-    {
-        bail!(
-            "invalid {CONFIG_FILE_NAME} at line {line}: [[link]] to uses {{{name}}}, which from does not capture"
-        );
+    if targets.is_empty() {
+        bail!("invalid {CONFIG_FILE_NAME} at line {line}: [[link]] to lists no target");
+    }
+
+    let mut to = Vec::new();
+
+    for target in targets {
+        if target.starts_with(LITERAL_TARGET) {
+            bail!(
+                "invalid {CONFIG_FILE_NAME} at line {line}: [[link]] {LITERAL_TARGET} targets are not supported yet, they come with string anchors"
+            );
+        }
+
+        let target = PathPattern::new(target).map_err(rule_error(Some(line), "[[link]]"))?;
+
+        if let Some(name) = target
+            .capture_names()
+            .iter()
+            .find(|name| !from.capture_names().contains(name))
+        {
+            bail!(
+                "invalid {CONFIG_FILE_NAME} at line {line}: [[link]] to uses {{{name}}}, which from does not capture"
+            );
+        }
+
+        to.push(target);
     }
 
     Ok(LinkRule { line, from, to })
@@ -556,7 +604,7 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::config::Config;
-    use crate::graph::{UnresolvedCause, UnresolvedSite};
+    use crate::graph::{Edge, EdgeKind, Inference, UnresolvedCause, UnresolvedSite};
 
     fn repo_path(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()
@@ -575,11 +623,14 @@ mod tests {
             return Vec::new();
         };
 
-        graph
+        let mut dependents: Vec<(String, EdgeKind)> = graph
             .dependents(file)
-            .iter()
             .map(|edge| (graph.path(edge.dependent).to_string(), edge.kind))
-            .collect()
+            .collect();
+
+        dependents.sort();
+
+        dependents
     }
 
     fn plugin_project() -> (GraphBuilder, Vec<RepoPath>) {
@@ -663,6 +714,14 @@ mod tests {
                 "[[link]]\nfrom = \"a\"\n",
                 "invalid prober.toml at line 1, column 1: missing field `to`",
             ),
+            (
+                "[[link]]\nfrom = \"a/**\"\nto = []\n",
+                "invalid prober.toml at line 1: [[link]] to lists no target",
+            ),
+            (
+                "[[link]]\nfrom = \"extensions/{id}/**\"\nto = [\"test/a.test.ts\", \"literal:pluginId: \\\"{id}\\\"\"]\n",
+                "invalid prober.toml at line 1: [[link]] literal: targets are not supported yet, they come with string anchors",
+            ),
         ];
 
         for (config_text, expected_message) in invalid_configs {
@@ -674,7 +733,7 @@ mod tests {
     }
 
     #[test]
-    fn links_connect_captured_files_and_resolve_the_unresolved_sites_they_declare() {
+    fn links_connect_captured_files_and_only_add_to_the_selection() {
         let (mut builder, files) = plugin_project();
         let rules = rules(
             "[[link]]\nfrom = \"extensions/{id}/**\"\nto = \"test/plugins/{id}.test.ts\"\n\n[[link]]\nfrom = \"extensions/*/index.ts\"\nto = \"src/loader.ts\"\n",
@@ -689,11 +748,8 @@ mod tests {
                 ("test/plugins/slack.test.ts".to_owned(), EdgeKind::Rule),
             ]
         );
-        assert_eq!(graph.unresolved_sites(), []);
-        assert_eq!(
-            graph.set_aside_sites()[0].set_aside,
-            SetAside::Resolved { line: 5 }
-        );
+        assert_eq!(graph.unresolved_sites().len(), 1);
+        assert_eq!(graph.set_aside_sites(), []);
         assert_eq!(
             rule_report.effects,
             [
@@ -703,12 +759,14 @@ mod tests {
                         .to_owned(),
                     links: 2,
                     sites: 0,
+                    unlinked: Vec::new(),
                 },
                 RuleEffect {
                     line: 5,
                     rule: "[[link]] from \"extensions/*/index.ts\" to \"src/loader.ts\"".to_owned(),
                     links: 2,
-                    sites: 1,
+                    sites: 0,
+                    unlinked: Vec::new(),
                 },
             ]
         );
@@ -735,35 +793,101 @@ mod tests {
     }
 
     #[test]
-    fn ignores_set_aside_inferred_links_and_unresolved_sites_but_never_imports() {
+    fn a_link_to_several_targets_connects_each_capture_to_all_of_them() {
+        let (mut builder, mut files) = plugin_project();
+
+        files.push(repo_path("extensions/zalo/index.ts"));
+
+        let rules = rules(
+            "[[link]]\nfrom = \"extensions/{id}/**\"\nto = [\"test/plugins/{id}.test.ts\", \"src/loader.test.ts\"]\n",
+        );
+        let rule_report = rules.apply(&mut builder, &files, &[]);
+        let graph = builder.build();
+
+        assert_eq!(
+            dependents(&graph, "extensions/slack/index.ts"),
+            [
+                ("src/loader.test.ts".to_owned(), EdgeKind::Rule),
+                ("test/plugins/slack.test.ts".to_owned(), EdgeKind::Rule),
+            ]
+        );
+        assert_eq!(
+            dependents(&graph, "extensions/zalo/index.ts"),
+            [("src/loader.test.ts".to_owned(), EdgeKind::Rule)]
+        );
+        assert_eq!(rule_report.effects[0].links, 5);
+        assert_eq!(rule_report.effects[0].unlinked, Vec::<String>::new());
+    }
+
+    #[test]
+    fn capture_values_whose_targets_match_nothing_are_reported() {
+        let (mut builder, mut files) = plugin_project();
+
+        files.push(repo_path("extensions/zalo/index.ts"));
+
+        let rule_report =
+            rules("[[link]]\nfrom = \"extensions/{id}/**\"\nto = \"test/plugins/{id}.test.ts\"\n")
+                .apply(&mut builder, &files, &[]);
+
+        assert_eq!(rule_report.effects[0].links, 2);
+        assert_eq!(rule_report.effects[0].unlinked, ["id=zalo"]);
+        assert_eq!(dependents(&builder.build(), "extensions/zalo/index.ts"), []);
+    }
+
+    #[test]
+    fn ignores_set_aside_links_of_every_kind_and_unresolved_sites() {
         let (mut builder, files) = plugin_project();
         let rules = rules(
-            "[[ignore]]\nfrom = \"**\"\nto = \"src/loader.test.ts\"\n\n[[ignore]]\nsite = \"src/loader.ts\"\n",
+            "[[link]]\nfrom = \"extensions/{id}/**\"\nto = \"test/plugins/{id}.test.ts\"\n\n[[ignore]]\nfrom = \"**\"\nto = \"src/loader.test.ts\"\n\n[[ignore]]\nsite = \"src/loader.ts\"\n\n[[ignore]]\nfrom = \"extensions/slack/**\"\nto = \"test/**\"\n",
         );
         let rule_report = rules.apply(&mut builder, &files, &[]);
         let graph = builder.build();
         let telegram = graph
             .file_id(&repo_path("extensions/telegram/index.ts"))
             .unwrap();
+        let slack = graph
+            .file_id(&repo_path("extensions/slack/index.ts"))
+            .unwrap();
 
-        assert_eq!(dependents(&graph, "extensions/telegram/index.ts"), []);
         assert_eq!(
-            dependents(&graph, "src/loader.ts"),
-            [("src/loader.test.ts".to_owned(), EdgeKind::Import)]
+            dependents(&graph, "extensions/telegram/index.ts"),
+            [("test/plugins/telegram.test.ts".to_owned(), EdgeKind::Rule)]
         );
-        assert_eq!(graph.ignored_dependents(telegram)[0].line, 1);
+        assert_eq!(dependents(&graph, "src/loader.ts"), []);
+        assert_eq!(dependents(&graph, "extensions/slack/index.ts"), []);
+        assert_eq!(
+            graph
+                .ignored_dependents(telegram)
+                .map(|ignored_edge| ignored_edge.line)
+                .collect::<Vec<_>>(),
+            [5]
+        );
+        assert_eq!(
+            graph
+                .ignored_dependents(slack)
+                .map(|ignored_edge| (ignored_edge.edge.kind, ignored_edge.line))
+                .collect::<Vec<_>>(),
+            [(EdgeKind::Rule, 12)]
+        );
         assert_eq!(graph.unresolved_sites(), []);
-        assert_eq!(
-            graph.set_aside_sites()[0].set_aside,
-            SetAside::Ignored { line: 5 }
-        );
+        assert_eq!(graph.set_aside_sites()[0].line, 9);
         assert_eq!(
             rule_report
                 .effects
                 .iter()
                 .map(|effect| (effect.links, effect.sites))
                 .collect::<Vec<_>>(),
-            [(1, 0), (0, 1)]
+            [(2, 0), (2, 0), (0, 1), (1, 0)]
+        );
+        assert_eq!(
+            rule_report
+                .warnings
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            [
+                "prober.toml:5: [[ignore]] from \"**\" to \"src/loader.test.ts\" removes 1 import edges written in the code: tests reached only through them are no longer selected"
+            ]
         );
     }
 
@@ -787,7 +911,7 @@ mod tests {
             messages,
             [
                 "prober.toml:1: from \"fixtures/missing/**\" matches no file",
-                "prober.toml:5: [[ignore]] from \"fixtures/**\" to \"src/loader.ts\" matches no inferred link",
+                "prober.toml:5: [[ignore]] from \"fixtures/**\" to \"src/loader.ts\" matches no link",
                 "prober.toml:9: [[ignore]] site \"src/other.ts\" matches no unresolved site",
                 "prober.toml:12: [always_run] test \"test/smoke/**\" matches no test file",
             ]

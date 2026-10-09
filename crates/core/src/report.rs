@@ -7,6 +7,7 @@ use crate::changes::{FileChange, ResolvedRevisions};
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{Edge, EdgeKind, Graph, TestFile};
+use crate::patterns::describe_captures;
 use crate::ratios::{format_percentage, rounded_ratio};
 use crate::select::{Hop, Link, Reason, SelectedTest};
 
@@ -632,13 +633,17 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
                 kind: EdgeKind::Rule,
             };
 
-            match graph.inference(&edge) {
-                Some(inference) => {
-                    format!(
-                        "-> linked to {dependent} by {CONFIG_FILE_NAME}:{}",
-                        inference.line
-                    )
-                }
+            match graph.rule_link(&edge) {
+                Some(rule_link) if rule_link.captures.is_empty() => format!(
+                    "-> linked to {dependent} by rule link ({CONFIG_FILE_NAME}:{}): {}",
+                    rule_link.line, rule_link.pattern
+                ),
+                Some(rule_link) => format!(
+                    "-> linked to {dependent} by rule link ({CONFIG_FILE_NAME}:{}): {} ({})",
+                    rule_link.line,
+                    rule_link.pattern,
+                    describe_captures(&rule_link.captures)
+                ),
                 None => format!("-> linked to {dependent} by {CONFIG_FILE_NAME}"),
             }
         }
@@ -700,9 +705,7 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
 
             format!(
                 "{WIDENED_HOP_PREFIX}unresolved dynamic import at {dependent}:{} ({}), set aside by {CONFIG_FILE_NAME}:{}",
-                set_aside_site.site.line,
-                set_aside_site.site.expression,
-                set_aside_site.set_aside.line()
+                set_aside_site.site.line, set_aside_site.site.expression, set_aside_site.line
             )
         }
     }
@@ -751,7 +754,7 @@ mod tests {
     use super::*;
     use crate::changes::ChangeKind;
     use crate::config::Config;
-    use crate::graph::{Edge, GraphBuilder, Inference, UnresolvedCause, UnresolvedSite};
+    use crate::graph::{Edge, GraphBuilder, Inference, RuleLink, UnresolvedCause, UnresolvedSite};
     use crate::select::{Widening, select_tests};
 
     const CONFIG_HASH: &str = "0123456789abcdef";
@@ -1112,33 +1115,28 @@ mod tests {
     }
 
     #[test]
-    fn config_link_hop_names_the_rule_line() {
+    fn config_link_hop_names_the_rule_line_and_its_captures() {
         let mut builder = GraphBuilder::default();
-        let golden_test = builder.add_test_file(repo_path("test/golden.test.ts"), "typescript");
-        let fixture = builder.add_file(repo_path("fixtures/golden/a.json"));
+        let plugins_test =
+            builder.add_test_file(repo_path("test/plugins.e2e.test.ts"), "typescript");
+        let telegram = builder.add_file(repo_path("extensions/telegram/send.ts"));
 
-        builder.add_inferred_edge(
-            Edge {
-                dependent: golden_test,
-                dependency: fixture,
-                kind: EdgeKind::Rule,
-            },
-            Inference {
-                line: 6,
-                kind: "link",
-                pattern: "fixtures/golden/**".to_owned(),
-                detail: None,
-            },
-        );
+        builder.add_rule_link(RuleLink {
+            line: 12,
+            pattern: "extensions/{id}/**".to_owned(),
+            captures: vec![("id".to_owned(), "telegram".to_owned())],
+            from: vec![telegram],
+            to: vec![plugins_test],
+        });
 
         let graph = builder.build();
-        let report = report_for_changes(&graph, &[modified("fixtures/golden/a.json")]);
+        let report = report_for_changes(&graph, &[modified("extensions/telegram/send.ts")]);
 
         assert_eq!(
             report.targets[0].impact.as_ref().unwrap().reason,
             [
-                "fixtures/golden/a.json (modified)",
-                "-> linked to test/golden.test.ts by prober.toml:6",
+                "extensions/telegram/send.ts (modified)",
+                "-> linked to test/plugins.e2e.test.ts by rule link (prober.toml:12): extensions/{id}/** (id=telegram)",
             ]
         );
     }
