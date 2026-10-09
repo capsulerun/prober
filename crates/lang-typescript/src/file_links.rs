@@ -25,7 +25,7 @@ use crate::manifests::is_manifest;
 use crate::presets::patterns::join_directory;
 use crate::repo_index::RepoIndex;
 use crate::resolver::ModuleResolver;
-use crate::workspaces::parent_directory;
+use crate::workspaces::{package_directory, parent_directory};
 
 const MAX_LISTING_FILE_SIZE: u64 = 1 << 20;
 
@@ -573,20 +573,8 @@ impl FileReading<'_> {
         Value::Strings(directories)
     }
 
-    fn package_directory<'p>(&'p self, path: &'p RepoPath) -> &'p str {
-        let mut directory = parent_directory(path);
-
-        loop {
-            if let Some(package_directory) = self.package_directories.get(directory) {
-                return package_directory;
-            }
-
-            match directory.rsplit_once('/') {
-                Some((parent, _)) => directory = parent,
-                None if directory.is_empty() => return "",
-                None => directory = "",
-            }
-        }
+    fn package_directory(&self, path: &RepoPath) -> &str {
+        package_directory(self.package_directories, path)
     }
 }
 

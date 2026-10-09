@@ -4,20 +4,21 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use prober_core::files::RepoPath;
 
 use crate::conventions::is_source_file;
+use crate::dynamic::spawn::{Spawned, launch};
 use crate::dynamic::summarizer::{SummaryScope, summarize_module};
 use crate::dynamic::summary::{
     Access, Action, Comparison, Effect, Expr, FunctionIndex, ImportedName, ModuleSummary, Reach,
     UseKind,
 };
 use crate::dynamic::value::{
-    AccessKind, Builtin, FunctionRef, Part, PathFunction, Pattern, Unknown, Value, alternatives,
-    concatenation, file_url_to_path, is_open_object, merge_config, merge_objects, path_dirname,
-    path_join, path_resolve, require_resolve, url,
+    AccessKind, Builtin, FunctionRef, Part, PathFunction, Pattern, SpawnKind, Unknown, Value,
+    alternatives, concatenation, file_url_to_path, is_open_object, merge_config, merge_objects,
+    path_dirname, path_join, path_resolve, require_resolve, url,
 };
 use crate::presets::{VITEST_DEFAULT_EXCLUDE, VITEST_DEFAULT_INCLUDE};
 use crate::resolver::{ModuleResolver, Resolution};
@@ -32,6 +33,21 @@ const MAX_EVALUATION_STEPS: usize = 20_000;
 
 const MAX_ACCESS_STEPS: usize = 2_000;
 
+pub(crate) type SharedSummaries = HashMap<RepoPath, Arc<ModuleSummary>>;
+
+const LOADING_BUILTIN_MODULES: [&str; 8] = [
+    "path",
+    "path/posix",
+    "url",
+    "module",
+    "child_process",
+    "execa",
+    "cross-spawn",
+    "jiti",
+];
+
+const NODE_EXECUTABLE: &str = "node";
+
 pub(crate) struct Load {
     pub specifier: Value,
     pub base: LoadBase,
@@ -41,12 +57,26 @@ pub(crate) enum LoadBase {
     Module(RepoPath),
     Require(Vec<Pattern>),
     WorkingDirectory,
+    Process(Vec<Pattern>),
+    Program(Vec<Pattern>),
+}
+
+impl Load {
+    pub fn is_spawn(&self) -> bool {
+        matches!(self.base, LoadBase::Process(_) | LoadBase::Program(_))
+    }
 }
 
 pub(crate) struct FileAccess {
     pub kind: AccessKind,
     pub path: Value,
     pub options: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoadScope {
+    Modules,
+    Processes,
 }
 
 #[derive(Clone)]
@@ -99,7 +129,8 @@ pub(crate) struct Evaluator<'e> {
     repo_root: &'e Path,
     resolver: &'e ModuleResolver,
     importers: &'e HashMap<RepoPath, Vec<RepoPath>>,
-    summaries: RefCell<HashMap<RepoPath, Option<Rc<ModuleSummary>>>>,
+    summaries: RefCell<HashMap<RepoPath, Option<Arc<ModuleSummary>>>>,
+    shared_summaries: Option<&'e SharedSummaries>,
     analysed: RefCell<HashSet<RepoPath>>,
     resolutions: RefCell<HashMap<(RepoPath, String), Resolution>>,
     loaders: RefCell<HashMap<FunctionRef, bool>>,
@@ -110,7 +141,9 @@ pub(crate) struct Evaluator<'e> {
     evaluates_spreads: Cell<bool>,
     step_limit: Cell<usize>,
     working_directory: RefCell<Value>,
+    process_directory: RefCell<Value>,
     summary_scope: SummaryScope,
+    load_scope: LoadScope,
 }
 
 impl<'e> Evaluator<'e> {
@@ -124,6 +157,7 @@ impl<'e> Evaluator<'e> {
             resolver,
             importers,
             summaries: RefCell::new(HashMap::new()),
+            shared_summaries: None,
             analysed: RefCell::new(HashSet::new()),
             resolutions: RefCell::new(HashMap::new()),
             loaders: RefCell::new(HashMap::new()),
@@ -133,9 +167,32 @@ impl<'e> Evaluator<'e> {
             steps: Cell::new(0),
             evaluates_spreads: Cell::new(false),
             step_limit: Cell::new(MAX_EVALUATION_STEPS),
-            working_directory: RefCell::new(Value::runtime_value()),
+            working_directory: RefCell::new(Value::Unknown(Unknown::working_directory())),
+            process_directory: RefCell::new(Value::runtime_value()),
             summary_scope: SummaryScope::Loads,
+            load_scope: LoadScope::Modules,
         }
+    }
+
+    pub fn with_load_scope(self, load_scope: LoadScope) -> Self {
+        Self { load_scope, ..self }
+    }
+
+    pub fn with_shared_summaries(self, shared_summaries: &'e SharedSummaries) -> Self {
+        Self {
+            shared_summaries: Some(shared_summaries),
+            ..self
+        }
+    }
+
+    pub fn analysed_summaries(&self) -> SharedSummaries {
+        let summaries = self.summaries.borrow();
+
+        self.analysed
+            .borrow()
+            .iter()
+            .filter_map(|module| Some((module.clone(), summaries.get(module)?.clone()?)))
+            .collect()
     }
 
     pub fn with_summary_scope(self, summary_scope: SummaryScope) -> Self {
@@ -143,6 +200,10 @@ impl<'e> Evaluator<'e> {
             summary_scope,
             ..self
         }
+    }
+
+    pub fn set_process_directory(&self, process_directory: Value) {
+        self.process_directory.replace(process_directory);
     }
 
     pub fn add_analysed(&self, module: RepoPath, summary: ModuleSummary) {
@@ -153,14 +214,23 @@ impl<'e> Evaluator<'e> {
     pub fn add_summary(&self, module: RepoPath, summary: ModuleSummary) {
         self.summaries
             .borrow_mut()
-            .insert(module, Some(Rc::new(summary)));
+            .insert(module, Some(Arc::new(summary)));
     }
 
     pub fn is_analysed(&self, module: &RepoPath) -> bool {
-        self.analysed.borrow().contains(module)
+        self.shared_summaries
+            .is_some_and(|shared_summaries| shared_summaries.contains_key(module))
+            || self.analysed.borrow().contains(module)
     }
 
-    pub fn summary(&self, module: &RepoPath) -> Option<Rc<ModuleSummary>> {
+    pub fn summary(&self, module: &RepoPath) -> Option<Arc<ModuleSummary>> {
+        if let Some(summary) = self
+            .shared_summaries
+            .and_then(|shared_summaries| shared_summaries.get(module))
+        {
+            return Some(Arc::clone(summary));
+        }
+
         if let Some(summary) = self.summaries.borrow().get(module) {
             return summary.clone();
         }
@@ -169,7 +239,7 @@ impl<'e> Evaluator<'e> {
             .then(|| fs::read(self.repo_root.join(module.as_str())).ok())
             .flatten()
             .map(|source_bytes| {
-                Rc::new(summarize_module(
+                Arc::new(summarize_module(
                     module,
                     &String::from_utf8_lossy(&source_bytes),
                     self.summary_scope,
@@ -411,6 +481,9 @@ impl<'e> Evaluator<'e> {
 
     fn action_loads(&self, context: &Context, action: &Action) -> Vec<Load> {
         match action {
+            Action::Import(_) | Action::Worker(_) if self.load_scope == LoadScope::Processes => {
+                Vec::new()
+            }
             Action::Import(specifier) => vec![Load {
                 specifier: self.evaluate(context, specifier),
                 base: LoadBase::Module(context.module.clone()),
@@ -428,7 +501,10 @@ impl<'e> Evaluator<'e> {
 
     fn callee_loads(&self, context: &Context, callee: Value, arguments: &[Expr]) -> Vec<Load> {
         match callee {
-            Value::Require(bases) => vec![Load {
+            Value::Builtin(Builtin::Spawn(kind)) if self.load_scope == LoadScope::Processes => {
+                self.spawn_loads(context, kind, arguments)
+            }
+            Value::Require(bases) if self.load_scope == LoadScope::Modules => vec![Load {
                 specifier: arguments
                     .first()
                     .map_or_else(Value::runtime_value, |specifier| {
@@ -445,6 +521,26 @@ impl<'e> Evaluator<'e> {
         }
     }
 
+    fn spawn_loads(&self, context: &Context, kind: SpawnKind, arguments: &[Expr]) -> Vec<Load> {
+        let arguments = self.evaluate_all(context, arguments);
+        let launch = launch(kind, &arguments, &self.process_directory.borrow());
+
+        launch
+            .spawned
+            .into_iter()
+            .map(|spawned| match spawned {
+                Spawned::Script(script) => Load {
+                    specifier: script,
+                    base: LoadBase::Process(launch.directories.clone()),
+                },
+                Spawned::Program(name) => Load {
+                    specifier: Value::text(&name),
+                    base: LoadBase::Program(launch.directories.clone()),
+                },
+            })
+            .collect()
+    }
+
     fn may_load(&self, function: &FunctionRef) -> bool {
         if let Some(&may_load) = self.loaders.borrow().get(function) {
             return may_load;
@@ -456,7 +552,7 @@ impl<'e> Evaluator<'e> {
         let context = Context::top(&function.module);
         let may_load = self.summary(&function.module).is_some_and(|summary| {
             unit_effects(&summary, function.index).any(|effect| match &effect.action {
-                Action::Import(_) | Action::Worker(_) => true,
+                Action::Import(_) | Action::Worker(_) => self.load_scope == LoadScope::Modules,
                 Action::Call { callee, .. } => {
                     self.may_reach_a_loader(&context, callee)
                         && self.callee_may_load(self.evaluate_callee(&context, callee))
@@ -472,7 +568,8 @@ impl<'e> Evaluator<'e> {
 
     fn callee_may_load(&self, callee: Value) -> bool {
         match callee {
-            Value::Require(_) => true,
+            Value::Require(_) => self.load_scope == LoadScope::Modules,
+            Value::Builtin(Builtin::Spawn(_)) => self.load_scope == LoadScope::Processes,
             Value::Function(function) => {
                 self.is_analysed(&function.module) && self.may_load(&function)
             }
@@ -496,7 +593,7 @@ impl<'e> Evaluator<'e> {
             .strip_prefix("node:")
             .unwrap_or(imported_specifier);
 
-        if matches!(builtin_module, "path" | "path/posix" | "url" | "module") {
+        if LOADING_BUILTIN_MODULES.contains(&builtin_module) {
             return true;
         }
 
@@ -519,15 +616,22 @@ impl<'e> Evaluator<'e> {
             return Vec::new();
         }
 
+        if self.load_scope == LoadScope::Processes && !self.is_parametric_loader(function) {
+            return Vec::new();
+        }
+
         let Some(summary) = self.summary(&function.module) else {
             return Vec::new();
         };
 
         if context.frames.len() >= MAX_CALL_DEPTH {
-            return vec![Load {
-                specifier: Value::runtime_value(),
-                base: LoadBase::Module(function.module.clone()),
-            }];
+            return (self.load_scope == LoadScope::Modules)
+                .then(|| Load {
+                    specifier: Value::runtime_value(),
+                    base: LoadBase::Module(function.module.clone()),
+                })
+                .into_iter()
+                .collect();
         }
 
         let argument_values = arguments
@@ -751,17 +855,24 @@ impl<'e> Evaluator<'e> {
             Value::Builtin(Builtin::ModuleModule) => module_member(property),
             Value::Builtin(Builtin::FsModule) => fs_member(property),
             Value::Builtin(Builtin::GlobModule) => glob_member(property),
-            Value::Builtin(Builtin::Process) if property == "cwd" => {
-                Value::Builtin(Builtin::ProcessCwd)
+            Value::Builtin(Builtin::Process) => match property {
+                "cwd" => Value::Builtin(Builtin::ProcessCwd),
+                "execPath" | "argv0" => Value::text(NODE_EXECUTABLE),
+                _ => Value::runtime_value(),
+            },
+            Value::Builtin(Builtin::ChildProcessModule) => child_process_member(property),
+            Value::Builtin(Builtin::Spawn(kind)) if property == "sync" => {
+                Value::Builtin(Builtin::Spawn(kind))
             }
             Value::Builtin(Builtin::ObjectConstructor) => match property {
                 "keys" => Value::Builtin(Builtin::ObjectKeys),
                 "values" => Value::Builtin(Builtin::ObjectValues),
                 _ => Value::runtime_value(),
             },
-            Value::Require(bases) if property == "resolve" => {
+            Value::Require(bases) if matches!(property, "resolve" | "esmResolve") => {
                 Value::Builtin(Builtin::RequireResolve(bases))
             }
+            Value::Require(bases) if property == "import" => Value::Require(bases),
             Value::Module(module) => self.export(&module, property, 0),
             Value::Object(properties) => properties
                 .into_iter()
@@ -1028,6 +1139,15 @@ fn builtin_import(specifier: &str, name: &ImportedName) -> Option<Value> {
             Some(Value::Builtin(Builtin::GlobModule))
         }
         ("glob" | "fast-glob" | "tinyglobby" | "globby", Some(member)) => Some(glob_member(member)),
+        ("child_process", None) => Some(Value::Builtin(Builtin::ChildProcessModule)),
+        ("child_process", Some(member)) => Some(child_process_member(member)),
+        ("execa", None) | ("cross-spawn", _) => {
+            Some(Value::Builtin(Builtin::Spawn(SpawnKind::Command)))
+        }
+        ("execa", Some(member)) => Some(execa_member(member)),
+        ("jiti", None | Some("createJiti" | "default")) => {
+            Some(Value::Builtin(Builtin::CreateRequire))
+        }
         (
             "vitest/config" | "vitest" | "vite" | "vitest/node" | "@playwright/test" | "cypress",
             Some(member),
@@ -1096,6 +1216,29 @@ fn glob_member(member: &str) -> Value {
         | "stream" => Value::Builtin(Builtin::FileAccess(AccessKind::Glob)),
         _ => Value::runtime_value(),
     }
+}
+
+fn child_process_member(member: &str) -> Value {
+    let kind = match member {
+        "default" => return Value::Builtin(Builtin::ChildProcessModule),
+        "spawn" | "spawnSync" | "execFile" | "execFileSync" => SpawnKind::Command,
+        "exec" | "execSync" => SpawnKind::Shell,
+        "fork" => SpawnKind::Node,
+        _ => return Value::runtime_value(),
+    };
+
+    Value::Builtin(Builtin::Spawn(kind))
+}
+
+fn execa_member(member: &str) -> Value {
+    let kind = match member {
+        "execa" | "execaSync" | "default" => SpawnKind::Command,
+        "execaCommand" | "execaCommandSync" => SpawnKind::Shell,
+        "execaNode" => SpawnKind::Node,
+        _ => return Value::runtime_value(),
+    };
+
+    Value::Builtin(Builtin::Spawn(kind))
 }
 
 fn module_member(member: &str) -> Value {

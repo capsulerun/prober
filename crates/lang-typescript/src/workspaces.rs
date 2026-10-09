@@ -142,6 +142,25 @@ pub(crate) fn is_workspace_manifest(path: &RepoPath) -> bool {
     matches!(file_name(path), PACKAGE_MANIFEST | PNPM_WORKSPACE)
 }
 
+pub(crate) fn package_directory<'p>(
+    package_directories: &'p BTreeSet<String>,
+    path: &RepoPath,
+) -> &'p str {
+    let mut directory = parent_directory(path);
+
+    loop {
+        if let Some(package_directory) = package_directories.get(directory) {
+            return package_directory;
+        }
+
+        match directory.rsplit_once('/') {
+            Some((parent, _)) => directory = parent,
+            None if directory.is_empty() => return "",
+            None => directory = "",
+        }
+    }
+}
+
 pub(crate) fn parent_directory(path: &RepoPath) -> &str {
     path.as_str()
         .rsplit_once('/')

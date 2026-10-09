@@ -13,6 +13,8 @@ pub enum EdgeKind {
     Reads,
     Lists,
     Family,
+    Spawn,
+    Build,
 }
 
 impl EdgeKind {
@@ -24,7 +26,9 @@ impl EdgeKind {
             | EdgeKind::Asset
             | EdgeKind::Reads
             | EdgeKind::Lists
-            | EdgeKind::Family => true,
+            | EdgeKind::Family
+            | EdgeKind::Spawn
+            | EdgeKind::Build => true,
             EdgeKind::TypeOnly => false,
         }
     }
@@ -518,6 +522,8 @@ mod tests {
         assert!(EdgeKind::Reads.selects_tests());
         assert!(EdgeKind::Lists.selects_tests());
         assert!(EdgeKind::Family.selects_tests());
+        assert!(EdgeKind::Spawn.selects_tests());
+        assert!(EdgeKind::Build.selects_tests());
         assert!(!EdgeKind::TypeOnly.selects_tests());
     }
 
@@ -527,6 +533,8 @@ mod tests {
             assert!(EdgeKind::Import.follows(content));
             assert!(EdgeKind::Dynamic.follows(content));
             assert!(EdgeKind::Asset.follows(content));
+            assert!(EdgeKind::Spawn.follows(content));
+            assert!(EdgeKind::Build.follows(content));
         }
 
         assert!(!EdgeKind::Reads.follows(ContentChange::None));
@@ -537,6 +545,8 @@ mod tests {
         assert!(EdgeKind::Lists.follows(ContentChange::Direct));
         assert_eq!(EdgeKind::Lists.dependent_content(), ContentChange::Listed);
         assert_eq!(EdgeKind::Reads.dependent_content(), ContentChange::None);
+        assert_eq!(EdgeKind::Spawn.dependent_content(), ContentChange::None);
+        assert_eq!(EdgeKind::Build.dependent_content(), ContentChange::None);
     }
 
     #[test]

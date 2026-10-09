@@ -1,14 +1,16 @@
-//! The file system the resolver sees: the working tree, base revision contents of changed configs, and workspace packages linked under node_modules.
+//! The file system the resolver sees: the working tree, base revision contents of changed configs, workspace packages linked under node_modules, and build outputs mapped to their sources.
 
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use oxc_resolver::{FileMetadata, FileSystem, FileSystemOs, ResolveError};
 use serde_json::Value;
 
+use crate::build_mapping::BuildMapping;
 use crate::manifests::documents::parse_jsonc;
 use crate::resolver::package_name;
 
@@ -18,12 +20,15 @@ pub(crate) struct RepoFileSystem {
     links: HashMap<PathBuf, PathBuf>,
     link_directories: HashSet<PathBuf>,
     links_root: PathBuf,
+    repo_root: PathBuf,
+    build_mapping: Option<Arc<BuildMapping>>,
 }
 
 enum Entry<'f> {
     Overlay(Option<&'f [u8]>),
     Link(&'f Path),
     LinkDirectory,
+    BuildOutput,
     Disk(Cow<'f, Path>),
 }
 
@@ -31,7 +36,15 @@ impl RepoFileSystem {
     pub fn at(repo_root: &Path) -> Self {
         Self {
             links_root: repo_root.join("node_modules"),
+            repo_root: repo_root.to_path_buf(),
             ..Self::default()
+        }
+    }
+
+    pub fn with_build_mapping(self, build_mapping: Option<Arc<BuildMapping>>) -> Self {
+        Self {
+            build_mapping,
+            ..self
         }
     }
 
@@ -82,7 +95,22 @@ impl RepoFileSystem {
             return Entry::LinkDirectory;
         }
 
+        if self.is_build_output(&path) {
+            return Entry::BuildOutput;
+        }
+
         Entry::Disk(path)
+    }
+
+    fn is_build_output(&self, path: &Path) -> bool {
+        let Some(build_mapping) = &self.build_mapping else {
+            return false;
+        };
+
+        path.strip_prefix(&self.repo_root)
+            .ok()
+            .and_then(Path::to_str)
+            .is_some_and(|relative_path| build_mapping.is_output(relative_path))
     }
 
     fn overlay_content(&self, path: &Path) -> Option<Option<&[u8]>> {
@@ -214,6 +242,7 @@ impl FileSystem for RepoFileSystem {
         let bytes = match self.entry(path) {
             Entry::Overlay(Some(content)) => content.to_vec(),
             Entry::Overlay(None) => return Err(not_found()),
+            Entry::BuildOutput => Vec::new(),
             Entry::Link(_) | Entry::LinkDirectory => return Err(directory_read()),
             Entry::Disk(path) => fs::read(path)?,
         };
@@ -231,7 +260,9 @@ impl FileSystem for RepoFileSystem {
 
     fn metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         match self.entry(path) {
-            Entry::Overlay(Some(_)) => Ok(FileMetadata::new(true, false, false)),
+            Entry::Overlay(Some(_)) | Entry::BuildOutput => {
+                Ok(FileMetadata::new(true, false, false))
+            }
             Entry::Overlay(None) => Err(not_found()),
             Entry::Link(target) => FileSystemOs::metadata(target),
             Entry::LinkDirectory => Ok(FileMetadata::new(false, true, false)),
@@ -241,7 +272,9 @@ impl FileSystem for RepoFileSystem {
 
     fn symlink_metadata(&self, path: &Path) -> io::Result<FileMetadata> {
         match self.entry(path) {
-            Entry::Overlay(Some(_)) => Ok(FileMetadata::new(true, false, false)),
+            Entry::Overlay(Some(_)) | Entry::BuildOutput => {
+                Ok(FileMetadata::new(true, false, false))
+            }
             Entry::Overlay(None) => Err(not_found()),
             Entry::Link(_) => Ok(FileMetadata::new(false, false, true)),
             Entry::LinkDirectory => Ok(FileMetadata::new(false, true, false)),
@@ -253,7 +286,7 @@ impl FileSystem for RepoFileSystem {
         match self.entry(path) {
             Entry::Link(target) => Ok(target.to_path_buf()),
             Entry::Disk(path) => FileSystemOs::read_link(&path),
-            Entry::Overlay(_) | Entry::LinkDirectory => {
+            Entry::Overlay(_) | Entry::LinkDirectory | Entry::BuildOutput => {
                 Err(io::Error::from(io::ErrorKind::InvalidInput).into())
             }
         }
@@ -263,7 +296,7 @@ impl FileSystem for RepoFileSystem {
         match self.entry(path) {
             Entry::Link(target) => fs::canonicalize(target),
             Entry::Disk(path) => fs::canonicalize(path),
-            Entry::Overlay(Some(_)) | Entry::LinkDirectory => {
+            Entry::Overlay(Some(_)) | Entry::LinkDirectory | Entry::BuildOutput => {
                 fs::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
             }
             Entry::Overlay(None) => Err(not_found()),

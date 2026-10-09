@@ -531,12 +531,30 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             ..
         } => format!("-> paired by name with {dependent}"),
         Link::Edge {
-            kind: kind @ (EdgeKind::Reads | EdgeKind::Lists | EdgeKind::Dynamic),
+            kind: EdgeKind::Build,
+            dependency,
+        } => {
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind: EdgeKind::Build,
+            };
+
+            match graph.inference(&edge) {
+                Some(inference) => {
+                    format!("-> built into {dependent} ({})", inference.description())
+                }
+                None => format!("-> built into {dependent}"),
+            }
+        }
+        Link::Edge {
+            kind: kind @ (EdgeKind::Reads | EdgeKind::Lists | EdgeKind::Dynamic | EdgeKind::Spawn),
             dependency,
         } => {
             let verb = match kind {
                 EdgeKind::Reads => "read",
                 EdgeKind::Lists => "listed",
+                EdgeKind::Spawn => "spawned",
                 _ => "loaded",
             };
             let edge = Edge {
@@ -836,6 +854,69 @@ mod tests {
             serde_json::json!([
                 "extensions/a/index.ts (modified)",
                 "-> paired by name with extensions/a/index.e2e.test.ts",
+            ])
+        );
+    }
+
+    #[test]
+    fn spawn_and_build_hops_name_the_process_launch_and_the_build_output() {
+        let mut builder = GraphBuilder::default();
+        let cli_test = builder.add_test_file(repo_path("test/cli.e2e.test.ts"), "typescript");
+        let launcher = builder.add_file(repo_path("bin/cli.mjs"));
+        let output = builder.add_file(repo_path("dist/entry.js"));
+        let entry = builder.add_file(repo_path("src/entry.ts"));
+
+        builder.add_inferred_edge(
+            Edge {
+                dependent: cli_test,
+                dependency: launcher,
+                kind: EdgeKind::Spawn,
+            },
+            Inference {
+                line: 12,
+                kind: "spawn",
+                pattern: "bin/cli.mjs".to_owned(),
+                detail: None,
+            },
+        );
+        builder.add_inferred_edge(
+            Edge {
+                dependent: launcher,
+                dependency: output,
+                kind: EdgeKind::Dynamic,
+            },
+            Inference {
+                line: 3,
+                kind: "path",
+                pattern: "dist/entry.js".to_owned(),
+                detail: None,
+            },
+        );
+        builder.add_inferred_edge(
+            Edge {
+                dependent: output,
+                dependency: entry,
+                kind: EdgeKind::Build,
+            },
+            Inference {
+                line: 0,
+                kind: "build mapping",
+                pattern: "dist/ <- src/".to_owned(),
+                detail: Some("tsconfig.json".to_owned()),
+            },
+        );
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("src/entry.ts")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["test/cli.e2e.test.ts"],
+            serde_json::json!([
+                "src/entry.ts (modified)",
+                "-> built into dist/entry.js (inferred build mapping dist/ <- src/ (tsconfig.json))",
+                "-> loaded by bin/cli.mjs:3 (inferred path dist/entry.js)",
+                "-> spawned by test/cli.e2e.test.ts:12 (inferred spawn bin/cli.mjs)",
             ])
         );
     }

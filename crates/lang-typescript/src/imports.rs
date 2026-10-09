@@ -25,6 +25,8 @@ const MODULE_LOADING_METHODS: [(&str, &str); 8] = [
 
 const WORKER_CONSTRUCTORS: [&str; 2] = ["Worker", "SharedWorker"];
 
+const LOADER_MODULES: [&str; 1] = ["jiti"];
+
 const MOCKING_METHODS: [(&str, &str); 4] = [
     ("vi", "mock"),
     ("vi", "doMock"),
@@ -55,6 +57,14 @@ const FILE_ACCESS_MODULES: [&str; 10] = [
     "fast-glob",
     "tinyglobby",
     "globby",
+];
+
+const SPAWN_MODULES: [&str; 5] = [
+    "child_process",
+    "node:child_process",
+    "execa",
+    "cross-spawn",
+    "nano-spawn",
 ];
 
 const MAX_PATH_LITERAL_LENGTH: usize = 255;
@@ -91,6 +101,7 @@ pub struct ParsedImports {
     pub import_requests: Vec<ImportRequest>,
     pub has_dynamic_sites: bool,
     pub has_file_accesses: bool,
+    pub has_spawn_sites: bool,
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
     pub path_literals: Vec<PathLiteral>,
@@ -165,6 +176,14 @@ impl ImportCollector<'_> {
     fn record(&mut self, specifier: &str, kind: EdgeKind) {
         if FILE_ACCESS_MODULES.contains(&specifier) {
             self.parsed_imports.has_file_accesses = true;
+        }
+
+        if kind == EdgeKind::Import && SPAWN_MODULES.contains(&specifier) {
+            self.parsed_imports.has_spawn_sites = true;
+        }
+
+        if kind == EdgeKind::Import && LOADER_MODULES.contains(&specifier) {
+            self.parsed_imports.has_dynamic_sites = true;
         }
 
         self.parsed_imports.import_requests.push(ImportRequest {
@@ -598,12 +617,15 @@ mod tests {
             "const load = createRequire(import.meta.url);",
             "const load = module.createRequire(root);",
             "new Worker(new URL(\"./a.worker.ts\", import.meta.url));",
+            "import { createJiti } from \"jiti\";",
         ];
         let static_sources = [
             "await import(\"./plugins/telegram.js\");",
             "require(\"./config.json\");",
             "require.resolve(modulePath);",
             "new Map(entries);",
+            "import type { JitiOptions } from \"jiti\";",
+            "const loader = createJiti(source);",
         ];
 
         for dynamic_source in dynamic_sources {
@@ -613,6 +635,22 @@ mod tests {
         for static_source in static_sources {
             assert!(!has_dynamic_sites(static_source), "{static_source}");
         }
+    }
+
+    #[test]
+    fn runtime_imports_of_process_modules_are_spawn_sites() {
+        let has_spawn_sites = |source_text: &str| {
+            parse_imports(&RepoPath::new("test/a.test.ts").unwrap(), source_text).has_spawn_sites
+        };
+
+        assert!(has_spawn_sites(
+            "import { spawnSync } from \"node:child_process\";"
+        ));
+        assert!(has_spawn_sites("const { execa } = require(\"execa\");"));
+        assert!(!has_spawn_sites(
+            "import type { ChildProcess } from \"node:child_process\";"
+        ));
+        assert!(!has_spawn_sites("import { readFile } from \"node:fs\";"));
     }
 
     #[test]
