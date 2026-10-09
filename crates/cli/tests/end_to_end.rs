@@ -827,7 +827,7 @@ fn config_links_ignores_and_smoke_tests_shape_the_selection() {
         json!({
             "test/output.e2e.test.ts": [
                 "fixtures/golden/expected.txt (modified)",
-                "-> linked to test/output.e2e.test.ts by prober.toml:1",
+                "-> linked to test/output.e2e.test.ts by rule link (prober.toml:1): fixtures/golden/**",
             ],
             "src/b.test.ts": ["always run by prober.toml:5 (\"src/b.test.ts\")"],
         })
@@ -846,7 +846,7 @@ fn why_explains_a_selected_test_and_the_rule_leaving_another_out() {
 
     assert_eq!(
         why("test/output.e2e.test.ts").stdout,
-        "test/output.e2e.test.ts is selected:\n  fixtures/golden/expected.txt (modified)\n  -> linked to test/output.e2e.test.ts by prober.toml:1\n"
+        "test/output.e2e.test.ts is selected:\n  fixtures/golden/expected.txt (modified)\n  -> linked to test/output.e2e.test.ts by rule link (prober.toml:1): fixtures/golden/**\n"
     );
     assert_eq!(
         why("./src/b.test.ts").stdout,
@@ -854,7 +854,7 @@ fn why_explains_a_selected_test_and_the_rule_leaving_another_out() {
     );
     assert_eq!(
         why("src/data.test.ts").stdout,
-        "src/data.test.ts is not selected: every path goes through what prober.toml:8 ignores:\n  fixtures/data.json (modified)\n  -> read by src/data.test.ts:2 (inferred file path ../fixtures/data.json)\n"
+        "src/data.test.ts is not selected: every path goes through what prober.toml:8 ignores:\n  fixtures/data.json (modified)\n  -> read by src/data.test.ts:2 (inferred file path ../fixtures/data.json), ignored by prober.toml:8\n"
     );
     assert_eq!(
         why("src/a.test.ts").stdout,
@@ -929,6 +929,7 @@ fn scan_suggests_declaring_what_a_loader_loads_and_the_link_stops_its_widening()
             "rule": "[[link]] from \"extensions/*/index.ts\" to \"src/loader.ts\"",
             "links": 1,
             "sites": 1,
+            "unlinked": [],
         }])
     );
 }

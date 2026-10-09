@@ -2,6 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use crate::files::{FileId, FileTable, RepoPath};
+use crate::patterns::Captures;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EdgeKind {
@@ -164,6 +165,46 @@ pub struct IgnoredEdge {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuleLink {
+    pub line: usize,
+    pub pattern: String,
+    pub captures: Captures,
+    pub from: Vec<FileId>,
+    pub to: Vec<FileId>,
+}
+
+impl RuleLink {
+    fn link_count(&self, from: impl Fn(FileId) -> bool, to: impl Fn(FileId) -> bool) -> usize {
+        let from_files: HashSet<FileId> = self
+            .from
+            .iter()
+            .copied()
+            .filter(|&file| from(file))
+            .collect();
+        let to_files: Vec<FileId> = self.to.iter().copied().filter(|&file| to(file)).collect();
+        let self_links = to_files
+            .iter()
+            .filter(|file| from_files.contains(file))
+            .count();
+
+        from_files.len() * to_files.len() - self_links
+    }
+}
+
+#[derive(Debug)]
+struct RuleIgnore {
+    line: usize,
+    from: HashSet<FileId>,
+    to: HashSet<FileId>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct IgnoredLinks {
+    pub links: usize,
+    pub imports: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RootScope {
     pub directory: String,
     pub configs: Vec<RepoPath>,
@@ -207,6 +248,8 @@ pub struct GraphBuilder {
     ignored_edges: Vec<IgnoredEdge>,
     set_aside_sites: Vec<SetAsideSite>,
     root_scopes: Vec<RootScope>,
+    rule_links: Vec<RuleLink>,
+    rule_ignores: Vec<RuleIgnore>,
 }
 
 impl GraphBuilder {
@@ -280,6 +323,19 @@ impl GraphBuilder {
         self.root_scopes.push(root_scope);
     }
 
+    pub fn add_rule_link(&mut self, mut rule_link: RuleLink) -> usize {
+        rule_link.from.sort();
+        rule_link.from.dedup();
+        rule_link.to.sort();
+        rule_link.to.dedup();
+
+        let links = rule_link.link_count(|_| true, |_| true);
+
+        self.rule_links.push(rule_link);
+
+        links
+    }
+
     pub(crate) fn files(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
         self.files.iter()
     }
@@ -288,23 +344,44 @@ impl GraphBuilder {
         self.test_languages.contains_key(&file)
     }
 
-    pub(crate) fn ignore_edges(&mut self, line: usize, ignores: impl Fn(&Edge) -> bool) -> usize {
+    pub(crate) fn ignore_links(
+        &mut self,
+        line: usize,
+        from: HashSet<FileId>,
+        to: HashSet<FileId>,
+    ) -> IgnoredLinks {
         let inferences = &self.inferences;
-        let is_ignorable = |edge: &Edge| {
-            matches!(edge.kind, EdgeKind::Family | EdgeKind::Contains)
-                || edge.kind != EdgeKind::Rule
-                    && inferences.contains_key(&(edge.dependent, edge.dependency, edge.kind))
+        let is_import = |edge: &Edge| {
+            matches!(
+                edge.kind,
+                EdgeKind::Import | EdgeKind::Dynamic | EdgeKind::Asset
+            ) && !inferences.contains_key(&(edge.dependent, edge.dependency, edge.kind))
         };
         let (ignored, kept): (Vec<Edge>, Vec<Edge>) = std::mem::take(&mut self.edges)
             .into_iter()
-            .partition(|edge| is_ignorable(edge) && ignores(edge));
-        let ignored_count = ignored.len();
+            .partition(|edge| to.contains(&edge.dependent) && from.contains(&edge.dependency));
+        let imports = ignored.iter().filter(|edge| is_import(edge)).count();
+        let rule_links: usize = self
+            .rule_links
+            .iter()
+            .map(|rule_link| {
+                rule_link.link_count(|file| from.contains(&file), |file| to.contains(&file))
+            })
+            .sum();
+        let ignored_links = IgnoredLinks {
+            links: ignored.len() + rule_links,
+            imports,
+        };
 
         self.edges = kept;
         self.ignored_edges
             .extend(ignored.into_iter().map(|edge| IgnoredEdge { edge, line }));
 
-        ignored_count
+        if rule_links > 0 {
+            self.rule_ignores.push(RuleIgnore { line, from, to });
+        }
+
+        ignored_links
     }
 
     pub(crate) fn set_aside_sites(
@@ -392,6 +469,25 @@ impl GraphBuilder {
             mocked_modules.dedup();
         }
 
+        let mut rule_links_by_dependency: HashMap<FileId, Vec<usize>> = HashMap::new();
+        let mut rule_links_by_dependent: HashMap<FileId, Vec<usize>> = HashMap::new();
+
+        for (rule_index, rule_link) in self.rule_links.iter().enumerate() {
+            for &file in &rule_link.from {
+                rule_links_by_dependency
+                    .entry(file)
+                    .or_default()
+                    .push(rule_index);
+            }
+
+            for &file in &rule_link.to {
+                rule_links_by_dependent
+                    .entry(file)
+                    .or_default()
+                    .push(rule_index);
+            }
+        }
+
         Graph {
             files: self.files,
             test_languages: self.test_languages,
@@ -407,6 +503,10 @@ impl GraphBuilder {
             ignored_dependents,
             set_aside_sites: self.set_aside_sites,
             root_scopes: self.root_scopes,
+            rule_links: self.rule_links,
+            rule_links_by_dependency,
+            rule_links_by_dependent,
+            rule_ignores: self.rule_ignores,
         }
     }
 }
@@ -427,6 +527,10 @@ pub struct Graph {
     ignored_dependents: HashMap<FileId, Vec<IgnoredEdge>>,
     set_aside_sites: Vec<SetAsideSite>,
     root_scopes: Vec<RootScope>,
+    rule_links: Vec<RuleLink>,
+    rule_links_by_dependency: HashMap<FileId, Vec<usize>>,
+    rule_links_by_dependent: HashMap<FileId, Vec<usize>>,
+    rule_ignores: Vec<RuleIgnore>,
 }
 
 impl Graph {
@@ -458,12 +562,73 @@ impl Graph {
         test_files
     }
 
-    pub fn dependents(&self, file: FileId) -> &[Edge] {
-        &self.dependents_by_file[file.index()]
+    pub fn dependents(&self, file: FileId) -> impl Iterator<Item = Edge> + '_ {
+        let rule_edges = self
+            .rule_dependents(file)
+            .filter(|edge| self.rule_ignore_line(edge).is_none());
+
+        self.dependents_by_file[file.index()]
+            .iter()
+            .copied()
+            .chain(rule_edges)
     }
 
-    pub fn dependencies(&self, file: FileId) -> &[Edge] {
-        &self.dependencies_by_file[file.index()]
+    pub fn dependencies(&self, file: FileId) -> impl Iterator<Item = Edge> + '_ {
+        let rule_edges = self
+            .rule_dependencies(file)
+            .filter(|edge| self.rule_ignore_line(edge).is_none());
+
+        self.dependencies_by_file[file.index()]
+            .iter()
+            .copied()
+            .chain(rule_edges)
+    }
+
+    pub fn rule_link(&self, edge: &Edge) -> Option<&RuleLink> {
+        if edge.kind != EdgeKind::Rule {
+            return None;
+        }
+
+        rule_links_at(
+            &self.rule_links,
+            &self.rule_links_by_dependency,
+            edge.dependency,
+        )
+        .find(|rule_link| rule_link.to.binary_search(&edge.dependent).is_ok())
+    }
+
+    fn rule_dependents(&self, file: FileId) -> impl Iterator<Item = Edge> + '_ {
+        rule_links_at(&self.rule_links, &self.rule_links_by_dependency, file)
+            .flat_map(move |rule_link| {
+                rule_link.to.iter().map(move |&dependent| Edge {
+                    dependent,
+                    dependency: file,
+                    kind: EdgeKind::Rule,
+                })
+            })
+            .filter(move |edge| edge.dependent != file)
+    }
+
+    fn rule_dependencies(&self, file: FileId) -> impl Iterator<Item = Edge> + '_ {
+        rule_links_at(&self.rule_links, &self.rule_links_by_dependent, file)
+            .flat_map(move |rule_link| {
+                rule_link.from.iter().map(move |&dependency| Edge {
+                    dependent: file,
+                    dependency,
+                    kind: EdgeKind::Rule,
+                })
+            })
+            .filter(move |edge| edge.dependency != file)
+    }
+
+    fn rule_ignore_line(&self, edge: &Edge) -> Option<usize> {
+        self.rule_ignores
+            .iter()
+            .find(|rule_ignore| {
+                rule_ignore.from.contains(&edge.dependency)
+                    && rule_ignore.to.contains(&edge.dependent)
+            })
+            .map(|rule_ignore| rule_ignore.line)
     }
 
     pub fn inference(&self, edge: &Edge) -> Option<&Inference> {
@@ -499,15 +664,22 @@ impl Graph {
         &self.unresolved_sites
     }
 
-    pub fn ignored_dependents(&self, file: FileId) -> &[IgnoredEdge] {
+    pub fn ignored_dependents(&self, file: FileId) -> impl Iterator<Item = IgnoredEdge> + '_ {
+        let ignored_rule_edges = self.rule_dependents(file).filter_map(|edge| {
+            self.rule_ignore_line(&edge)
+                .map(|line| IgnoredEdge { edge, line })
+        });
+
         self.ignored_dependents
             .get(&file)
-            .map_or(&[], Vec::as_slice)
+            .into_iter()
+            .flatten()
+            .copied()
+            .chain(ignored_rule_edges)
     }
 
-    pub fn ignored_edge(&self, edge: &Edge) -> Option<&IgnoredEdge> {
+    pub fn ignored_edge(&self, edge: &Edge) -> Option<IgnoredEdge> {
         self.ignored_dependents(edge.dependency)
-            .iter()
             .find(|ignored_edge| ignored_edge.edge == *edge)
     }
 
@@ -536,10 +708,22 @@ impl Graph {
     }
 
     pub fn is_asset(&self, file: FileId) -> bool {
-        let dependents = self.dependents(file);
+        let mut dependents = self.dependents(file).peekable();
 
-        !dependents.is_empty() && dependents.iter().all(|edge| edge.kind == EdgeKind::Asset)
+        dependents.peek().is_some() && dependents.all(|edge| edge.kind == EdgeKind::Asset)
     }
+}
+
+fn rule_links_at<'g>(
+    rule_links: &'g [RuleLink],
+    rule_links_by_file: &'g HashMap<FileId, Vec<usize>>,
+    file: FileId,
+) -> impl Iterator<Item = &'g RuleLink> {
+    rule_links_by_file
+        .get(&file)
+        .into_iter()
+        .flatten()
+        .map(|&rule_index| &rule_links[rule_index])
 }
 
 #[cfg(test)]
@@ -555,7 +739,6 @@ mod tests {
 
         graph
             .dependents(dependency_file)
-            .iter()
             .map(|edge| (graph.path(edge.dependent).as_str().to_owned(), edge.kind))
             .collect()
     }
@@ -740,16 +923,74 @@ mod tests {
         assert_eq!(graph.inference(&dynamic_edge), Some(&inference_at(4)));
         assert_eq!(graph.inference(&read_edge), None);
         assert_eq!(
-            graph.dependencies(loader),
-            [Edge {
-                dependent: loader,
-                dependency: plugin,
-                kind: EdgeKind::Dynamic,
-            }]
+            graph.dependencies(loader).collect::<Vec<_>>(),
+            [dynamic_edge]
         );
         assert_eq!(
             graph.inferred_edges().collect::<Vec<_>>(),
-            [(graph.dependencies(loader)[0], &inference_at(4))]
+            [(dynamic_edge, &inference_at(4))]
+        );
+    }
+
+    #[test]
+    fn rule_links_expand_into_edges_from_every_file_to_every_target_when_visited() {
+        let mut builder = GraphBuilder::default();
+        let sources: Vec<FileId> = ["crates/lang-a/src/lib.rs", "crates/lang-a/src/parse.rs"]
+            .into_iter()
+            .map(|path| builder.add_file(repo_path(path)))
+            .collect();
+        let targets: Vec<FileId> = ["project-a-test/a.test.ts", "project-a-test/b.test.ts"]
+            .into_iter()
+            .map(|path| builder.add_test_file(repo_path(path), "typescript"))
+            .collect();
+        let links = builder.add_rule_link(RuleLink {
+            line: 3,
+            pattern: "crates/lang-{lang}/**".to_owned(),
+            captures: vec![("lang".to_owned(), "a".to_owned())],
+            from: sources.clone(),
+            to: targets.clone(),
+        });
+        let ignored =
+            builder.ignore_links(9, HashSet::from([sources[1]]), HashSet::from([targets[1]]));
+        let graph = builder.build();
+        let ignored_edge = Edge {
+            dependent: targets[1],
+            dependency: sources[1],
+            kind: EdgeKind::Rule,
+        };
+
+        assert_eq!(links, 4);
+        assert_eq!(ignored.links, 1);
+        assert_eq!(
+            dependent_paths(&graph, "crates/lang-a/src/lib.rs"),
+            [
+                ("project-a-test/a.test.ts".to_owned(), EdgeKind::Rule),
+                ("project-a-test/b.test.ts".to_owned(), EdgeKind::Rule),
+            ]
+        );
+        assert_eq!(
+            dependent_paths(&graph, "crates/lang-a/src/parse.rs"),
+            [("project-a-test/a.test.ts".to_owned(), EdgeKind::Rule)]
+        );
+        assert_eq!(
+            graph
+                .dependencies(targets[1])
+                .map(|edge| graph.path(edge.dependency).as_str())
+                .collect::<Vec<_>>(),
+            ["crates/lang-a/src/lib.rs"]
+        );
+        assert_eq!(
+            graph.ignored_edge(&ignored_edge),
+            Some(IgnoredEdge {
+                edge: ignored_edge,
+                line: 9
+            })
+        );
+        assert_eq!(
+            graph
+                .rule_link(&ignored_edge)
+                .map(|rule_link| rule_link.line),
+            Some(3)
         );
     }
 

@@ -15,11 +15,10 @@ fn loaded_by(graph: &Graph, dependency: &str) -> Vec<(String, String)> {
 
     graph
         .dependents(dependency_file)
-        .iter()
         .filter(|edge| edge.kind == EdgeKind::Dynamic)
         .map(|edge| {
             let inference = graph
-                .inference(edge)
+                .inference(&edge)
                 .expect("dynamic edges carry their inference");
 
             (
@@ -704,7 +703,7 @@ fn disabled_inference_leaves_every_dynamic_load_unresolved() {
     assert_eq!(
         graph
             .dependents(graph.file_id(&repo_path("src/helper.ts")).unwrap())
-            .len(),
+            .count(),
         1
     );
 }

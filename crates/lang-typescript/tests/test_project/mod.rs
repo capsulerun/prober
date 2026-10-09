@@ -205,7 +205,6 @@ pub fn dependents<'g>(graph: &'g Graph, dependency: &str) -> Vec<(&'g str, EdgeK
 
     graph
         .dependents(dependency_file)
-        .iter()
         .map(|edge| (graph.path(edge.dependent).as_str(), edge.kind))
         .collect()
 }

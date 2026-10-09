@@ -44,7 +44,7 @@ fn is_unhandled(graph: Option<&Graph>, path: &RepoPath) -> bool {
     !graph.is_module(path)
         && graph
             .file_id(path)
-            .is_none_or(|file| !graph.is_test(file) && graph.dependents(file).is_empty())
+            .is_none_or(|file| !graph.is_test(file) && graph.dependents(file).next().is_none())
 }
 
 #[cfg(test)]

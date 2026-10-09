@@ -88,6 +88,15 @@ impl PathPattern {
     }
 }
 
+pub fn describe_captures(captures: &Captures) -> String {
+    let bindings: Vec<String> = captures
+        .iter()
+        .map(|(name, value)| format!("{name}={value}"))
+        .collect();
+
+    bindings.join(", ")
+}
+
 fn capture_names(text: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut rest = text;

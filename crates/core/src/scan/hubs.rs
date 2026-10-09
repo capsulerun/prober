@@ -37,7 +37,6 @@ pub(crate) fn hubs_and_smoke_set(
             let file = graph.file_id(path).filter(|&file| !graph.is_test(file))?;
             let direct_dependents = graph
                 .dependents(file)
-                .iter()
                 .filter(|edge| edge.kind.selects_tests())
                 .count();
 

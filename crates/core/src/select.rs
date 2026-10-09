@@ -80,17 +80,14 @@ impl<'g> Traversal<'g> {
     }
 
     fn dependents(self, file: FileId) -> impl Iterator<Item = Edge> + 'g {
-        let ignored = if self.is_relaxed(Relaxation::Ignores) {
-            self.graph.ignored_dependents(file)
-        } else {
-            &[]
-        };
+        let ignored = self
+            .is_relaxed(Relaxation::Ignores)
+            .then(|| self.graph.ignored_dependents(file))
+            .into_iter()
+            .flatten()
+            .map(|ignored_edge| ignored_edge.edge);
 
-        self.graph
-            .dependents(file)
-            .iter()
-            .copied()
-            .chain(ignored.iter().map(|ignored_edge| ignored_edge.edge))
+        self.graph.dependents(file).chain(ignored)
     }
 
     fn widening_sites(self) -> impl Iterator<Item = (Link, &'g UnresolvedSite)> {
@@ -238,7 +235,6 @@ fn reason_past_mocks(
     while let Some(file) = files_to_visit.pop_front() {
         let test_selecting_edges = graph
             .dependencies(file)
-            .iter()
             .filter(|edge| traversal.follows(edge.kind, ContentChange::Direct));
 
         for edge in test_selecting_edges {

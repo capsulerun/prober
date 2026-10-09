@@ -8,7 +8,7 @@ use std::fmt::Write;
 use serde::Serialize;
 
 use crate::files::{FileId, RepoPath};
-use crate::graph::{ContentChange, EdgeKind, Graph, RootScope, UnresolvedCause};
+use crate::graph::{ContentChange, Graph, RootScope, UnresolvedCause};
 use crate::ratios::format_percentage;
 use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
 
@@ -18,6 +18,8 @@ pub use crate::scan::suggestions::Suggestion;
 const SCHEMA_VERSION: u32 = 1;
 
 const LISTED_ROWS: usize = 20;
+
+const UNLINKED_SHOWN: usize = 5;
 
 const REPOSITORY_ROOT: &str = "(root)";
 
@@ -226,6 +228,7 @@ impl ScanReport {
                         rule: &rule_effect.rule,
                         links: rule_effect.links,
                         sites: rule_effect.sites,
+                        unlinked: &rule_effect.unlinked,
                     })
                     .collect(),
                 warnings: self
@@ -367,6 +370,27 @@ impl ScanReport {
                 "  prober.toml:{}  {}: {} links, {} unresolved sites",
                 rule_effect.line, rule_effect.rule, rule_effect.links, rule_effect.sites
             );
+
+            if !rule_effect.unlinked.is_empty() {
+                let shown: Vec<&str> = rule_effect
+                    .unlinked
+                    .iter()
+                    .take(UNLINKED_SHOWN)
+                    .map(String::as_str)
+                    .collect();
+                let more = rule_effect.unlinked.len().saturating_sub(UNLINKED_SHOWN);
+                let more = if more > 0 {
+                    format!(" and {more} more")
+                } else {
+                    String::new()
+                };
+
+                let _ = writeln!(
+                    text,
+                    "    targets match no file for {}{more}",
+                    shown.join("; ")
+                );
+            }
         }
 
         for warning in &self.config_warnings {
@@ -499,10 +523,6 @@ fn inferred_sites(graph: &Graph) -> (Vec<InferredSite>, BTreeMap<&'static str, u
     let mut links_by_kind: BTreeMap<&'static str, usize> = BTreeMap::new();
 
     for (inferred_edge, inference) in graph.inferred_edges() {
-        if inferred_edge.kind == EdgeKind::Rule {
-            continue;
-        }
-
         let site = (graph.path(inferred_edge.dependent), inference.line);
         let (patterns, links) = patterns_by_site.entry(site).or_default();
 
@@ -759,6 +779,7 @@ struct JsonRuleEffect<'a> {
     rule: &'a str,
     links: usize,
     sites: usize,
+    unlinked: &'a [String],
 }
 
 #[derive(Serialize)]
