@@ -22,6 +22,7 @@ prober-core.workspace = true
 rayon.workspace = true
 regex.workspace = true
 serde_json.workspace = true
+xxhash-rust.workspace = true
 yaml-rust2.workspace = true
 
 [dev-dependencies]

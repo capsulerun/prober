@@ -1,3 +1,4 @@
+mod cycles;
 mod hubs;
 mod suggestions;
 
@@ -11,7 +12,9 @@ use crate::files::{FileId, RepoPath};
 use crate::graph::{ContentChange, Graph, RootScope, UnresolvedCause};
 use crate::ratios::format_percentage;
 use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
+use crate::symbols::FallbackCause;
 
+pub use crate::scan::cycles::{CycleSize, ImportCycle, SymbolCycles, SymbolSummary};
 pub use crate::scan::hubs::{HubFile, SmokeSet};
 pub use crate::scan::suggestions::Suggestion;
 
@@ -22,6 +25,10 @@ const LISTED_ROWS: usize = 20;
 const UNLINKED_SHOWN: usize = 5;
 
 const REPOSITORY_ROOT: &str = "(root)";
+
+const CYCLE_DIRECTORY_DEPTH: usize = 2;
+
+const CYCLE_DIRECTORIES_SHOWN: usize = 4;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 pub struct InferredPattern {
@@ -62,6 +69,8 @@ pub struct ScanReport {
     pub root_scopes: Vec<RootScope>,
     pub hub_files: Vec<HubFile>,
     pub smoke_set: SmokeSet,
+    pub symbol_summary: SymbolSummary,
+    pub import_cycles: Vec<ImportCycle>,
     pub suggestions: Vec<Suggestion>,
     pub rule_effects: Vec<RuleEffect>,
     pub config_warnings: Vec<ConfigWarning>,
@@ -95,6 +104,8 @@ impl ScanReport {
             root_scopes: graph.root_scopes().to_vec(),
             hub_files,
             smoke_set,
+            symbol_summary: cycles::symbol_summary(graph),
+            import_cycles: cycles::import_cycles(graph, repo_files),
             suggestions,
             rule_effects: Vec::new(),
             config_warnings: Vec::new(),
@@ -121,6 +132,13 @@ impl ScanReport {
         self.unreachable_modules.len() + self.unreachable_other_files.len()
     }
 
+    pub fn modules_in_import_cycles(&self) -> usize {
+        self.import_cycles
+            .iter()
+            .map(|import_cycle| import_cycle.modules.len())
+            .sum()
+    }
+
     pub fn to_text(&self) -> String {
         let mut text = String::new();
 
@@ -135,6 +153,10 @@ impl ScanReport {
         self.write_root_scopes(&mut text);
         text.push('\n');
         self.write_hub_files(&mut text);
+        text.push('\n');
+        self.write_symbols(&mut text);
+        text.push('\n');
+        self.write_import_cycles(&mut text);
         text.push('\n');
         self.write_suggestions(&mut text);
 
@@ -211,6 +233,35 @@ impl ScanReport {
                 tests: self.smoke_set.tests.iter().map(RepoPath::as_str).collect(),
                 covered_hub_files: self.smoke_set.covered_hub_files,
             },
+            symbols: JsonSymbols {
+                symbols: self.symbol_summary.symbols,
+                modules: self.symbol_summary.modules,
+                file_level: json_file_level(&self.symbol_summary.file_level),
+                whole_module_uses: self
+                    .symbol_summary
+                    .whole_module_uses
+                    .iter()
+                    .map(|(cause, uses)| (cause.key(), *uses))
+                    .collect(),
+            },
+            cycles: self
+                .import_cycles
+                .iter()
+                .map(|import_cycle| JsonImportCycle {
+                    modules: import_cycle.modules.iter().map(RepoPath::as_str).collect(),
+                    tests: import_cycle.tests,
+                    symbols: import_cycle
+                        .symbols
+                        .as_ref()
+                        .map(|symbol_cycles| JsonSymbolCycles {
+                            symbols: symbol_cycles.symbols,
+                            cycle: symbol_cycles.cycle.map(JsonCycleSize::from),
+                            leading_in: symbol_cycles.leading_in,
+                            next_cycle: symbol_cycles.next_cycle.map(JsonCycleSize::from),
+                            file_level: json_file_level(&symbol_cycles.file_level),
+                        }),
+                })
+                .collect(),
             suggestions: self
                 .suggestions
                 .iter()
@@ -246,6 +297,9 @@ impl ScanReport {
                 missing_file_sites: self.missing_file_sites.len(),
                 tests_total: self.test_count,
                 unreachable_files: self.unreachable_file_count(),
+                symbols: self.symbol_summary.symbols,
+                import_cycles: self.import_cycles.len(),
+                modules_in_import_cycles: self.modules_in_import_cycles(),
                 config_hash: &self.config_hash,
             },
         };
@@ -258,7 +312,7 @@ impl ScanReport {
 
     pub fn summary_line(&self) -> String {
         format!(
-            "prober scan: {} links inferred from {} sites; {} unresolved sites reach {}/{} test files ({}); {} sites load missing files; {} files reach no test; {} suggestions",
+            "prober scan: {} links inferred from {} sites; {} unresolved sites reach {}/{} test files ({}); {} sites load missing files; {} files reach no test; {} import cycles; {} suggestions",
             self.inferred_link_count(),
             self.inferred_sites.len(),
             self.unresolved_sites.len(),
@@ -270,6 +324,7 @@ impl ScanReport {
             ),
             self.missing_file_sites.len(),
             self.unreachable_file_count(),
+            self.import_cycles.len(),
             self.suggestions.len()
         )
     }
@@ -342,6 +397,87 @@ impl ScanReport {
             self.hub_files.len(),
             tests.join(", ")
         );
+    }
+
+    fn write_symbols(&self, text: &mut String) {
+        let summary = &self.symbol_summary;
+        let _ = writeln!(
+            text,
+            "Symbols: {} in {} modules; {} modules at file level{}; {} uses keep a whole module{}",
+            summary.symbols,
+            summary.modules,
+            summary.file_level.len(),
+            counted_causes(
+                summary
+                    .file_level
+                    .iter()
+                    .map(|(_, cause)| (cause.description(), 1))
+            ),
+            summary.whole_module_uses.values().sum::<usize>(),
+            counted_causes(
+                summary
+                    .whole_module_uses
+                    .iter()
+                    .map(|(cause, uses)| (cause.description(), *uses))
+            )
+        );
+    }
+
+    fn write_import_cycles(&self, text: &mut String) {
+        let _ = writeln!(
+            text,
+            "Import cycles: {} with 2 or more modules, {} modules in them",
+            self.import_cycles.len(),
+            self.modules_in_import_cycles()
+        );
+
+        if self.import_cycles.is_empty() {
+            return;
+        }
+
+        let modules_width = self
+            .import_cycles
+            .iter()
+            .map(|import_cycle| import_cycle.modules.len().to_string().len())
+            .chain(["modules".len()])
+            .max()
+            .unwrap_or_default();
+        let tests_width = self
+            .import_cycles
+            .iter()
+            .map(|import_cycle| import_cycle.tests.to_string().len())
+            .chain(["tests".len()])
+            .max()
+            .unwrap_or_default();
+        let indent = " ".repeat(modules_width + tests_width + 6);
+
+        let _ = writeln!(
+            text,
+            "  {:>modules_width$}  {:>tests_width$}  directories",
+            "modules", "tests"
+        );
+
+        for import_cycle in self.import_cycles.iter().take(LISTED_ROWS) {
+            let _ = writeln!(
+                text,
+                "  {:>modules_width$}  {:>tests_width$}  {}",
+                import_cycle.modules.len(),
+                import_cycle.tests,
+                cycle_directories(&import_cycle.modules)
+            );
+
+            if let Some(symbol_cycles) = &import_cycle.symbols {
+                let _ = writeln!(text, "{indent}{}", symbol_cycles_text(symbol_cycles));
+            }
+        }
+
+        if self.import_cycles.len() > LISTED_ROWS {
+            let _ = writeln!(
+                text,
+                "  … {} more cycles, all of them with --format json",
+                self.import_cycles.len() - LISTED_ROWS
+            );
+        }
     }
 
     fn write_suggestions(&self, text: &mut String) {
@@ -689,6 +825,123 @@ fn unreachable_files(graph: &Graph, repo_files: &[RepoPath]) -> (Vec<RepoPath>, 
     (unreachable_modules, unreachable_other_files)
 }
 
+fn counted_causes<'c>(causes: impl Iterator<Item = (&'c str, usize)>) -> String {
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+
+    for (cause, count) in causes {
+        *counts.entry(cause).or_default() += count;
+    }
+
+    if counts.is_empty() {
+        return String::new();
+    }
+
+    let mut counts: Vec<(&str, usize)> = counts.into_iter().collect();
+
+    counts.sort_by_key(|&(_, count)| Reverse(count));
+
+    let listed: Vec<String> = counts
+        .into_iter()
+        .map(|(cause, count)| format!("{cause} {count}"))
+        .collect();
+
+    format!(" ({})", listed.join(", "))
+}
+
+fn cycle_directories(modules: &[RepoPath]) -> String {
+    let mut modules_by_directory: BTreeMap<String, usize> = BTreeMap::new();
+
+    for module in modules {
+        let segments: Vec<&str> = module.as_str().split('/').collect();
+        let directory = segments[..segments.len() - 1]
+            .iter()
+            .take(CYCLE_DIRECTORY_DEPTH)
+            .copied()
+            .collect::<Vec<&str>>()
+            .join("/");
+        let directory = if directory.is_empty() {
+            REPOSITORY_ROOT.to_owned()
+        } else {
+            directory
+        };
+
+        *modules_by_directory.entry(directory).or_default() += 1;
+    }
+
+    let mut directories: Vec<(String, usize)> = modules_by_directory.into_iter().collect();
+
+    directories.sort_by_key(|(_, modules)| Reverse(*modules));
+
+    let more = directories.len().saturating_sub(CYCLE_DIRECTORIES_SHOWN);
+    let shown: Vec<String> = directories
+        .into_iter()
+        .take(CYCLE_DIRECTORIES_SHOWN)
+        .map(|(directory, modules)| format!("{directory} {modules}"))
+        .collect();
+
+    if more > 0 {
+        format!("{} and {more} more directories", shown.join(", "))
+    } else {
+        shown.join(", ")
+    }
+}
+
+fn symbol_cycles_text(symbol_cycles: &SymbolCycles) -> String {
+    let cycles = match symbol_cycles.cycle {
+        Some(cycle) => {
+            let next_cycle = match symbol_cycles.next_cycle {
+                Some(next_cycle) => format!(
+                    "; next: {} symbols in {} modules, {} tests",
+                    next_cycle.symbols, next_cycle.modules, next_cycle.tests
+                ),
+                None => String::new(),
+            };
+
+            format!(
+                "{} symbols in {} modules still form a cycle pulling in {} tests, {} symbols lead into it ({}){next_cycle}",
+                cycle.symbols,
+                cycle.modules,
+                cycle.tests,
+                symbol_cycles.leading_in,
+                format_percentage(
+                    symbol_cycles.leading_in as f64,
+                    symbol_cycles.symbols as f64
+                )
+            )
+        }
+        None => "no cycle left".to_owned(),
+    };
+    let file_level = if symbol_cycles.file_level.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} modules at file level{}",
+            symbol_cycles.file_level.len(),
+            counted_causes(
+                symbol_cycles
+                    .file_level
+                    .iter()
+                    .map(|(_, cause)| (cause.description(), 1))
+            )
+        )
+    };
+
+    format!(
+        "symbol level: {} symbols, {cycles}{file_level}",
+        symbol_cycles.symbols
+    )
+}
+
+fn json_file_level(file_level: &[(RepoPath, FallbackCause)]) -> Vec<JsonFileLevelModule<'_>> {
+    file_level
+        .iter()
+        .map(|(file, cause)| JsonFileLevelModule {
+            file: file.as_str(),
+            cause: cause.key(),
+        })
+        .collect()
+}
+
 fn top_directory(path: &RepoPath) -> &str {
     match path.as_str().split_once('/') {
         Some((directory, _)) => directory,
@@ -739,6 +992,8 @@ struct JsonScan<'a> {
     root_scopes: Vec<JsonRootScope<'a>>,
     hub_files: Vec<JsonHubFile<'a>>,
     smoke_set: JsonSmokeSet<'a>,
+    symbols: JsonSymbols<'a>,
+    cycles: Vec<JsonImportCycle<'a>>,
     suggestions: Vec<JsonSuggestion<'a>>,
     config: JsonConfig<'a>,
     stats: JsonScanStats<'a>,
@@ -763,6 +1018,53 @@ struct JsonHubFile<'a> {
 struct JsonSmokeSet<'a> {
     tests: Vec<&'a str>,
     covered_hub_files: usize,
+}
+
+#[derive(Serialize)]
+struct JsonSymbols<'a> {
+    symbols: usize,
+    modules: usize,
+    file_level: Vec<JsonFileLevelModule<'a>>,
+    whole_module_uses: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Serialize)]
+struct JsonFileLevelModule<'a> {
+    file: &'a str,
+    cause: &'static str,
+}
+
+#[derive(Serialize)]
+struct JsonImportCycle<'a> {
+    modules: Vec<&'a str>,
+    tests: usize,
+    symbols: Option<JsonSymbolCycles<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonSymbolCycles<'a> {
+    symbols: usize,
+    cycle: Option<JsonCycleSize>,
+    leading_in: usize,
+    next_cycle: Option<JsonCycleSize>,
+    file_level: Vec<JsonFileLevelModule<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonCycleSize {
+    symbols: usize,
+    modules: usize,
+    tests: usize,
+}
+
+impl From<CycleSize> for JsonCycleSize {
+    fn from(cycle_size: CycleSize) -> Self {
+        Self {
+            symbols: cycle_size.symbols,
+            modules: cycle_size.modules,
+            tests: cycle_size.tests,
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -823,6 +1125,9 @@ struct JsonScanStats<'a> {
     missing_file_sites: usize,
     tests_total: usize,
     unreachable_files: usize,
+    symbols: usize,
+    import_cycles: usize,
+    modules_in_import_cycles: usize,
     config_hash: &'a str,
 }
 
@@ -830,6 +1135,10 @@ struct JsonScanStats<'a> {
 mod tests {
     use super::*;
     use crate::graph::{Edge, EdgeKind, GraphBuilder, Inference, UnresolvedSite};
+    use crate::symbols::{
+        FallbackCause, LineRange, MODULE_INIT_NAME, ModuleFallback, Symbol, SymbolEdge, SymbolKind,
+        SymbolTarget, WholeModuleCause,
+    };
 
     fn repo_path(path: &str) -> RepoPath {
         RepoPath::new(path).unwrap()
@@ -974,6 +1283,10 @@ Suggested smoke set: 2 test files within two links of 4 of these 4 files; run th
   [always_run]
   tests = [\"src/loader.test.ts\", \"src/worker.test.ts\"]
 
+Symbols: 0 in 0 modules; 0 modules at file level; 0 uses keep a whole module
+
+Import cycles: 0 with 2 or more modules, 0 modules in them
+
 Suggestions: 0
 "
         );
@@ -1025,11 +1338,133 @@ Suggestions: 0
         assert_eq!(scan_report.unreachable_other_files, []);
     }
 
+    fn cyclic_project() -> ScanReport {
+        let mut builder = GraphBuilder::default();
+        let test = builder.add_test_file(repo_path("src/a.test.ts"), "typescript");
+        let a = builder.add_file(repo_path("src/a.ts"));
+        let b = builder.add_file(repo_path("src/b.ts"));
+        let legacy = builder.add_file(repo_path("src/c.cjs"));
+        let imports = [(test, a), (a, b), (b, a), (b, legacy), (legacy, a)];
+
+        builder.add_language("typescript", |path| {
+            path.as_str().ends_with(".ts") || path.as_str().ends_with(".cjs")
+        });
+
+        for (dependent, dependency) in imports {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind: EdgeKind::Import,
+            });
+        }
+
+        let mut add_symbol = |file: FileId, name: &str, kind: SymbolKind| {
+            builder.add_symbol(Symbol {
+                file,
+                name: name.to_owned(),
+                kind,
+                lines: vec![LineRange { start: 1, end: 1 }],
+                hash: 0,
+            })
+        };
+        let a_init = add_symbol(a, MODULE_INIT_NAME, SymbolKind::ModuleInit);
+        let run = add_symbol(a, "run", SymbolKind::Function);
+        let b_init = add_symbol(b, MODULE_INIT_NAME, SymbolKind::ModuleInit);
+        let format = add_symbol(b, "format", SymbolKind::Function);
+        let via_a = add_symbol(b, "viaA", SymbolKind::Function);
+        let from_legacy = add_symbol(b, "fromLegacy", SymbolKind::Variable);
+        let not_analysed = SymbolTarget::Module {
+            file: legacy,
+            cause: WholeModuleCause::NotAnalysed,
+        };
+        let uses = [
+            (a_init, SymbolTarget::Symbol(b_init)),
+            (b_init, SymbolTarget::Symbol(a_init)),
+            (b_init, not_analysed),
+            (run, SymbolTarget::Symbol(format)),
+            (via_a, SymbolTarget::Symbol(run)),
+            (from_legacy, not_analysed),
+        ];
+
+        for (dependent, dependency) in uses {
+            builder.add_symbol_edge(SymbolEdge {
+                dependent,
+                dependency,
+                kind: EdgeKind::Import,
+            });
+        }
+
+        builder.add_fallback(ModuleFallback {
+            file: legacy,
+            cause: FallbackCause::CommonJs,
+        });
+
+        let graph = builder.build();
+        let repo_files: Vec<RepoPath> = ["src/a.test.ts", "src/a.ts", "src/b.ts", "src/c.cjs"]
+            .into_iter()
+            .map(repo_path)
+            .collect();
+
+        ScanReport::new(&graph, &repo_files, String::new())
+    }
+
+    #[test]
+    fn scan_text_tells_what_is_left_of_each_import_cycle_at_symbol_level() {
+        let text = cyclic_project().to_text();
+        let sections: Vec<&str> = text
+            .split("\n\n")
+            .filter(|section| {
+                section.starts_with("Symbols") || section.starts_with("Import cycles")
+            })
+            .collect();
+
+        assert_eq!(
+            sections,
+            [
+                "Symbols: 6 in 2 modules; 1 modules at file level (CommonJS exports 1); 2 uses keep a whole module (module analysed at file level 2)",
+                "Import cycles: 1 with 2 or more modules, 3 modules in them
+  modules  tests  directories
+        3      1  src 3
+                  symbol level: 6 symbols, 2 symbols in 3 modules still form a cycle pulling in 1 tests, 4 symbols lead into it (66.7%); 1 modules at file level (CommonJS exports 1)",
+            ]
+        );
+    }
+
+    #[test]
+    fn scan_json_lists_every_module_of_each_import_cycle() {
+        let json_scan: serde_json::Value =
+            serde_json::from_str(&cyclic_project().to_json()).unwrap();
+
+        assert_eq!(
+            json_scan["cycles"],
+            serde_json::json!([{
+                "modules": ["src/a.ts", "src/b.ts", "src/c.cjs"],
+                "tests": 1,
+                "symbols": {
+                    "symbols": 6,
+                    "cycle": { "symbols": 2, "modules": 3, "tests": 1 },
+                    "leading_in": 4,
+                    "next_cycle": null,
+                    "file_level": [{ "file": "src/c.cjs", "cause": "commonjs" }],
+                },
+            }])
+        );
+        assert_eq!(
+            json_scan["symbols"],
+            serde_json::json!({
+                "symbols": 6,
+                "modules": 2,
+                "file_level": [{ "file": "src/c.cjs", "cause": "commonjs" }],
+                "whole_module_uses": { "not_analysed": 2 },
+            })
+        );
+    }
+
     #[test]
     fn scan_summary_line_counts_links_unresolved_sites_and_unreachable_files() {
         assert_eq!(
             scanned_project().summary_line(),
-            "prober scan: 2 links inferred from 1 sites; 1 unresolved sites reach 1/2 test files (50.0%); 1 sites load missing files; 3 files reach no test; 0 suggestions"
+            "prober scan: 2 links inferred from 1 sites; 1 unresolved sites reach 1/2 test files (50.0%); 1 sites load missing files; 3 files reach no test; 0 import cycles; 0 suggestions"
         );
     }
 
@@ -1077,6 +1512,9 @@ Suggestions: 0
                 "missing_file_sites": 1,
                 "tests_total": 2,
                 "unreachable_files": 3,
+                "symbols": 0,
+                "import_cycles": 0,
+                "modules_in_import_cycles": 0,
                 "config_hash": "0123456789abcdef",
             })
         );

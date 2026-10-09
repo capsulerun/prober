@@ -382,7 +382,7 @@ fn edge_kind(import_or_export_kind: ImportOrExportKind) -> EdgeKind {
     }
 }
 
-fn literal_text<'s>(expression: &'s Expression) -> Option<&'s str> {
+pub(crate) fn literal_text<'s>(expression: &'s Expression) -> Option<&'s str> {
     match expression {
         Expression::StringLiteral(string_literal) => Some(&string_literal.value),
         Expression::TemplateLiteral(template_literal)
@@ -461,7 +461,7 @@ fn line_starts(source_text: &str) -> Vec<usize> {
         .collect()
 }
 
-fn is_require(callee: &Expression) -> bool {
+pub(crate) fn is_require(callee: &Expression) -> bool {
     matches!(callee.get_inner_expression(), Expression::Identifier(function) if function.name == "require")
 }
 
@@ -473,7 +473,7 @@ fn creates_require(callee: &Expression) -> bool {
     }
 }
 
-fn loads_module(callee: &Expression) -> bool {
+pub(crate) fn loads_module(callee: &Expression) -> bool {
     match callee {
         Expression::Identifier(function) => function.name == "require",
         Expression::StaticMemberExpression(method) => match &method.object {

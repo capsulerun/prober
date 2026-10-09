@@ -1,5 +1,6 @@
 pub mod changes;
 pub mod config;
+mod cycles;
 pub mod files;
 pub mod graph;
 pub mod junit;
@@ -11,5 +12,6 @@ pub mod rules;
 pub mod scan;
 pub mod select;
 pub mod shadow;
+pub mod symbols;
 pub mod unhandled;
 pub mod why;
