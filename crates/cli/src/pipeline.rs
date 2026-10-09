@@ -103,7 +103,7 @@ pub fn scan(directory: &Path) -> Result<ScanReport> {
     let workspace = Workspace::open(directory, "HEAD")?;
     let config_text = workspace.read_config()?;
     let config = Config::parse(&config_text)?;
-    let linker = workspace.linker(&config)?;
+    let linker = workspace.linker(&config)?.with_symbol_analysis();
     let mut builder = GraphBuilder::default();
 
     linker.link(&workspace.repo_files, &mut builder)?;

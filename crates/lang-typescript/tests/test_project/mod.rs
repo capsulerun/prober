@@ -95,6 +95,19 @@ impl TestProject {
         self.link_with(InferenceSettings::default())
     }
 
+    pub fn link_symbols(&self) -> Graph {
+        let repo_files = self.repo_files();
+        let mut builder = GraphBuilder::default();
+
+        TypeScriptLinker::new(self.root(), &repo_files)
+            .unwrap()
+            .with_symbol_analysis()
+            .link(&repo_files, &mut builder)
+            .unwrap();
+
+        builder.build()
+    }
+
     pub fn link_with(&self, inference: InferenceSettings) -> Graph {
         let repo_files = self.repo_files();
         let mut builder = GraphBuilder::default();

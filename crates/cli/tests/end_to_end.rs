@@ -1125,7 +1125,7 @@ fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
     );
     assert_eq!(
         run.stderr,
-        "prober scan: 1 links inferred from 1 sites; 1 unresolved sites reach 1/3 test files (33.3%); 0 sites load missing files; 4 files reach no test; 0 suggestions\n"
+        "prober scan: 1 links inferred from 1 sites; 1 unresolved sites reach 1/3 test files (33.3%); 0 sites load missing files; 4 files reach no test; 0 import cycles; 0 suggestions\n"
     );
 
     let text_run = repository.prober(&["scan"]);
@@ -1134,6 +1134,57 @@ fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
         text_run
             .stdout
             .starts_with("Inferred links: 1 from 1 sites\n"),
+        "{}",
+        text_run.stdout
+    );
+}
+
+#[test]
+fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.write(
+        "src/x.ts",
+        "import { y } from \"./y\";\nexport function x() { return y(); }\nexport function helper() { return 1; }\n",
+    );
+    repository.write(
+        "src/y.ts",
+        "import { helper } from \"./x\";\nexport function y() { return 2; }\nexport function viaX() { return helper(); }\n",
+    );
+    repository.write("src/x.test.ts", "import { x } from \"./x\";\nx();\n");
+    repository.commit_all("cycle");
+
+    let run = repository.prober(&["scan", "--format", "json"]);
+    let scan = run.json();
+
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(
+        scan["cycles"],
+        json!([{
+            "modules": ["src/x.ts", "src/y.ts"],
+            "tests": 1,
+            "symbols": {
+                "symbols": 6,
+                "cycle": { "symbols": 2, "modules": 2, "tests": 1 },
+                "leading_in": 2,
+                "next_cycle": null,
+                "file_level": [],
+            },
+        }])
+    );
+    assert_eq!(scan["stats"]["import_cycles"], 1);
+    assert_eq!(scan["stats"]["modules_in_import_cycles"], 2);
+
+    let text_run = repository.prober(&["scan"]);
+
+    assert!(
+        text_run.stdout.contains(
+            "Import cycles: 1 with 2 or more modules, 2 modules in them
+  modules  tests  directories
+        2      1  src 2
+                  symbol level: 6 symbols, 2 symbols in 2 modules still form a cycle pulling in 1 tests, 2 symbols lead into it (33.3%)
+"
+        ),
         "{}",
         text_run.stdout
     );

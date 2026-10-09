@@ -2041,6 +2041,7 @@ dependencies = [
  "regex",
  "serde_json",
  "tempfile",
+ "xxhash-rust",
  "yaml-rust2",
 ]
 

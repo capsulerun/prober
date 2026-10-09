@@ -3,6 +3,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::files::{FileId, FileTable, RepoPath};
 use crate::patterns::Captures;
+use crate::symbols::{
+    LineRange, ModuleFallback, Symbol, SymbolEdge, SymbolId, SymbolKind, SymbolTable,
+    SymbolTableBuilder, SymbolTarget,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EdgeKind {
@@ -236,6 +240,7 @@ pub struct GraphBuilder {
     root_scopes: Vec<RootScope>,
     rule_links: Vec<RuleLink>,
     rule_ignores: Vec<RuleIgnore>,
+    symbols: SymbolTableBuilder,
 }
 
 impl GraphBuilder {
@@ -322,6 +327,18 @@ impl GraphBuilder {
         links
     }
 
+    pub fn add_symbol(&mut self, symbol: Symbol) -> SymbolId {
+        self.symbols.add_symbol(symbol)
+    }
+
+    pub fn add_symbol_edge(&mut self, edge: SymbolEdge) {
+        self.symbols.add_edge(edge);
+    }
+
+    pub fn add_fallback(&mut self, fallback: ModuleFallback) {
+        self.symbols.add_fallback(fallback);
+    }
+
     pub(crate) fn files(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
         self.files.iter()
     }
@@ -362,6 +379,9 @@ impl GraphBuilder {
         self.edges = kept;
         self.ignored_edges
             .extend(ignored.into_iter().map(|edge| IgnoredEdge { edge, line }));
+        self.symbols.retain_edges(|dependent, dependency| {
+            !(to.contains(&dependent) && from.contains(&dependency))
+        });
 
         if rule_links > 0 {
             self.rule_ignores.push(RuleIgnore { line, from, to });
@@ -490,6 +510,7 @@ impl GraphBuilder {
             rule_links_by_dependency,
             rule_links_by_dependent,
             rule_ignores: self.rule_ignores,
+            symbols: self.symbols.build(),
         }
     }
 }
@@ -514,6 +535,7 @@ pub struct Graph {
     rule_links_by_dependency: HashMap<FileId, Vec<usize>>,
     rule_links_by_dependent: HashMap<FileId, Vec<usize>>,
     rule_ignores: Vec<RuleIgnore>,
+    symbols: SymbolTable,
 }
 
 impl Graph {
@@ -694,6 +716,79 @@ impl Graph {
         let mut dependents = self.dependents(file).peekable();
 
         dependents.peek().is_some() && dependents.all(|edge| edge.kind == EdgeKind::Asset)
+    }
+
+    pub fn symbol(&self, symbol: SymbolId) -> &Symbol {
+        self.symbols.symbol(symbol)
+    }
+
+    pub fn symbol_count(&self) -> usize {
+        self.symbols.len()
+    }
+
+    pub fn analysed_module_count(&self) -> usize {
+        self.symbols.analysed_module_count()
+    }
+
+    pub fn symbols_of(&self, file: FileId) -> &[SymbolId] {
+        self.symbols.symbols_of(file)
+    }
+
+    pub fn module_init(&self, file: FileId) -> Option<SymbolId> {
+        self.symbols_of(file)
+            .iter()
+            .copied()
+            .find(|&symbol| self.symbol(symbol).kind == SymbolKind::ModuleInit)
+    }
+
+    pub fn symbols_at(&self, file: FileId, line: u32) -> Vec<SymbolId> {
+        let enclosing: Vec<SymbolId> = self
+            .symbols_of(file)
+            .iter()
+            .copied()
+            .filter(|&symbol| {
+                let symbol = self.symbol(symbol);
+
+                symbol.kind != SymbolKind::ModuleInit
+                    && symbol
+                        .lines
+                        .iter()
+                        .any(|lines: &LineRange| lines.contains(line))
+            })
+            .collect();
+
+        if enclosing.is_empty() {
+            return self.module_init(file).into_iter().collect();
+        }
+
+        enclosing
+    }
+
+    pub fn symbol_edges(&self) -> &[SymbolEdge] {
+        self.symbols.edges()
+    }
+
+    pub fn symbol_dependencies(&self, symbol: SymbolId) -> &[SymbolEdge] {
+        self.symbols.dependencies(symbol)
+    }
+
+    pub fn symbol_dependents(&self, symbol: SymbolId) -> impl Iterator<Item = &SymbolEdge> {
+        self.symbols.dependents(symbol)
+    }
+
+    pub fn module_dependents(&self, file: FileId) -> impl Iterator<Item = &SymbolEdge> {
+        self.symbols.module_dependents(file)
+    }
+
+    pub fn fallbacks(&self) -> &[ModuleFallback] {
+        self.symbols.fallbacks()
+    }
+
+    pub fn symbol_target_file(&self, target: SymbolTarget) -> FileId {
+        match target {
+            SymbolTarget::Symbol(symbol) => self.symbol(symbol).file,
+            SymbolTarget::Module { file, .. } => file,
+        }
     }
 }
 

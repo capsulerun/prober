@@ -12,6 +12,7 @@ mod presets;
 mod repo_index;
 mod resolver;
 mod root_scope;
+mod symbols;
 mod test_links;
 mod workspaces;
 

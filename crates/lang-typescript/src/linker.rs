@@ -5,13 +5,14 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
-use oxc_parser::Parser;
+use oxc_parser::{Parser, config::RuntimeParserConfig};
 use oxc_span::SourceType;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
 use prober_core::graph::{Edge, EdgeKind, GraphBuilder, RootScope, UnresolvedSite};
 use prober_core::report::ModeReason;
+use prober_core::symbols::FallbackCause;
 use rayon::prelude::*;
 
 use crate::build_mapping::BuildMapping;
@@ -32,6 +33,7 @@ use crate::presets::patterns::join_directory;
 use crate::presets::{RunnerGroup, RunnerPresets, ScopeInputs, imports_node_test, runner_groups};
 use crate::resolver::{ModuleResolver, package_node};
 use crate::root_scope::RootScopeEffects;
+use crate::symbols::{SymbolAnalysis, add_symbols, extract_symbols};
 use crate::test_links::TestLinks;
 use crate::workspaces::{
     PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest, parent_directory,
@@ -39,7 +41,7 @@ use crate::workspaces::{
 
 pub(crate) const PACKAGE_NODE_PREFIX: &str = "node_modules/";
 
-const RAW_IMPORT_QUERY: &str = "?raw";
+pub(crate) const RAW_IMPORT_QUERY: &str = "?raw";
 
 pub struct TypeScriptLinker {
     repo_root: PathBuf,
@@ -49,6 +51,7 @@ pub struct TypeScriptLinker {
     resolver: ModuleResolver,
     inference: InferenceSettings,
     presets: RunnerPresets,
+    symbol_analysis: bool,
 }
 
 pub struct LinkChanges<'c> {
@@ -81,6 +84,7 @@ pub(crate) struct LinkedFile {
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
     pub path_literals: Vec<PathLiteral>,
+    pub symbols: Option<SymbolAnalysis>,
 }
 
 impl TypeScriptLinker {
@@ -114,6 +118,7 @@ impl TypeScriptLinker {
             resolver,
             inference: InferenceSettings::default(),
             presets: RunnerPresets::default(),
+            symbol_analysis: false,
         };
 
         Ok(linker.with_presets(&Presets::Auto, repo_files))
@@ -129,6 +134,13 @@ impl TypeScriptLinker {
         Self {
             inference,
             resolver,
+            ..self
+        }
+    }
+
+    pub fn with_symbol_analysis(self) -> Self {
+        Self {
+            symbol_analysis: true,
             ..self
         }
     }
@@ -280,6 +292,10 @@ impl TypeScriptLinker {
 
         for linked_file in &linked_files {
             self.add_linked_file(linked_file, manifest_changes, graph);
+        }
+
+        if self.symbol_analysis {
+            add_symbols(&linked_files, graph);
         }
 
         let mocked_modules = TestLinks {
@@ -553,7 +569,9 @@ impl TypeScriptLinker {
         let source_text = String::from_utf8_lossy(&source_bytes);
         let allocator = Allocator::default();
         let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-        let parsed = Parser::new(&allocator, &source_text, source_type).parse();
+        let parsed = Parser::new(&allocator, &source_text, source_type)
+            .with_config(RuntimeParserConfig::new(self.symbol_analysis))
+            .parse();
         let parsed_imports = collect_imports(&parsed.program, &source_text);
         let access_summary = (self.inference.files && parsed_imports.has_file_accesses)
             .then(|| summarize_program(&parsed.program, &source_text, SummaryScope::Accesses))
@@ -564,9 +582,17 @@ impl TypeScriptLinker {
             .any(|import_request| imports_node_test(&import_request.specifier));
         let mut dependencies = Vec::new();
         let mut resolution_change = None;
+        let mut targets: HashMap<String, Vec<RepoPath>> = HashMap::new();
 
         for import_request in parsed_imports.import_requests {
             let resolved_paths = self.resolver.resolve(path, &import_request.specifier);
+
+            if self.symbol_analysis {
+                targets
+                    .entry(import_request.specifier.clone())
+                    .or_insert_with(|| resolved_paths.clone());
+            }
+
             let resolves_differently_at_base = resolution_change.is_none()
                 && base_resolver.is_some_and(|base_resolver| {
                     base_resolver.resolve(path, &import_request.specifier) != resolved_paths
@@ -595,6 +621,25 @@ impl TypeScriptLinker {
             }));
         }
 
+        let symbols = self.symbol_analysis.then(|| {
+            let module = if parsed.panicked || parsed.diagnostics.has_errors() {
+                Err(FallbackCause::ParseError)
+            } else {
+                extract_symbols(&parsed.program, &source_text, &parsed.tokens)
+            };
+
+            if let Ok(module_symbols) = &module {
+                for specifier in module_symbols.specifiers() {
+                    if !targets.contains_key(specifier) {
+                        targets
+                            .insert(specifier.to_owned(), self.resolver.resolve(path, specifier));
+                    }
+                }
+            }
+
+            SymbolAnalysis { module, targets }
+        });
+
         Ok(LinkedFile {
             path: path.clone(),
             is_test: self.presets.is_test(path, imports_node_test),
@@ -606,6 +651,7 @@ impl TypeScriptLinker {
             mocks: parsed_imports.mocks,
             glob_imports: parsed_imports.glob_imports,
             path_literals: parsed_imports.path_literals,
+            symbols,
         })
     }
 }
