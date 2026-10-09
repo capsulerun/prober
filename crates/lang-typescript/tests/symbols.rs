@@ -3,7 +3,7 @@
 mod test_project;
 
 use prober_core::graph::Graph;
-use prober_core::scan::{CycleSize, ScanReport, SymbolCycles};
+use prober_core::scan::{ScanReport, SymbolCycle, SymbolCycles};
 use prober_core::symbols::{FallbackCause, MODULE_INIT_NAME, SymbolTarget};
 
 use crate::test_project::{TestProject, repo_path};
@@ -244,13 +244,12 @@ fn a_file_level_cycle_without_symbol_cycle_keeps_only_its_module_loads() {
             vec!["src/a.ts".to_owned(), "src/b.ts".to_owned()],
             Some(SymbolCycles {
                 symbols: 6,
-                cycle: Some(CycleSize {
+                cycles: vec![SymbolCycle {
                     symbols: 2,
                     modules: 2,
                     tests: 0,
-                }),
-                leading_in: 2,
-                next_cycle: None,
+                    leading_in: 2,
+                }],
                 file_level: Vec::new(),
             })
         )]
@@ -276,17 +275,20 @@ fn functions_calling_each_other_and_load_time_calls_keep_the_cycle() {
             vec!["src/x.ts".to_owned(), "src/y.ts".to_owned()],
             Some(SymbolCycles {
                 symbols: 4,
-                cycle: Some(CycleSize {
-                    symbols: 2,
-                    modules: 2,
-                    tests: 0,
-                }),
-                leading_in: 4,
-                next_cycle: Some(CycleSize {
-                    symbols: 2,
-                    modules: 2,
-                    tests: 0,
-                }),
+                cycles: vec![
+                    SymbolCycle {
+                        symbols: 2,
+                        modules: 2,
+                        tests: 0,
+                        leading_in: 4,
+                    },
+                    SymbolCycle {
+                        symbols: 2,
+                        modules: 2,
+                        tests: 0,
+                        leading_in: 2,
+                    },
+                ],
                 file_level: Vec::new(),
             })
         )]
@@ -312,13 +314,12 @@ fn a_commonjs_module_in_a_cycle_stays_at_file_level_and_keeps_its_importers_whol
             vec!["src/legacy.cjs".to_owned(), "src/p.ts".to_owned()],
             Some(SymbolCycles {
                 symbols: 3,
-                cycle: Some(CycleSize {
+                cycles: vec![SymbolCycle {
                     symbols: 2,
                     modules: 2,
                     tests: 0,
-                }),
-                leading_in: 3,
-                next_cycle: None,
+                    leading_in: 3,
+                }],
                 file_level: vec![(repo_path("src/legacy.cjs"), FallbackCause::CommonJs)],
             })
         )]

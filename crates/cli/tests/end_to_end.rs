@@ -1253,9 +1253,7 @@ fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
             "tests": 1,
             "symbols": {
                 "symbols": 6,
-                "cycle": { "symbols": 2, "modules": 2, "tests": 1 },
-                "leading_in": 2,
-                "next_cycle": null,
+                "cycles": [{ "symbols": 2, "modules": 2, "tests": 1, "leading_in": 2 }],
                 "file_level": [],
             },
         }])
