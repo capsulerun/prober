@@ -16,6 +16,7 @@ pub enum Blocker {
     Content,
     TypeOnly,
     AssetBlind,
+    SymbolLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,6 +114,9 @@ impl Blocker {
                 "the changed assets reach it, but it runs in a project that renders no assets"
                     .to_owned()
             }
+            Blocker::SymbolLevel => {
+                "it reaches the changed files, but none of the symbols it uses changed ([inference] symbols = false follows files)".to_owned()
+            }
         }
     }
 }
@@ -159,6 +163,7 @@ pub fn explain(
         Relaxation::Content,
         Relaxation::TypeOnly,
         Relaxation::Assets,
+        Relaxation::FileLevel,
     ];
 
     for relaxation in relaxations {
@@ -176,6 +181,7 @@ pub fn explain(
             Relaxation::Content => Blocker::Content,
             Relaxation::TypeOnly => Blocker::TypeOnly,
             Relaxation::Assets => Blocker::AssetBlind,
+            Relaxation::FileLevel => Blocker::SymbolLevel,
         };
 
         let mut reason = describe_reason(graph, &selected_test.reason);
@@ -214,7 +220,11 @@ fn ignoring_lines(graph: &Graph, reason: &Reason) -> Vec<usize> {
             Link::SetAsideSite(site_index) => {
                 lines.insert(graph.set_aside_sites()[site_index].line);
             }
-            Link::ChangedPart(_) | Link::UnresolvedSite(_) => {}
+            Link::Uses(_)
+            | Link::Loads { .. }
+            | Link::ChangedSymbol(_)
+            | Link::ChangedPart(_)
+            | Link::UnresolvedSite(_) => {}
         }
     }
 
@@ -247,10 +257,15 @@ fn ignored_edge_line(graph: &Graph, hop: &Hop) -> Option<usize> {
 fn mocked_modules(graph: &Graph, test_file: FileId, reason: &Reason) -> Vec<RepoPath> {
     let mocked = graph.mocked_modules(test_file);
     let mut modules = BTreeSet::new();
+    let through = reason.hops.iter().flat_map(|hop| match hop.link {
+        Link::Uses(edge) => graph.symbol_edge_through(&edge),
+        _ => &[],
+    });
     let path_files = graph
         .file_id(&reason.change.path)
         .into_iter()
-        .chain(reason.hops.iter().map(|hop| hop.dependent));
+        .chain(reason.hops.iter().map(|hop| hop.dependent))
+        .chain(through.copied());
 
     for file in path_files {
         if mocked.binary_search(&file).is_ok() {

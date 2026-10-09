@@ -124,6 +124,23 @@ impl TestProject {
 
 impl TestProject {
     pub fn outcome_of(&self, base_files: &[(&str, &str)], changes: &[FileChange]) -> Outcome {
+        self.outcome_with(base_files, changes, false)
+    }
+
+    pub fn symbol_outcome_of(
+        &self,
+        base_files: &[(&str, &str)],
+        changes: &[FileChange],
+    ) -> Outcome {
+        self.outcome_with(base_files, changes, true)
+    }
+
+    fn outcome_with(
+        &self,
+        base_files: &[(&str, &str)],
+        changes: &[FileChange],
+        symbols: bool,
+    ) -> Outcome {
         let repo_files = self.repo_files();
         let base_files = BaseFiles(
             base_files
@@ -139,7 +156,12 @@ impl TestProject {
             return Outcome::All(global_reasons.iter().map(ModeReason::message).collect());
         }
 
-        let linker = TypeScriptLinker::new(self.root(), &repo_files).unwrap();
+        let mut linker = TypeScriptLinker::new(self.root(), &repo_files).unwrap();
+
+        if symbols {
+            linker = linker.with_symbol_analysis();
+        }
+
         let link_changes = LinkChanges {
             changes,
             manifests: &manifest_changes,

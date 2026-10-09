@@ -34,12 +34,18 @@ impl TestRepository {
         test_repository.git(&["init", "--quiet", "--initial-branch=main"]);
         test_repository.write("package.json", r#"{ "name": "app" }"#);
         test_repository.write("src/a.ts", "export const a = 1;");
-        test_repository.write("src/a.test.ts", r#"import { a } from "./a";"#);
+        test_repository.write(
+            "src/a.test.ts",
+            "import { a } from \"./a\";\n\ntest(\"a\", () => expect(a).toBe(1));\n",
+        );
         test_repository.write(
             "src/b.ts",
             r#"import { a } from "./a"; export const b = a;"#,
         );
-        test_repository.write("src/b.test.ts", r#"import { b } from "./b";"#);
+        test_repository.write(
+            "src/b.test.ts",
+            "import { b } from \"./b\";\n\ntest(\"b\", () => expect(b).toBe(1));\n",
+        );
         test_repository.write("docs/guide.md", "# Guide");
 
         for &(path, content) in extra_files {
@@ -208,7 +214,10 @@ fn lists_the_tests_impacted_by_the_branch_closest_first() {
 fn json_report_explains_each_selected_test() {
     let repository = TestRepository::with_project_on_main();
 
-    repository.change_and_commit("src/b.ts", "export const b = 2;");
+    repository.change_and_commit(
+        "src/b.ts",
+        r#"import { a } from "./a"; export const b = a + 1;"#,
+    );
 
     let report = repository
         .prober(&["--base", "main", "--format", "json"])
@@ -222,7 +231,11 @@ fn json_report_explains_each_selected_test() {
     );
     assert_eq!(
         report["reasons"],
-        json!({ "src/b.test.ts": ["src/b.ts (modified)", "-> imported by src/b.test.ts"] })
+        json!({ "src/b.test.ts": [
+            "src/b.ts (modified)",
+            "-> b changed",
+            "-> b used at load by src/b.test.ts",
+        ] })
     );
     assert_eq!(report["distances"], json!({ "src/b.test.ts": 1 }));
     assert_eq!(report["stats"]["tests_total"], 2);
@@ -247,7 +260,7 @@ fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader_unless_wid
     repository.write("src/plugins/telegram.ts", "export const id = 1;");
     repository.write(
         "src/loader.test.ts",
-        r#"import { plugin } from "./loader";"#,
+        "import { plugin } from \"./loader\";\n\ntest(\"plugin\", () => expect(plugin).toBeDefined());\n",
     );
     repository.commit_all("plugin loader");
     repository.change_and_commit("src/plugins/telegram.ts", "export const id = 2;");
@@ -261,7 +274,7 @@ fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader_unless_wid
         json!({ "src/loader.test.ts": [
             "src/plugins/telegram.ts (modified)",
             "-> loaded by src/loader.ts:2 (inferred glob src/plugins/*.js)",
-            "-> imported by src/loader.test.ts",
+            "-> loaded by src/loader.test.ts",
         ] })
     );
 
@@ -274,7 +287,7 @@ fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader_unless_wid
         json!({ "src/loader.test.ts": [
             "src/plugins/telegram.ts (modified)",
             "-> widened: unresolved dynamic import at src/loader.ts:2 (`./plugins/${name}.js`)",
-            "-> imported by src/loader.test.ts",
+            "-> loaded by src/loader.test.ts",
         ] })
     );
     assert_eq!(
@@ -290,6 +303,80 @@ fn module_loaded_by_a_computed_import_selects_the_tests_of_its_loader_unless_wid
     let without_widening = repository.prober(&["--base", "HEAD~1"]);
 
     assert_eq!(without_widening.stdout, "");
+}
+
+#[test]
+fn change_to_one_function_selects_the_tests_using_it_unless_symbols_are_switched_off() {
+    let repository = TestRepository::with_files_on_main(&[
+        (
+            "src/hub.ts",
+            "export function parse(text: string) {\n  return text;\n}\n\nexport function format(value: string) {\n  return value;\n}\n",
+        ),
+        (
+            "src/parse.test.ts",
+            "import { parse } from \"./hub\";\n\ntest(\"parse\", () => parse(\"a\"));\n",
+        ),
+        (
+            "src/format.test.ts",
+            "import { format } from \"./hub\";\n\ntest(\"format\", () => format(\"a\"));\n",
+        ),
+    ]);
+
+    repository.change_and_commit(
+        "src/hub.ts",
+        "export function parse(text: string) {\n  return text.trim();\n}\n\nexport function format(value: string) {\n  return value;\n}\n",
+    );
+
+    let symbol_level = repository.prober(&["--base", "main"]);
+    let why_not = repository.prober(&["why", "src/format.test.ts", "--base", "main"]);
+
+    repository.write("prober.toml", "[inference]\nsymbols = false\n");
+
+    let file_level = repository.prober(&["--base", "main"]);
+
+    assert_eq!(symbol_level.stdout, "src/parse.test.ts\n");
+    assert_eq!(
+        why_not.stdout,
+        "src/format.test.ts is not selected: it reaches the changed files, but none of the symbols it uses changed ([inference] symbols = false follows files):\n  src/hub.ts (modified)\n  -> imported by src/format.test.ts\n"
+    );
+    assert_eq!(file_level.stdout, "src/format.test.ts\nsrc/parse.test.ts\n");
+}
+
+#[test]
+fn comment_change_selects_nothing_and_top_level_code_selects_every_importer() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.change_and_commit("src/a.ts", "// The first value.\nexport const a = 1;\n");
+
+    let comment = repository.prober(&["--base", "main"]);
+
+    repository.change_and_commit("src/a.ts", "export const a = 1;\nconsole.log(a);\n");
+
+    let top_level = repository
+        .prober(&["--base", "HEAD~1", "--format", "json"])
+        .json();
+
+    assert_eq!(comment.stdout, "");
+    assert_eq!(
+        comment.stderr,
+        "prober: none of 2 test files — 1 changed file reaches no test file\n"
+    );
+    assert_eq!(
+        top_level["reasons"],
+        json!({
+            "src/a.test.ts": [
+                "src/a.ts (modified)",
+                "-> code run at load changed",
+                "-> loaded by src/a.test.ts",
+            ],
+            "src/b.test.ts": [
+                "src/a.ts (modified)",
+                "-> code run at load changed",
+                "-> loaded by src/b.ts",
+                "-> loaded by src/b.test.ts",
+            ],
+        })
+    );
 }
 
 #[test]
@@ -449,8 +536,8 @@ fn runtime_dependency_bump_selects_the_tests_reaching_its_importers() {
         json!([
             "pnpm-lock.yaml (modified)",
             "-> package lodash changed (4.17.20 -> 4.17.21)",
-            "-> imported by src/a.ts",
-            "-> imported by src/a.test.ts",
+            "-> used whole at load by src/a.ts",
+            "-> loaded by src/a.test.ts",
         ])
     );
 }
@@ -505,7 +592,7 @@ fn exports_change_selects_the_tests_whose_imports_resolve_elsewhere() {
         json!([
             "packages/lib/package.json (modified)",
             "-> src/a.ts resolves \"@acme/lib\" differently",
-            "-> imported by src/a.test.ts",
+            "-> a used at load by src/a.test.ts",
         ])
     );
     assert_eq!(
@@ -696,7 +783,7 @@ fn command_change_selects_the_e2e_test_spawning_the_built_cli_unless_switched_of
         ("bin/cli.mjs", r#"await import("../dist/entry.js");"#),
         (
             "src/entry.ts",
-            r#"import { addAgent } from "./commands/agents.js";"#,
+            "import { addAgent } from \"./commands/agents.js\";\n\nregister(addAgent);\n",
         ),
         ("src/commands/agents.ts", "export const addAgent = 1;"),
         (
@@ -720,9 +807,10 @@ const output = execFileSync("npx", ["cli", "agents", "add"], { encoding: "utf8" 
         selected["reasons"]["test/agents.e2e.test.ts"],
         json!([
             "src/commands/agents.ts (modified)",
-            "-> imported by src/entry.ts",
+            "-> addAgent changed",
+            "-> addAgent used at load by src/entry.ts",
             "-> built into dist/entry.js (inferred build mapping dist/ <- src/)",
-            "-> imported by bin/cli.mjs",
+            "-> used whole at load by bin/cli.mjs (loaded with import() or require())",
             "-> spawned by test/agents.e2e.test.ts:2 (inferred spawn cli (bin of package.json))",
         ])
     );

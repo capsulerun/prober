@@ -1,15 +1,18 @@
 //! Links the symbols of every analysed module: imported names followed to the symbols exporting them through re-exports, aliases and barrels, module loads, and whole-module uses where a name cannot be followed.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::btree_map::Entry;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use prober_core::files::{FileId, RepoPath};
 use prober_core::graph::{EdgeKind, GraphBuilder};
 use prober_core::symbols::{
-    ModuleFallback, Symbol, SymbolEdge, SymbolId, SymbolTarget, WholeModuleCause,
+    ModuleFallback, Symbol, SymbolChange, SymbolChangeKind, SymbolEdge, SymbolId, SymbolTarget,
+    WholeModuleCause,
 };
 
 use crate::conventions::is_asset_file;
 use crate::linker::{Dependency, LinkedFile, RAW_IMPORT_QUERY};
+use crate::symbols::changes::{Changed, module_changes};
 use crate::symbols::{ExportTarget, Imported, ModuleSymbols, Use};
 
 const DEFAULT_EXPORT: &str = "default";
@@ -29,9 +32,40 @@ enum Resolved {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Reached {
+    resolved: Resolved,
+    through: Vec<usize>,
+}
+
+impl Reached {
+    fn direct(resolved: Resolved) -> Self {
+        Self {
+            resolved,
+            through: Vec::new(),
+        }
+    }
+
+    fn passing(mut self, module: usize, modules: &[Module]) -> Self {
+        let ends_in_module = match &self.resolved {
+            Resolved::Symbol {
+                module: reached, ..
+            }
+            | Resolved::Namespace(reached) => *reached == module,
+            Resolved::Whole { file, .. } => file == modules[module].path,
+        };
+
+        if !ends_in_module {
+            self.through.insert(0, module);
+        }
+
+        self
+    }
+}
+
 struct ResolvedUse {
     dependent: usize,
-    resolved: Resolved,
+    reached: Reached,
     raw: bool,
 }
 
@@ -45,12 +79,50 @@ struct Module<'l> {
 struct Resolver<'l> {
     modules: Vec<Module<'l>>,
     module_indices: HashMap<&'l RepoPath, usize>,
-    exports: HashMap<(usize, String), Vec<Resolved>>,
+    exports: HashMap<(usize, String), Vec<Reached>>,
     in_progress: HashSet<(usize, String)>,
     kept_parameters: HashMap<(usize, usize), Vec<bool>>,
 }
 
-pub(crate) fn add_symbols(linked_files: &[LinkedFile], graph: &mut GraphBuilder) {
+struct Targets<'t> {
+    symbol_ids: &'t [Vec<SymbolId>],
+    module_files: &'t [FileId],
+}
+
+impl Targets<'_> {
+    fn target(
+        &self,
+        resolved: Resolved,
+        graph: &mut GraphBuilder,
+    ) -> (SymbolTarget, FileId, Option<RepoPath>) {
+        match resolved {
+            Resolved::Symbol { module, symbol } => (
+                SymbolTarget::Symbol(self.symbol_ids[module][symbol]),
+                self.module_files[module],
+                None,
+            ),
+            Resolved::Namespace(module) => (
+                SymbolTarget::Module {
+                    file: self.module_files[module],
+                    cause: WholeModuleCause::EscapingNamespace,
+                },
+                self.module_files[module],
+                None,
+            ),
+            Resolved::Whole { file: path, cause } => {
+                let file = graph.add_file(path.clone());
+
+                (SymbolTarget::Module { file, cause }, file, Some(path))
+            }
+        }
+    }
+}
+
+pub(crate) fn add_symbols(
+    linked_files: &[LinkedFile],
+    base_modules: &HashMap<RepoPath, ModuleSymbols>,
+    graph: &mut GraphBuilder,
+) {
     let mut modules = Vec::new();
 
     for linked_file in linked_files {
@@ -112,49 +184,48 @@ pub(crate) fn add_symbols(linked_files: &[LinkedFile], graph: &mut GraphBuilder)
         kept_parameters: HashMap::new(),
     };
 
+    let targets = Targets {
+        symbol_ids: &symbol_ids,
+        module_files: &module_files,
+    };
+
     resolver.solve_kept_parameters();
 
-    for module in 0..resolver.modules.len() {
-        let mut edges = BTreeSet::new();
+    for (module, module_symbol_ids) in symbol_ids.iter().enumerate() {
+        let mut edges: BTreeMap<SymbolEdge, Vec<FileId>> = BTreeMap::new();
         let mut covered_files = HashSet::new();
 
         for resolved_use in resolver.resolved_uses(module) {
-            let (dependency, file, path) = match resolved_use.resolved {
-                Resolved::Symbol { module, symbol } => (
-                    SymbolTarget::Symbol(symbol_ids[module][symbol]),
-                    module_files[module],
-                    None,
-                ),
-                Resolved::Namespace(module) => (
-                    SymbolTarget::Module {
-                        file: module_files[module],
-                        cause: WholeModuleCause::EscapingNamespace,
-                    },
-                    module_files[module],
-                    None,
-                ),
-                Resolved::Whole { file: path, cause } => {
-                    let file = graph.add_file(path.clone());
-
-                    (SymbolTarget::Module { file, cause }, file, Some(path))
-                }
-            };
+            let through: Vec<FileId> = resolved_use
+                .reached
+                .through
+                .iter()
+                .map(|&module| module_files[module])
+                .collect();
+            let (dependency, file, path) = targets.target(resolved_use.reached.resolved, graph);
             let is_asset = path.is_some_and(|path| is_asset_file(&path));
             let kind = if is_asset && !resolved_use.raw {
                 EdgeKind::Asset
             } else {
                 EdgeKind::Import
             };
-
-            covered_files.insert(file);
-            edges.insert(SymbolEdge {
-                dependent: symbol_ids[module][resolved_use.dependent],
+            let edge = SymbolEdge {
+                dependent: module_symbol_ids[resolved_use.dependent],
                 dependency,
                 kind,
-            });
+            };
+
+            covered_files.insert(file);
+
+            match edges.entry(edge) {
+                Entry::Vacant(entry) => {
+                    entry.insert(through);
+                }
+                Entry::Occupied(mut entry) => entry.get_mut().retain(|file| through.contains(file)),
+            }
         }
 
-        let init = symbol_ids[module][ModuleSymbols::INIT];
+        let init = module_symbol_ids[ModuleSymbols::INIT];
 
         for dependency in resolver.modules[module].dependencies {
             if !matches!(dependency.kind, EdgeKind::Import | EdgeKind::Asset) {
@@ -164,20 +235,43 @@ pub(crate) fn add_symbols(linked_files: &[LinkedFile], graph: &mut GraphBuilder)
             let file = graph.add_file(dependency.path.clone());
 
             if covered_files.insert(file) {
-                edges.insert(SymbolEdge {
+                let edge = SymbolEdge {
                     dependent: init,
                     dependency: SymbolTarget::Module {
                         file,
                         cause: WholeModuleCause::Unattributed,
                     },
                     kind: dependency.kind,
-                });
+                };
+
+                edges.insert(edge, Vec::new());
             }
         }
 
-        for edge in edges {
-            graph.add_symbol_edge(edge);
+        for (edge, through) in edges {
+            graph.add_symbol_edge_through(edge, through);
         }
+    }
+
+    for (module, &file) in module_files.iter().enumerate() {
+        let Some(base) = base_modules.get(resolver.modules[module].path) else {
+            continue;
+        };
+        let symbol_changes = resolver
+            .symbol_changes(module, base)
+            .into_iter()
+            .map(|(name, kind, reaches)| SymbolChange {
+                file,
+                name,
+                kind,
+                reaches: reaches
+                    .into_iter()
+                    .map(|reached| targets.target(reached.resolved, graph).0)
+                    .collect(),
+            })
+            .collect();
+
+        graph.add_module_changes(file, symbol_changes);
     }
 }
 
@@ -207,9 +301,9 @@ impl Resolver<'_> {
                 };
 
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
-                    |resolved| ResolvedUse {
+                    |reached| ResolvedUse {
                         dependent,
-                        resolved,
+                        reached,
                         raw,
                     },
                 ));
@@ -223,9 +317,9 @@ impl Resolver<'_> {
 
             for symbol_use in &argument.uses {
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
-                    |resolved| ResolvedUse {
+                    |reached| ResolvedUse {
                         dependent: ModuleSymbols::INIT,
-                        resolved,
+                        reached,
                         raw: false,
                     },
                 ));
@@ -238,13 +332,123 @@ impl Resolver<'_> {
             resolved_uses.extend(self.load(module, specifier).into_iter().map(|resolved| {
                 ResolvedUse {
                     dependent: ModuleSymbols::INIT,
-                    resolved,
+                    reached: Reached::direct(resolved),
                     raw,
                 }
             }));
         }
 
         resolved_uses
+    }
+
+    fn symbol_changes(
+        &mut self,
+        module: usize,
+        base: &ModuleSymbols,
+    ) -> Vec<(String, SymbolChangeKind, Vec<Reached>)> {
+        let head = self.modules[module].symbols;
+        let mut symbol_changes = Vec::new();
+
+        for changed in module_changes(base, head) {
+            match changed {
+                Changed::Symbol { index, kind } => symbol_changes.push((
+                    head.symbols[index].name.clone(),
+                    kind,
+                    vec![Reached::direct(Resolved::Symbol {
+                        module,
+                        symbol: index,
+                    })],
+                )),
+                Changed::Removed(name) => {
+                    symbol_changes.push((name, SymbolChangeKind::Removed, Vec::new()));
+                }
+                Changed::Export(name) => {
+                    let reaches = self.resolve_name(module, &name);
+
+                    symbol_changes.push((name, SymbolChangeKind::Export, reaches));
+                }
+                Changed::StarExport(specifier) => {
+                    for target in self.targets(module, &specifier) {
+                        let Some(&target_module) = self.module_indices.get(&target) else {
+                            let reaches = vec![Reached::direct(Resolved::Whole {
+                                file: target,
+                                cause: WholeModuleCause::NotAnalysed,
+                            })];
+
+                            symbol_changes.push((
+                                specifier.clone(),
+                                SymbolChangeKind::Export,
+                                reaches,
+                            ));
+
+                            continue;
+                        };
+                        let mut names = BTreeSet::new();
+
+                        self.exported_names(target_module, &mut HashSet::new(), &mut names);
+
+                        for name in names {
+                            let reaches = self.resolve_name(module, &name);
+
+                            symbol_changes.push((name, SymbolChangeKind::Export, reaches));
+                        }
+                    }
+                }
+            }
+        }
+
+        symbol_changes
+    }
+
+    fn exported_names(
+        &self,
+        module: usize,
+        visited: &mut HashSet<usize>,
+        names: &mut BTreeSet<String>,
+    ) {
+        if !visited.insert(module) {
+            return;
+        }
+
+        let symbols = self.modules[module].symbols;
+
+        names.extend(
+            symbols
+                .exports
+                .iter()
+                .map(|(name, _)| name)
+                .filter(|name| *name != DEFAULT_EXPORT)
+                .cloned(),
+        );
+
+        for specifier in &symbols.star_exports {
+            for target in self.targets(module, specifier) {
+                if let Some(&target_module) = self.module_indices.get(&target) {
+                    self.exported_names(target_module, visited, names);
+                }
+            }
+        }
+    }
+
+    fn star_sources(&self, module: usize) -> Vec<usize> {
+        let mut searched = vec![module];
+        let mut index = 0;
+
+        while let Some(&current) = searched.get(index) {
+            index += 1;
+
+            for specifier in &self.modules[current].symbols.star_exports {
+                for target in self.targets(current, specifier) {
+                    if let Some(&target_module) = self.module_indices.get(&target)
+                        && !searched.contains(&target_module)
+                    {
+                        searched.push(target_module);
+                    }
+                }
+            }
+        }
+
+        searched
     }
 
     fn solve_kept_parameters(&mut self) {
@@ -301,7 +505,12 @@ impl Resolver<'_> {
 
     fn keeps(&mut self, module: usize, callee: &Use, argument: usize) -> bool {
         match self.resolve_use(module, callee).as_slice() {
-            [Resolved::Symbol { module, symbol }] => self
+            [
+                Reached {
+                    resolved: Resolved::Symbol { module, symbol },
+                    ..
+                },
+            ] => self
                 .kept_parameters
                 .get(&(*module, *symbol))
                 .and_then(|kept| kept.get(argument))
@@ -330,48 +539,72 @@ impl Resolver<'_> {
             .collect()
     }
 
-    fn resolve_use(&mut self, module: usize, symbol_use: &Use) -> Vec<Resolved> {
+    fn resolve_use(&mut self, module: usize, symbol_use: &Use) -> Vec<Reached> {
         match symbol_use {
-            Use::Local(symbol) => vec![Resolved::Symbol {
+            Use::Local(symbol) => vec![Reached::direct(Resolved::Symbol {
                 module,
                 symbol: *symbol,
-            }],
+            })],
             Use::Import { binding, member } => {
                 let binding = &self.modules[module].symbols.imports[*binding];
-                let mut resolved = Vec::new();
+                let mut reached = Vec::new();
 
                 for imported in self.resolve_import(module, &binding.specifier, &binding.imported) {
-                    match (imported, member) {
-                        (Resolved::Namespace(namespace), Some(member)) => {
-                            resolved.extend(self.resolve_name(namespace, member));
+                    let Resolved::Namespace(namespace) = imported.resolved else {
+                        reached.push(imported);
+
+                        continue;
+                    };
+
+                    match member {
+                        Some(member) => {
+                            let members = self.resolve_name(namespace, member);
+
+                            reached.extend(members.into_iter().map(|member| {
+                                let mut member = member.passing(namespace, &self.modules);
+
+                                member
+                                    .through
+                                    .splice(0..0, imported.through.iter().copied());
+
+                                member
+                            }));
                         }
-                        (Resolved::Namespace(namespace), None) => {
+                        None => {
                             let cause = if binding.imported == Imported::Dynamic {
                                 WholeModuleCause::DynamicLoad
                             } else {
                                 WholeModuleCause::EscapingNamespace
                             };
 
-                            resolved.push(Resolved::Whole {
-                                file: self.modules[namespace].path.clone(),
-                                cause,
+                            reached.push(Reached {
+                                resolved: Resolved::Whole {
+                                    file: self.modules[namespace].path.clone(),
+                                    cause,
+                                },
+                                through: imported.through,
                             });
                         }
-                        (imported, _) => resolved.push(imported),
                     }
                 }
 
-                resolved
+                reached
             }
             Use::Module(specifier) => self
                 .targets(module, specifier)
                 .into_iter()
-                .map(|file| Resolved::Whole {
-                    file,
-                    cause: WholeModuleCause::DynamicLoad,
+                .map(|file| {
+                    Reached::direct(Resolved::Whole {
+                        file,
+                        cause: WholeModuleCause::DynamicLoad,
+                    })
                 })
                 .collect(),
-            Use::Load(specifier) => self.load(module, specifier),
+            Use::Load(specifier) => self
+                .load(module, specifier)
+                .into_iter()
+                .map(Reached::direct)
+                .collect(),
         }
     }
 
@@ -380,48 +613,67 @@ impl Resolver<'_> {
         module: usize,
         specifier: &str,
         imported: &Imported,
-    ) -> Vec<Resolved> {
-        let mut resolved = Vec::new();
+    ) -> Vec<Reached> {
+        let mut reached = Vec::new();
 
         for target in self.targets(module, specifier) {
             let Some(&target_module) = self.module_indices.get(&target) else {
-                resolved.push(Resolved::Whole {
+                reached.push(Reached::direct(Resolved::Whole {
                     file: target,
                     cause: WholeModuleCause::NotAnalysed,
-                });
+                }));
 
                 continue;
             };
 
             match imported {
                 Imported::Namespace | Imported::Dynamic => {
-                    resolved.push(Resolved::Namespace(target_module));
+                    reached.push(Reached::direct(Resolved::Namespace(target_module)));
                 }
-                Imported::Module => resolved.push(Resolved::Whole {
+                Imported::Module => reached.push(Reached::direct(Resolved::Whole {
                     file: target,
                     cause: WholeModuleCause::DynamicLoad,
-                }),
-                Imported::Name(name) => resolved.extend(self.resolve_name(target_module, name)),
+                })),
+                Imported::Name(name) => {
+                    let named = self.resolve_name(target_module, name);
+
+                    reached.extend(
+                        named
+                            .into_iter()
+                            .map(|named| named.passing(target_module, &self.modules)),
+                    );
+                }
             }
         }
 
-        resolved
+        reached
     }
 
-    fn resolve_name(&mut self, module: usize, name: &str) -> Vec<Resolved> {
+    fn resolve_name(&mut self, module: usize, name: &str) -> Vec<Reached> {
         let exported = self.resolve_export(module, name);
 
-        if exported.is_empty() {
-            return vec![Resolved::Whole {
-                file: self.modules[module].path.clone(),
-                cause: WholeModuleCause::MissingExport,
-            }];
+        if !exported.is_empty() {
+            return exported;
         }
 
-        exported
+        let searched = if name == DEFAULT_EXPORT {
+            vec![module]
+        } else {
+            self.star_sources(module)
+        };
+
+        searched
+            .into_iter()
+            .map(|searched_module| {
+                Reached::direct(Resolved::Whole {
+                    file: self.modules[searched_module].path.clone(),
+                    cause: WholeModuleCause::MissingExport,
+                })
+            })
+            .collect()
     }
 
-    fn resolve_export(&mut self, module: usize, name: &str) -> Vec<Resolved> {
+    fn resolve_export(&mut self, module: usize, name: &str) -> Vec<Reached> {
         let key = (module, name.to_owned());
 
         if let Some(resolved) = self.exports.get(&key) {
@@ -440,7 +692,7 @@ impl Resolver<'_> {
         resolved
     }
 
-    fn find_export(&mut self, module: usize, name: &str) -> Vec<Resolved> {
+    fn find_export(&mut self, module: usize, name: &str) -> Vec<Reached> {
         let symbols = self.modules[module].symbols;
         let mut entries = symbols
             .exports
@@ -454,10 +706,12 @@ impl Resolver<'_> {
 
             for entry in entries {
                 match entry {
-                    ExportTarget::Local(symbol) => resolved.push(Resolved::Symbol {
-                        module,
-                        symbol: *symbol,
-                    }),
+                    ExportTarget::Local(symbol) => {
+                        resolved.push(Reached::direct(Resolved::Symbol {
+                            module,
+                            symbol: *symbol,
+                        }))
+                    }
                     ExportTarget::Import(binding) => {
                         let binding = &symbols.imports[*binding];
 
@@ -497,11 +751,19 @@ impl Resolver<'_> {
         for specifier in &symbols.star_exports {
             for target in self.targets(module, specifier) {
                 match self.module_indices.get(&target) {
-                    Some(&target_module) => found.extend(self.resolve_export(target_module, name)),
-                    None => not_analysed.push(Resolved::Whole {
+                    Some(&target_module) => {
+                        let exported = self.resolve_export(target_module, name);
+
+                        found.extend(
+                            exported
+                                .into_iter()
+                                .map(|exported| exported.passing(target_module, &self.modules)),
+                        );
+                    }
+                    None => not_analysed.push(Reached::direct(Resolved::Whole {
                         file: target,
                         cause: WholeModuleCause::NotAnalysed,
-                    }),
+                    })),
                 }
             }
         }

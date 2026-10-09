@@ -10,6 +10,10 @@ use crate::graph::{Edge, EdgeKind, Graph, TestFile};
 use crate::patterns::describe_captures;
 use crate::ratios::{format_percentage, rounded_ratio};
 use crate::select::{Hop, Link, Reason, SelectedTest};
+use crate::symbols::{
+    MODULE_INIT_NAME, SymbolChange, SymbolChangeKind, SymbolEdge, SymbolKind, SymbolTarget,
+    WholeModuleCause,
+};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -606,7 +610,13 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
         Link::Edge {
             kind: EdgeKind::Import,
             ..
-        } => format!("-> imported by {dependent}"),
+        } => match graph.fallback_of(hop.dependent) {
+            Some(cause) => format!(
+                "-> imported by {dependent} (analysed at file level: {})",
+                cause.description()
+            ),
+            None => format!("-> imported by {dependent}"),
+        },
         Link::Edge {
             kind: EdgeKind::TypeOnly,
             ..
@@ -689,6 +699,35 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
                 None => format!("-> {verb} by {dependent}"),
             }
         }
+        Link::Uses(edge) => describe_use(graph, &edge),
+        Link::Loads {
+            dependency,
+            dependent: loading_symbol,
+        } => {
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind: EdgeKind::Dynamic,
+            };
+            let site = match graph.inference(&edge) {
+                Some(inference) => format!(
+                    "{dependent}:{} ({})",
+                    inference.line,
+                    inference.description()
+                ),
+                None => dependent.to_string(),
+            };
+            let loading_symbol = graph.symbol(loading_symbol);
+
+            if loading_symbol.kind == SymbolKind::ModuleInit {
+                format!("-> loaded by {site}")
+            } else {
+                format!("-> loaded by {} in {site}", loading_symbol.name)
+            }
+        }
+        Link::ChangedSymbol(change_index) => {
+            describe_symbol_change(&graph.symbol_changes()[change_index])
+        }
         Link::ChangedPart(part_index) => {
             format!("-> {}", graph.changed_parts()[part_index].description)
         }
@@ -708,6 +747,64 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
                 set_aside_site.site.line, set_aside_site.site.expression, set_aside_site.line
             )
         }
+    }
+}
+
+fn describe_use(graph: &Graph, edge: &SymbolEdge) -> String {
+    let user = graph.symbol(edge.dependent);
+    let user_file = graph.path(user.file);
+    let at_load = user.kind == SymbolKind::ModuleInit;
+
+    match edge.dependency {
+        SymbolTarget::Symbol(used) => {
+            let used = graph.symbol(used);
+
+            match (used.kind == SymbolKind::ModuleInit, at_load) {
+                (true, true) => format!("-> loaded by {user_file}"),
+                (true, false) => format!("-> loaded by {} in {user_file}", user.name),
+                (false, true) => format!("-> {} used at load by {user_file}", used.name),
+                (false, false) => {
+                    format!("-> {} used by {} in {user_file}", used.name, user.name)
+                }
+            }
+        }
+        SymbolTarget::Module { .. } if edge.kind == EdgeKind::Asset => {
+            if at_load {
+                format!("-> imported as an asset by {user_file}")
+            } else {
+                format!("-> imported as an asset by {} in {user_file}", user.name)
+            }
+        }
+        SymbolTarget::Module { file, cause } => {
+            let why = match (cause, graph.fallback_of(file)) {
+                (WholeModuleCause::NotAnalysed, Some(fallback)) => {
+                    format!(" (analysed at file level: {})", fallback.description())
+                }
+                (WholeModuleCause::NotAnalysed, None) => String::new(),
+                (cause, _) => format!(" ({})", cause.description()),
+            };
+
+            if at_load {
+                format!("-> used whole at load by {user_file}{why}")
+            } else {
+                format!("-> used whole by {} in {user_file}{why}", user.name)
+            }
+        }
+    }
+}
+
+fn describe_symbol_change(symbol_change: &SymbolChange) -> String {
+    let name = &symbol_change.name;
+
+    match &symbol_change.kind {
+        SymbolChangeKind::Modified if name == MODULE_INIT_NAME => {
+            "-> code run at load changed".to_owned()
+        }
+        SymbolChangeKind::Modified => format!("-> {name} changed"),
+        SymbolChangeKind::Added => format!("-> {name} added"),
+        SymbolChangeKind::Renamed { from } => format!("-> {name} renamed from {from}"),
+        SymbolChangeKind::Removed => format!("-> {name} removed"),
+        SymbolChangeKind::Export => format!("-> export {name} changed"),
     }
 }
 

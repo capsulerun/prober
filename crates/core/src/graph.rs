@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use crate::files::{FileId, FileTable, RepoPath};
 use crate::patterns::Captures;
 use crate::symbols::{
-    ModuleFallback, Symbol, SymbolEdge, SymbolId, SymbolKind, SymbolTable, SymbolTableBuilder,
-    SymbolTarget,
+    FallbackCause, ModuleFallback, Symbol, SymbolChange, SymbolEdge, SymbolId, SymbolKind,
+    SymbolTable, SymbolTableBuilder, SymbolTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -335,8 +335,16 @@ impl GraphBuilder {
         self.symbols.add_edge(edge);
     }
 
+    pub fn add_symbol_edge_through(&mut self, edge: SymbolEdge, through: Vec<FileId>) {
+        self.symbols.add_edge_through(edge, through);
+    }
+
     pub fn add_fallback(&mut self, fallback: ModuleFallback) {
         self.symbols.add_fallback(fallback);
+    }
+
+    pub fn add_module_changes(&mut self, file: FileId, changes: Vec<SymbolChange>) {
+        self.symbols.add_module_changes(file, changes);
     }
 
     pub(crate) fn files(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
@@ -747,10 +755,10 @@ impl Graph {
             .iter()
             .copied()
             .filter(|&symbol| {
-                let symbol = self.symbol(symbol);
-
-                symbol.kind != SymbolKind::ModuleInit
-                    && symbol.lines.iter().any(|lines| lines.contains(line))
+                self.symbol(symbol)
+                    .lines
+                    .iter()
+                    .any(|lines| lines.contains(line))
             })
             .collect();
 
@@ -779,6 +787,25 @@ impl Graph {
 
     pub fn fallbacks(&self) -> &[ModuleFallback] {
         self.symbols.fallbacks()
+    }
+
+    pub fn symbol_edge_through(&self, edge: &SymbolEdge) -> &[FileId] {
+        self.symbols.through(edge)
+    }
+
+    pub fn fallback_of(&self, file: FileId) -> Option<FallbackCause> {
+        self.fallbacks()
+            .iter()
+            .find(|fallback| fallback.file == file)
+            .map(|fallback| fallback.cause)
+    }
+
+    pub fn symbol_changes(&self) -> &[SymbolChange] {
+        self.symbols.changes()
+    }
+
+    pub fn module_changes(&self, file: FileId) -> Option<&[usize]> {
+        self.symbols.changes_of(file)
     }
 
     pub fn symbol_target_file(&self, target: SymbolTarget) -> FileId {
