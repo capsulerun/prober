@@ -15,6 +15,7 @@ pub enum EdgeKind {
     Family,
     Spawn,
     Build,
+    Rule,
 }
 
 impl EdgeKind {
@@ -28,7 +29,8 @@ impl EdgeKind {
             | EdgeKind::Lists
             | EdgeKind::Family
             | EdgeKind::Spawn
-            | EdgeKind::Build => true,
+            | EdgeKind::Build
+            | EdgeKind::Rule => true,
             EdgeKind::TypeOnly => false,
         }
     }
@@ -135,6 +137,41 @@ pub struct UnresolvedSite {
     pub language: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetAside {
+    Ignored { line: usize },
+    Resolved { line: usize },
+}
+
+impl SetAside {
+    pub fn line(self) -> usize {
+        match self {
+            SetAside::Ignored { line } | SetAside::Resolved { line } => line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetAsideSite {
+    pub site: UnresolvedSite,
+    pub set_aside: SetAside,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IgnoredEdge {
+    pub edge: Edge,
+    pub line: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RootScope {
+    pub directory: String,
+    pub configs: Vec<RepoPath>,
+    pub files: Vec<RepoPath>,
+    pub packages: usize,
+    pub tests: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ChangedPart {
     pub change_path: RepoPath,
@@ -167,6 +204,9 @@ pub struct GraphBuilder {
     changed_contracts: HashSet<FileId>,
     asset_blind_tests: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
+    ignored_edges: Vec<IgnoredEdge>,
+    set_aside_sites: Vec<SetAsideSite>,
+    root_scopes: Vec<RootScope>,
 }
 
 impl GraphBuilder {
@@ -236,13 +276,74 @@ impl GraphBuilder {
         self.module_filters.insert(language, loads);
     }
 
+    pub fn add_root_scope(&mut self, root_scope: RootScope) {
+        self.root_scopes.push(root_scope);
+    }
+
+    pub(crate) fn files(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
+        self.files.iter()
+    }
+
+    pub(crate) fn is_test(&self, file: FileId) -> bool {
+        self.test_languages.contains_key(&file)
+    }
+
+    pub(crate) fn ignore_edges(&mut self, line: usize, ignores: impl Fn(&Edge) -> bool) -> usize {
+        let inferences = &self.inferences;
+        let is_ignorable = |edge: &Edge| {
+            matches!(edge.kind, EdgeKind::Family | EdgeKind::Contains)
+                || edge.kind != EdgeKind::Rule
+                    && inferences.contains_key(&(edge.dependent, edge.dependency, edge.kind))
+        };
+        let (ignored, kept): (Vec<Edge>, Vec<Edge>) = std::mem::take(&mut self.edges)
+            .into_iter()
+            .partition(|edge| is_ignorable(edge) && ignores(edge));
+        let ignored_count = ignored.len();
+
+        self.edges = kept;
+        self.ignored_edges
+            .extend(ignored.into_iter().map(|edge| IgnoredEdge { edge, line }));
+
+        ignored_count
+    }
+
+    pub(crate) fn set_aside_sites(
+        &mut self,
+        set_aside: SetAside,
+        matches: impl Fn(&UnresolvedSite, &RepoPath) -> bool,
+    ) -> usize {
+        let files = &self.files;
+        let (matching, kept): (Vec<UnresolvedSite>, Vec<UnresolvedSite>) =
+            std::mem::take(&mut self.unresolved_sites)
+                .into_iter()
+                .partition(|site| site.cause.widens() && matches(site, files.path(site.file)));
+        let set_aside_count = matching.len();
+
+        self.unresolved_sites = kept;
+        self.set_aside_sites.extend(
+            matching
+                .into_iter()
+                .map(|site| SetAsideSite { site, set_aside }),
+        );
+
+        set_aside_count
+    }
+
     pub fn build(mut self) -> Graph {
         let mut dependents_by_file = vec![Vec::new(); self.files.len()];
         let mut dependencies_by_file = vec![Vec::new(); self.files.len()];
+        let mut ignored_dependents: HashMap<FileId, Vec<IgnoredEdge>> = HashMap::new();
 
         for edge in self.edges {
             dependents_by_file[edge.dependency.index()].push(edge);
             dependencies_by_file[edge.dependent.index()].push(edge);
+        }
+
+        for ignored_edge in self.ignored_edges {
+            ignored_dependents
+                .entry(ignored_edge.edge.dependency)
+                .or_default()
+                .push(ignored_edge);
         }
 
         for dependents in &mut dependents_by_file {
@@ -303,6 +404,9 @@ impl GraphBuilder {
             changed_contracts: self.changed_contracts,
             asset_blind_tests: self.asset_blind_tests,
             module_filters: self.module_filters,
+            ignored_dependents,
+            set_aside_sites: self.set_aside_sites,
+            root_scopes: self.root_scopes,
         }
     }
 }
@@ -320,6 +424,9 @@ pub struct Graph {
     changed_contracts: HashSet<FileId>,
     asset_blind_tests: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
+    ignored_dependents: HashMap<FileId, Vec<IgnoredEdge>>,
+    set_aside_sites: Vec<SetAsideSite>,
+    root_scopes: Vec<RootScope>,
 }
 
 impl Graph {
@@ -390,6 +497,26 @@ impl Graph {
 
     pub fn unresolved_sites(&self) -> &[UnresolvedSite] {
         &self.unresolved_sites
+    }
+
+    pub fn ignored_dependents(&self, file: FileId) -> &[IgnoredEdge] {
+        self.ignored_dependents
+            .get(&file)
+            .map_or(&[], Vec::as_slice)
+    }
+
+    pub fn ignored_edge(&self, edge: &Edge) -> Option<&IgnoredEdge> {
+        self.ignored_dependents(edge.dependency)
+            .iter()
+            .find(|ignored_edge| ignored_edge.edge == *edge)
+    }
+
+    pub fn set_aside_sites(&self) -> &[SetAsideSite] {
+        &self.set_aside_sites
+    }
+
+    pub fn root_scopes(&self) -> &[RootScope] {
+        &self.root_scopes
     }
 
     pub fn changed_parts(&self) -> &[ChangedPart] {

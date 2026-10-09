@@ -1,6 +1,7 @@
 mod pipeline;
 mod scan;
 mod shadow;
+mod why;
 
 use std::env;
 use std::io::{self, Write};
@@ -10,11 +11,10 @@ use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use prober_core::report::ListSeparator;
 
-use prober_core::report::Report;
-
-use crate::pipeline::{OnError, Revisions};
+use crate::pipeline::{OnError, Revisions, Selection};
 use crate::scan::ScanArguments;
 use crate::shadow::ShadowArguments;
+use crate::why::WhyArguments;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum Format {
@@ -47,6 +47,11 @@ enum Command {
         about = "Reports what Prober infers from the repository, what it cannot resolve, and the files no test reaches"
     )]
     Scan(ScanArguments),
+
+    #[command(
+        about = "Explains why a test file is selected for the changes between two revisions, or why it is not"
+    )]
+    Why(WhyArguments),
 }
 
 #[derive(Debug, Args)]
@@ -86,6 +91,7 @@ fn main() -> ExitCode {
     match &arguments.command {
         Some(Command::Shadow(shadow_arguments)) => shadow::run(shadow_arguments),
         Some(Command::Scan(scan_arguments)) => scan::run(scan_arguments),
+        Some(Command::Why(why_arguments)) => why::run(why_arguments),
         None => select(&arguments.selection),
     }
 }
@@ -107,14 +113,14 @@ fn select(arguments: &SelectionArguments) -> ExitCode {
             .expect("clap requires --base without a subcommand"),
         head: arguments.head.clone(),
     };
-    let report = env::current_dir()
+    let selection = env::current_dir()
         .map_err(anyhow::Error::from)
         .and_then(|current_directory| {
             pipeline::run(&current_directory, &revisions, arguments.on_error)
         });
 
-    match report {
-        Ok(report) => print_selection(&report, arguments),
+    match selection {
+        Ok(selection) => print_selection(&selection, arguments),
         Err(error) => {
             eprintln!("prober: {error:#}");
 
@@ -123,7 +129,11 @@ fn select(arguments: &SelectionArguments) -> ExitCode {
     }
 }
 
-fn print_selection(report: &Report, arguments: &SelectionArguments) -> ExitCode {
+fn print_selection(selection: &Selection, arguments: &SelectionArguments) -> ExitCode {
+    let report = &selection.report;
+
+    print_warnings(selection);
+
     let output = match arguments.format {
         Format::Json => report.to_json(),
         Format::List if arguments.nul_separated => report.to_list(ListSeparator::Nul),
@@ -133,6 +143,12 @@ fn print_selection(report: &Report, arguments: &SelectionArguments) -> ExitCode 
     eprintln!("{}", report.summary_line());
 
     write_to_stdout(&output)
+}
+
+fn print_warnings(selection: &Selection) {
+    for warning in &selection.warnings {
+        eprintln!("prober: warning: {warning}");
+    }
 }
 
 fn write_to_stdout(output: &str) -> ExitCode {

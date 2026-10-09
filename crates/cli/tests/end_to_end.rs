@@ -100,7 +100,15 @@ impl TestRepository {
     }
 
     fn prober(&self, arguments: &[&str]) -> ProberRun {
-        run_prober(self.path(), arguments, None)
+        run_prober(self.path(), arguments, None, &[])
+    }
+
+    fn prober_with_environment(
+        &self,
+        arguments: &[&str],
+        environment: &[(&str, &str)],
+    ) -> ProberRun {
+        run_prober(self.path(), arguments, None, environment)
     }
 
     fn shadow_inputs(&self, full_run_report: &str) -> ShadowInputs {
@@ -155,13 +163,20 @@ const FULL_RUN_REPORT: &str = r#"<testsuites>
   </testsuite>
 </testsuites>"#;
 
-fn run_prober(directory: &Path, arguments: &[&str], job_summary: Option<&Path>) -> ProberRun {
+fn run_prober(
+    directory: &Path,
+    arguments: &[&str],
+    job_summary: Option<&Path>,
+    environment: &[(&str, &str)],
+) -> ProberRun {
     let mut command = Command::new(env!("CARGO_BIN_EXE_prober"));
 
     command
         .args(arguments)
         .current_dir(directory)
-        .env_remove("GITHUB_STEP_SUMMARY");
+        .env_remove("GITHUB_STEP_SUMMARY")
+        .env_remove("PROBER_SELECTION")
+        .envs(environment.iter().copied());
 
     if let Some(job_summary) = job_summary {
         command.env("GITHUB_STEP_SUMMARY", job_summary);
@@ -715,6 +730,210 @@ const output = execFileSync("npx", ["cli", "agents", "add"], { encoding: "utf8" 
 }
 
 #[test]
+fn kill_switch_runs_every_test_with_a_forced_reason() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.change_and_commit("docs/guide.md", "# Guide v2");
+
+    let forced = repository.prober_with_environment(
+        &["--base", "main", "--format", "json"],
+        &[("PROBER_SELECTION", "all")],
+    );
+    let misspelled =
+        repository.prober_with_environment(&["--base", "main"], &[("PROBER_SELECTION", "al")]);
+
+    assert_eq!(forced.json()["mode"], "all");
+    assert_eq!(
+        forced.json()["mode_reasons"],
+        json!([{ "kind": "forced", "message": "forced by PROBER_SELECTION=all" }])
+    );
+    assert_eq!(
+        forced.stderr,
+        "prober: all 2 test files — forced by PROBER_SELECTION=all\n"
+    );
+    assert_eq!(misspelled.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(
+        misspelled.stderr,
+        "prober: all 2 test files — PROBER_SELECTION must be \"all\" or unset, not \"al\"\n"
+    );
+}
+
+#[test]
+fn changes_in_languages_without_a_frontend_are_listed_as_unhandled() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.change_and_commit("apps/ios/ChatView.swift", "struct ChatView {}");
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(report["mode"], "none");
+    assert_eq!(
+        report["mode_reasons"],
+        json!([{
+            "kind": "only_unhandled",
+            "message": "1 changed file is in a language Prober does not analyse",
+        }])
+    );
+    assert_eq!(report["unhandled"], json!(["apps/ios/ChatView.swift"]));
+}
+
+fn repository_with_rules() -> TestRepository {
+    let repository = TestRepository::with_files_on_main(&[
+        ("fixtures/golden/expected.txt", "v1"),
+        ("test/output.e2e.test.ts", "export {};"),
+        ("fixtures/data.json", "{}"),
+        (
+            "src/data.test.ts",
+            r#"import { readFileSync } from "node:fs";
+const data = readFileSync(new URL("../fixtures/data.json", import.meta.url), "utf8");"#,
+        ),
+        (
+            "prober.toml",
+            r#"[[link]]
+from = "fixtures/golden/**"
+to = "test/output.e2e.test.ts"
+
+[always_run]
+tests = ["src/b.test.ts"]
+
+[[ignore]]
+from = "fixtures/data.json"
+to = "src/data.test.ts"
+
+[[ignore]]
+from = "src/missing/**"
+to = "src/a.test.ts"
+"#,
+        ),
+    ]);
+
+    repository.write("fixtures/golden/expected.txt", "v2");
+    repository.write("fixtures/data.json", r#"{ "items": [] }"#);
+    repository.commit_all("change the fixtures");
+
+    repository
+}
+
+#[test]
+fn config_links_ignores_and_smoke_tests_shape_the_selection() {
+    let repository = repository_with_rules();
+    let run = repository.prober(&["--base", "main", "--format", "json"]);
+    let report = run.json();
+
+    assert_eq!(
+        report["reasons"],
+        json!({
+            "test/output.e2e.test.ts": [
+                "fixtures/golden/expected.txt (modified)",
+                "-> linked to test/output.e2e.test.ts by prober.toml:1",
+            ],
+            "src/b.test.ts": ["always run by prober.toml:5 (\"src/b.test.ts\")"],
+        })
+    );
+    assert_eq!(
+        run.stderr,
+        "prober: warning: prober.toml:12: from \"src/missing/**\" matches no file\nprober: selected 2/4 test files (50.0%), 1 always run\n"
+    );
+}
+
+#[test]
+fn why_explains_a_selected_test_and_the_rule_leaving_another_out() {
+    let repository = repository_with_rules();
+    let why = |test: &str| repository.prober(&["why", test, "--base", "main"]);
+    let not_a_test = why("src/a.ts");
+
+    assert_eq!(
+        why("test/output.e2e.test.ts").stdout,
+        "test/output.e2e.test.ts is selected:\n  fixtures/golden/expected.txt (modified)\n  -> linked to test/output.e2e.test.ts by prober.toml:1\n"
+    );
+    assert_eq!(
+        why("./src/b.test.ts").stdout,
+        "src/b.test.ts is selected: always run by prober.toml:5 (\"src/b.test.ts\")\n"
+    );
+    assert_eq!(
+        why("src/data.test.ts").stdout,
+        "src/data.test.ts is not selected: every path goes through what prober.toml:8 ignores:\n  fixtures/data.json (modified)\n  -> read by src/data.test.ts:2 (inferred file path ../fixtures/data.json)\n"
+    );
+    assert_eq!(
+        why("src/a.test.ts").stdout,
+        "src/a.test.ts is not selected: no path links it to the 2 changed files\n"
+    );
+    assert_eq!(not_a_test.exit_code, 1);
+    assert!(
+        not_a_test
+            .stderr
+            .ends_with("prober why: src/a.ts is not a test file\n"),
+        "{}",
+        not_a_test.stderr
+    );
+}
+
+#[test]
+fn scan_suggests_declaring_what_a_loader_loads_and_the_link_stops_its_widening() {
+    let mut files = vec![
+        (
+            "src/loader.ts".to_owned(),
+            "export const plugin = await import(process.env.PLUGIN_ENTRY!);\n".to_owned(),
+        ),
+        (
+            "extensions/telegram/index.ts".to_owned(),
+            "export const id = 1;".to_owned(),
+        ),
+    ];
+
+    for index in 0..10 {
+        files.push((
+            format!("src/loader-{index}.test.ts"),
+            r#"import { plugin } from "./loader";"#.to_owned(),
+        ));
+    }
+
+    let files: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(path, content)| (path.as_str(), content.as_str()))
+        .collect();
+    let repository = TestRepository::with_files_on_main(&files);
+
+    repository.change_and_commit("src/a.ts", "export const a = 2;");
+
+    let scan = repository.prober(&["scan"]);
+    let widened = repository.prober(&["--base", "main"]);
+
+    repository.write(
+        "prober.toml",
+        "[[link]]\nfrom = \"extensions/*/index.ts\"\nto = \"src/loader.ts\"\n",
+    );
+
+    let linked = repository.prober(&["--base", "main"]);
+    let linked_scan = repository.prober(&["scan", "--format", "json"]).json();
+
+    assert!(
+        scan.stdout.contains(
+            "Suggestions: 1\n  # src/loader.ts:1 widens to 10 test files: process.env.PLUGIN_ENTRY! is computed at runtime; declare what it loads and the unresolved sites of src/loader.ts stop widening\n  [[link]]\n  from = \"path/to/what/it/loads/**\"\n  to = \"src/loader.ts\"\n"
+        ),
+        "{}",
+        scan.stdout
+    );
+    assert_eq!(
+        widened.stderr,
+        "prober: selected 12/12 test files (100.0%), 10 added by widening\n"
+    );
+    assert_eq!(linked.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(linked_scan["unresolved"], json!([]));
+    assert_eq!(
+        linked_scan["config"]["rules"],
+        json!([{
+            "line": 1,
+            "rule": "[[link]] from \"extensions/*/index.ts\" to \"src/loader.ts\"",
+            "links": 1,
+            "sites": 1,
+        }])
+    );
+}
+
+#[test]
 fn manifests_switched_off_keep_package_json_global() {
     let repository = TestRepository::with_project_on_main();
 
@@ -760,7 +979,7 @@ fn invalid_config_runs_every_test_with_an_error_reason() {
         report["mode_reasons"],
         json!([{
             "kind": "error",
-            "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`",
+            "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
         }])
     );
     assert_eq!(report["stats"]["tests_selected"], 2);
@@ -778,7 +997,7 @@ fn on_error_fail_exits_with_the_error() {
     assert_eq!(run.stdout, "");
     assert_eq!(
         run.stderr,
-        "prober: invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `inference`\n"
+        "prober: invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`\n"
     );
 }
 
@@ -838,7 +1057,7 @@ fn nul_separator_is_rejected_with_json() {
 #[test]
 fn outside_a_repository_fails_even_with_on_error_all() {
     let directory = TempDir::new().unwrap();
-    let run = run_prober(directory.path(), &["--base", "main"], None);
+    let run = run_prober(directory.path(), &["--base", "main"], None, &[]);
 
     assert_eq!(run.exit_code, 1);
     assert_eq!(run.stdout, "");
@@ -896,7 +1115,7 @@ fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
     );
     assert_eq!(
         run.stderr,
-        "prober scan: 1 links inferred from 1 sites; 1 unresolved sites reach 1/3 test files (33.3%); 0 sites load missing files; 4 files reach no test\n"
+        "prober scan: 1 links inferred from 1 sites; 1 unresolved sites reach 1/3 test files (33.3%); 0 sites load missing files; 4 files reach no test; 0 suggestions\n"
     );
 
     let text_run = repository.prober(&["scan"]);
@@ -913,7 +1132,7 @@ fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
 #[test]
 fn scan_outside_a_repository_fails() {
     let directory = TempDir::new().unwrap();
-    let run = run_prober(directory.path(), &["scan"], None);
+    let run = run_prober(directory.path(), &["scan"], None, &[]);
 
     assert_eq!(run.exit_code, 1);
     assert_eq!(run.stdout, "");
@@ -959,6 +1178,7 @@ fn shadow_appends_its_markdown_to_the_github_job_summary() {
         repository.path(),
         &shadow_inputs.arguments(),
         Some(&job_summary),
+        &[],
     );
     let job_summary_content = fs::read_to_string(&job_summary).unwrap();
 

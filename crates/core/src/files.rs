@@ -75,6 +75,13 @@ impl FileTable {
     pub(crate) fn len(&self) -> usize {
         self.paths.len()
     }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
+        self.paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (FileId(index as u32), path))
+    }
 }
 
 #[cfg(test)]

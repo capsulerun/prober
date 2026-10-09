@@ -10,7 +10,7 @@ use oxc_span::SourceType;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
-use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
+use prober_core::graph::{Edge, EdgeKind, GraphBuilder, RootScope, UnresolvedSite};
 use prober_core::report::ModeReason;
 use rayon::prelude::*;
 
@@ -263,6 +263,20 @@ impl TypeScriptLinker {
             .collect();
 
         graph.add_language(LANGUAGE, |path| is_module_file(path) && !is_test_file(path));
+
+        for group in &groups {
+            graph.add_root_scope(RootScope {
+                directory: group.directory.clone(),
+                configs: group.configs.iter().cloned().collect(),
+                files: group
+                    .config_scope
+                    .union(&group.setup_scope)
+                    .cloned()
+                    .collect(),
+                packages: group.packages.len(),
+                tests: tests.iter().filter(|test| group.covers(test)).count(),
+            });
+        }
 
         for linked_file in &linked_files {
             self.add_linked_file(linked_file, manifest_changes, graph);
