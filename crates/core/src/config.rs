@@ -48,6 +48,8 @@ pub struct InferenceSettings {
     pub manifests: bool,
     pub files: bool,
     pub naming_families: bool,
+    pub spawned_entrypoints: bool,
+    pub build_mapping: bool,
 }
 
 impl Default for InferenceSettings {
@@ -59,6 +61,8 @@ impl Default for InferenceSettings {
             manifests: true,
             files: true,
             naming_families: true,
+            spawned_entrypoints: true,
+            build_mapping: true,
         }
     }
 }
@@ -261,6 +265,8 @@ mod tests {
                 && config.inference.manifests
                 && config.inference.files
                 && config.inference.naming_families
+                && config.inference.spawned_entrypoints
+                && config.inference.build_mapping
         );
     }
 
@@ -382,7 +388,7 @@ mod tests {
             ),
             (
                 "[inference]\nanchors = false\n",
-                "invalid prober.toml at line 2, column 1: unknown field `anchors`, expected one of `dynamic_imports`, `plugin_folders`, `widening`, `manifests`, `files`, `naming_families`",
+                "invalid prober.toml at line 2, column 1: unknown field `anchors`, expected one of `dynamic_imports`, `plugin_folders`, `widening`, `manifests`, `files`, `naming_families`, `spawned_entrypoints`, `build_mapping`",
             ),
             (
                 "[always_all]\ntests = [\"a.test.ts\"]\n",

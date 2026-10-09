@@ -672,6 +672,49 @@ const input = readFileSync(new URL("./fixtures/input.json", import.meta.url), "u
 }
 
 #[test]
+fn command_change_selects_the_e2e_test_spawning_the_built_cli_unless_switched_off() {
+    let repository = TestRepository::with_files_on_main(&[
+        (
+            "package.json",
+            r#"{ "name": "cli", "type": "module", "bin": { "cli": "bin/cli.mjs" } }"#,
+        ),
+        ("bin/cli.mjs", r#"await import("../dist/entry.js");"#),
+        (
+            "src/entry.ts",
+            r#"import { addAgent } from "./commands/agents.js";"#,
+        ),
+        ("src/commands/agents.ts", "export const addAgent = 1;"),
+        (
+            "test/agents.e2e.test.ts",
+            r#"import { execFileSync } from "node:child_process";
+const output = execFileSync("npx", ["cli", "agents", "add"], { encoding: "utf8" });"#,
+        ),
+    ]);
+
+    repository.change_and_commit("src/commands/agents.ts", "export const addAgent = 2;");
+
+    let selected = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    repository.write("prober.toml", "[inference]\nspawned_entrypoints = false\n");
+
+    let switched_off = repository.prober(&["--base", "main"]);
+
+    assert_eq!(
+        selected["reasons"]["test/agents.e2e.test.ts"],
+        json!([
+            "src/commands/agents.ts (modified)",
+            "-> imported by src/entry.ts",
+            "-> built into dist/entry.js (inferred build mapping dist/ <- src/)",
+            "-> imported by bin/cli.mjs",
+            "-> spawned by test/agents.e2e.test.ts:2 (inferred spawn cli (bin of package.json))",
+        ])
+    );
+    assert_eq!(switched_off.stdout, "");
+}
+
+#[test]
 fn manifests_switched_off_keep_package_json_global() {
     let repository = TestRepository::with_project_on_main();
 

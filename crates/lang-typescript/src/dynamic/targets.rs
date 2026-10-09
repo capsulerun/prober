@@ -28,6 +28,10 @@ pub(crate) enum Target {
         specifier: String,
     },
     Glob(GlobTarget),
+    Program {
+        name: String,
+        directories: Vec<String>,
+    },
     Unresolved(UnresolvedCause),
 }
 
@@ -38,6 +42,21 @@ pub(crate) struct GlobTarget {
 }
 
 pub(crate) fn targets_of(load: &Load) -> Vec<Target> {
+    if let LoadBase::Program(directories) = &load.base {
+        return load
+            .specifier
+            .single_literal()
+            .map(|name| Target::Program {
+                name,
+                directories: directories
+                    .iter()
+                    .filter_map(|directory| literal_path(directory.parts().get(1..)?))
+                    .collect(),
+            })
+            .into_iter()
+            .collect();
+    }
+
     let patterns = match &load.specifier {
         Value::Strings(patterns) => patterns.clone(),
         Value::Unknown(unknown) => return vec![Target::Unresolved(unknown.cause)],
@@ -65,6 +84,7 @@ fn located_patterns(pattern: &Pattern, base: &LoadBase) -> Vec<Pattern> {
 
     let relative_to_base = pattern.is_relative();
     let directories = match base {
+        LoadBase::Process(directories) | LoadBase::Program(directories) => directories.clone(),
         LoadBase::Module(module) if relative_to_base => {
             vec![Pattern::repo_path(module.as_str()).directory()]
         }
@@ -116,7 +136,9 @@ fn target_of(pattern: &Pattern, base: &LoadBase) -> Target {
                 importer: match base {
                     LoadBase::Module(module) => Some(module.clone()),
                     LoadBase::Require(bases) => bases.first().and_then(repo_module),
-                    LoadBase::WorkingDirectory => None,
+                    LoadBase::WorkingDirectory | LoadBase::Process(_) | LoadBase::Program(_) => {
+                        None
+                    }
                 },
                 specifier,
             },

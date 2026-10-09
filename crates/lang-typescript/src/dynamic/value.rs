@@ -21,6 +21,7 @@ pub(crate) struct FunctionRef {
 pub(crate) struct Unknown {
     pub cause: UnresolvedCause,
     pub parameter_of: Option<FunctionRef>,
+    pub is_working_directory: bool,
 }
 
 impl Unknown {
@@ -28,6 +29,7 @@ impl Unknown {
         Self {
             cause: UnresolvedCause::RuntimeValue,
             parameter_of: None,
+            is_working_directory: false,
         }
     }
 
@@ -35,6 +37,14 @@ impl Unknown {
         Self {
             cause: UnresolvedCause::Parameter,
             parameter_of: Some(function),
+            is_working_directory: false,
+        }
+    }
+
+    pub fn working_directory() -> Self {
+        Self {
+            is_working_directory: true,
+            ..Self::runtime_value()
         }
     }
 }
@@ -301,6 +311,13 @@ pub(crate) enum AccessKind {
     Glob,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SpawnKind {
+    Command,
+    Shell,
+    Node,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Builtin {
     PathModule,
@@ -323,6 +340,8 @@ pub(crate) enum Builtin {
     FileAccess(AccessKind),
     Process,
     ProcessCwd,
+    ChildProcessModule,
+    Spawn(SpawnKind),
 }
 
 #[derive(Debug, Clone, PartialEq)]

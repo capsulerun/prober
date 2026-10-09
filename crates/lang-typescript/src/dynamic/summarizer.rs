@@ -36,6 +36,8 @@ const ARRAY_ITERATION_METHODS: [&str; 9] = [
 
 const WORKER_CONSTRUCTORS: [&str; 2] = ["Worker", "SharedWorker"];
 
+const LOADER_IMPORT_METHOD: &str = "import";
+
 const FILE_ACCESS_FUNCTIONS: &[&str] = &[
     "access",
     "accessSync",
@@ -607,12 +609,13 @@ impl<'s, 'a> Summarizer<'s, 'a> {
                 match member.object.get_inner_expression() {
                     Expression::Identifier(object) => {
                         self.symbol_of(object).is_some_and(|symbol| {
-                            matches!(
-                                self.declaration_kind(symbol),
-                                AstKind::ImportNamespaceSpecifier(_)
-                                    | AstKind::ImportDefaultSpecifier(_)
-                                    | AstKind::ImportSpecifier(_)
-                            )
+                            member.property.name == LOADER_IMPORT_METHOD
+                                || matches!(
+                                    self.declaration_kind(symbol),
+                                    AstKind::ImportNamespaceSpecifier(_)
+                                        | AstKind::ImportDefaultSpecifier(_)
+                                        | AstKind::ImportSpecifier(_)
+                                )
                         })
                     }
                     _ => false,

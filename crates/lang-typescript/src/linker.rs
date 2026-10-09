@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use oxc_allocator::Allocator;
@@ -13,8 +14,10 @@ use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
 use prober_core::report::ModeReason;
 use rayon::prelude::*;
 
+use crate::build_mapping::BuildMapping;
 use crate::conventions::{LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file};
-use crate::dynamic::evaluator::Evaluator;
+use crate::dynamic::evaluator::{Evaluator, LoadScope};
+use crate::dynamic::spawn::Programs;
 use crate::dynamic::summarizer::{SummaryScope, summarize_program};
 use crate::dynamic::summary::ModuleSummary;
 use crate::dynamic::{DynamicInference, DynamicLoading};
@@ -40,6 +43,9 @@ const RAW_IMPORT_QUERY: &str = "?raw";
 
 pub struct TypeScriptLinker {
     repo_root: PathBuf,
+    packages: BTreeMap<String, String>,
+    build_mapping: Arc<BuildMapping>,
+    programs: Programs,
     resolver: ModuleResolver,
     inference: InferenceSettings,
     presets: RunnerPresets,
@@ -69,6 +75,7 @@ pub(crate) struct LinkedFile {
     pub is_test: bool,
     pub dependencies: Vec<Dependency>,
     pub has_dynamic_sites: bool,
+    pub has_spawn_sites: bool,
     pub access_summary: Option<ModuleSummary>,
     pub resolution_change: Option<String>,
     pub mocks: Vec<MockRequest>,
@@ -83,12 +90,27 @@ impl TypeScriptLinker {
             .with_context(|| format!("cannot open repository root {}", repo_root.display()))?;
         let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
         let manifest_paths = repo_files.iter().filter(|path| is_workspace_manifest(path));
-        let packages = discover_workspace(manifest_paths, &read_head).packages;
-        let file_system =
-            RepoFileSystem::at(&repo_root).with_links(package_links(&repo_root, &packages));
-        let resolver = ModuleResolver::new(&repo_root, file_system, packages.into_keys().collect());
+        let workspace = discover_workspace(manifest_paths, &read_head);
+        let member_manifests: Vec<RepoPath> = workspace
+            .member_directories
+            .iter()
+            .filter_map(|directory| {
+                RepoPath::new(join_directory(directory, PACKAGE_MANIFEST)?).ok()
+            })
+            .collect();
+        let programs = Programs::new(member_manifests.iter().filter_map(|manifest| {
+            let document = parse_jsonc(&read_head(manifest)?).ok()?;
+
+            Some((manifest, document))
+        }));
+        let packages = workspace.packages;
+        let build_mapping = Arc::new(BuildMapping::new(&repo_root, repo_files));
+        let resolver = head_resolver(&repo_root, &packages, Some(Arc::clone(&build_mapping)));
         let linker = Self {
             repo_root,
+            packages,
+            build_mapping,
+            programs,
             resolver,
             inference: InferenceSettings::default(),
             presets: RunnerPresets::default(),
@@ -98,7 +120,23 @@ impl TypeScriptLinker {
     }
 
     pub fn with_inference(self, inference: InferenceSettings) -> Self {
-        Self { inference, ..self }
+        let resolver = if inference.build_mapping {
+            self.resolver
+        } else {
+            head_resolver(&self.repo_root, &self.packages, None)
+        };
+
+        Self {
+            inference,
+            resolver,
+            ..self
+        }
+    }
+
+    fn build_outputs(&self) -> Option<Arc<BuildMapping>> {
+        self.inference
+            .build_mapping
+            .then(|| Arc::clone(&self.build_mapping))
     }
 
     pub fn with_presets(self, presets: &Presets, repo_files: &[RepoPath]) -> Self {
@@ -172,12 +210,14 @@ impl TypeScriptLinker {
             resolver: &self.resolver,
             repo_files,
             importers: &importers,
+            package_directories: &package_directories,
+            programs: &self.programs,
             settings: self.inference,
         };
-        let analysis = dynamic_loading.analyse(dynamic_seeds(&linked_files));
-        let (dynamic_inference, file_links) = std::thread::scope(|scope| {
+        let (dynamic_inference, process_inference, file_links) = std::thread::scope(|scope| {
             let linked_files = &linked_files;
             let package_directories = &package_directories;
+            let dynamic_loading = &dynamic_loading;
             let file_links = scope.spawn(move || {
                 self.infer_file_links(
                     repo_files,
@@ -187,16 +227,29 @@ impl TypeScriptLinker {
                     changes,
                 )
             });
-            let dynamic_inference = analysis.infer();
+            let process_inference = scope.spawn(move || {
+                if !self.inference.spawned_entrypoints {
+                    return Ok(DynamicInference::default());
+                }
+
+                dynamic_loading
+                    .analyse(process_seeds(linked_files), LoadScope::Processes)
+                    .infer()
+            });
+            let dynamic_inference = dynamic_loading
+                .analyse(module_seeds(linked_files), LoadScope::Modules)
+                .infer();
 
             (
                 dynamic_inference,
-                file_links
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic)),
+                joined(process_inference),
+                joined(file_links),
             )
         });
-        let (dynamic_inference, file_links) = (dynamic_inference?, file_links?);
+        let mut dynamic_inference = dynamic_inference?;
+        let file_links = file_links?;
+
+        dynamic_inference.links.extend(process_inference?.links);
         let groups = self.runner_groups(
             repo_files,
             &linked_files,
@@ -222,6 +275,14 @@ impl TypeScriptLinker {
             follows_glob_imports: self.presets.follows_glob_imports(),
         }
         .add_to(graph);
+
+        if self.inference.build_mapping {
+            add_build_edges(
+                &self.build_mapping,
+                build_output_candidates(&linked_files, &dynamic_inference),
+                graph,
+            );
+        }
 
         add_dynamic_inference(dynamic_inference, graph);
         add_file_links(file_links, graph);
@@ -439,7 +500,8 @@ impl TypeScriptLinker {
             .map(|(path, bytes)| (self.repo_root.join(path.as_str()), bytes.clone()));
         let file_system = RepoFileSystem::at(&self.repo_root)
             .with_links(package_links(&self.repo_root, &packages))
-            .with_overlay(overlay);
+            .with_overlay(overlay)
+            .with_build_mapping(self.build_outputs());
 
         ModuleResolver::new(&self.repo_root, file_system, packages.into_keys().collect())
     }
@@ -524,6 +586,7 @@ impl TypeScriptLinker {
             is_test: self.presets.is_test(path, imports_node_test),
             dependencies,
             has_dynamic_sites: parsed_imports.has_dynamic_sites,
+            has_spawn_sites: parsed_imports.has_spawn_sites,
             access_summary,
             resolution_change,
             mocks: parsed_imports.mocks,
@@ -533,12 +596,26 @@ impl TypeScriptLinker {
     }
 }
 
-fn dynamic_seeds(linked_files: &[LinkedFile]) -> Vec<RepoPath> {
+fn module_seeds(linked_files: &[LinkedFile]) -> Vec<RepoPath> {
     linked_files
         .iter()
         .filter(|linked_file| linked_file.has_dynamic_sites)
         .map(|linked_file| linked_file.path.clone())
         .collect()
+}
+
+fn process_seeds(linked_files: &[LinkedFile]) -> Vec<RepoPath> {
+    linked_files
+        .iter()
+        .filter(|linked_file| linked_file.has_spawn_sites)
+        .map(|linked_file| linked_file.path.clone())
+        .collect()
+}
+
+fn joined<T>(handle: std::thread::ScopedJoinHandle<'_, T>) -> T {
+    handle
+        .join()
+        .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 fn importers(linked_files: &[LinkedFile]) -> HashMap<RepoPath, Vec<RepoPath>> {
@@ -569,6 +646,55 @@ fn package_directories(repo_files: &[RepoPath]) -> BTreeSet<String> {
         .filter(|path| path.as_str().rsplit('/').next() == Some(PACKAGE_MANIFEST))
         .map(|path| parent_directory(path).to_owned())
         .collect()
+}
+
+fn head_resolver(
+    repo_root: &Path,
+    packages: &BTreeMap<String, String>,
+    build_mapping: Option<Arc<BuildMapping>>,
+) -> ModuleResolver {
+    let file_system = RepoFileSystem::at(repo_root)
+        .with_links(package_links(repo_root, packages))
+        .with_build_mapping(build_mapping);
+
+    ModuleResolver::new(repo_root, file_system, packages.keys().cloned().collect())
+}
+
+fn build_output_candidates<'l>(
+    linked_files: &'l [LinkedFile],
+    dynamic_inference: &'l DynamicInference,
+) -> BTreeSet<&'l RepoPath> {
+    linked_files
+        .iter()
+        .flat_map(|linked_file| &linked_file.dependencies)
+        .map(|dependency| &dependency.path)
+        .chain(
+            dynamic_inference
+                .links
+                .iter()
+                .map(|dynamic_link| &dynamic_link.dependency),
+        )
+        .collect()
+}
+
+fn add_build_edges(
+    build_mapping: &BuildMapping,
+    candidates: BTreeSet<&RepoPath>,
+    graph: &mut GraphBuilder,
+) {
+    for output in candidates {
+        for build_source in build_mapping.sources_of(output.as_str()) {
+            let output_file = graph.add_file(output.clone());
+            let source_file = graph.add_file(build_source.path);
+            let build_edge = Edge {
+                dependent: output_file,
+                dependency: source_file,
+                kind: EdgeKind::Build,
+            };
+
+            graph.add_inferred_edge(build_edge, build_source.inference);
+        }
+    }
 }
 
 fn package_links(repo_root: &Path, packages: &BTreeMap<String, String>) -> Vec<(String, PathBuf)> {
@@ -647,7 +773,7 @@ fn add_dynamic_inference(dynamic_inference: DynamicInference, graph: &mut GraphB
         let dynamic_edge = Edge {
             dependent,
             dependency,
-            kind: EdgeKind::Dynamic,
+            kind: dynamic_link.kind,
         };
 
         graph.add_inferred_edge(dynamic_edge, dynamic_link.inference);
