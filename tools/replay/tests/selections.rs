@@ -20,6 +20,10 @@ cat prober.toml >> "$PROBER_CALLS"
 printf '{"schema_version":1,"mode":"none","stats":{"selected_ratio":0.0}}\n'
 "#;
 
+const REASONING_PROBER: &str = r#"#!/bin/sh
+printf '{"schema_version":1,"mode":"selected","targets":{"typescript":["a.test.ts"]},"reasons":{"a.test.ts":["src/c.ts (modified)","-> imported by src/b.ts","-> imported by a.test.ts"]},"stats":{"selected_ratio":0.5}}\n'
+"#;
+
 const FAILING_PROBER: &str = r#"#!/bin/sh
 echo "prober: unknown revision \"$2\"" >&2
 exit 1
@@ -71,6 +75,7 @@ impl ReplayFixture {
 
         fixture.write_script("prober", STUB_PROBER);
         fixture.write_script("failing-prober", FAILING_PROBER);
+        fixture.write_script("reasoning-prober", REASONING_PROBER);
         fixture.write_script("config-reading-prober", CONFIG_READING_PROBER);
 
         Self { commits, ..fixture }
@@ -122,11 +127,25 @@ impl ReplayFixture {
     }
 
     fn replay_with(&self, repository: &Path, prober_script: &str, arguments: &[&str]) -> ReplayRun {
+        self.run_subcommand("selections", repository, prober_script, arguments)
+    }
+
+    fn probe(&self, arguments: &[&str]) -> ReplayRun {
+        self.run_subcommand("probe", &self.repository(), "prober", arguments)
+    }
+
+    fn run_subcommand(
+        &self,
+        subcommand: &str,
+        repository: &Path,
+        prober_script: &str,
+        arguments: &[&str],
+    ) -> ReplayRun {
         let output = self.path("records.jsonl");
         let worktree = self.path("worktree");
         let output = Command::new(env!("CARGO_BIN_EXE_prober-replay"))
             .args([
-                "selections",
+                subcommand,
                 "--repo",
                 repository.to_str().unwrap(),
                 "--output",
@@ -349,6 +368,34 @@ fn prober_config_is_placed_in_the_worktree_for_each_change_and_removed_after() {
 }
 
 #[test]
+fn prober_config_replaces_one_left_untracked_in_the_worktree() {
+    let fixture = ReplayFixture::with_commits(3);
+    let config_path = fixture.path("inference-off.toml");
+
+    fixture.replay(&["--last", "1"]);
+    fs::write(fixture.path("worktree").join("prober.toml"), "leftover\n").unwrap();
+    fs::write(&config_path, "[inference]\ndynamic_imports = false\n").unwrap();
+
+    let run = fixture.replay_with_prober(
+        "config-reading-prober",
+        &[
+            "--last",
+            "2",
+            "--prober-config",
+            config_path.to_str().unwrap(),
+        ],
+    );
+
+    assert_eq!(run.exit_code, 0, "{}", run.stderr);
+    assert!(
+        fs::read_to_string(fixture.path("prober-calls.txt"))
+            .unwrap()
+            .ends_with("[inference]\ndynamic_imports = false\n")
+    );
+    assert!(!fixture.path("worktree").join("prober.toml").exists());
+}
+
+#[test]
 fn prober_config_never_replaces_a_tracked_one() {
     let fixture = ReplayFixture::with_commits(1);
     let config_path = fixture.path("inference-off.toml");
@@ -428,4 +475,94 @@ fn missing_heads_are_fetched_from_origin_when_asked() {
 
     assert_eq!(records[0]["error"], Value::Null);
     assert_eq!(records[0]["selection"]["revisions"]["head"], late_commit);
+}
+
+#[test]
+fn probes_change_one_file_at_a_time_and_replay_it_against_the_commit() {
+    let fixture = ReplayFixture::with_commits(3);
+    let probed_commit = fixture.commits[1].clone();
+    let files = fixture.path("files.txt");
+
+    fs::write(&files, "file-1.ts\n\nfile-2.ts\nfile-3.ts\n").unwrap();
+
+    let run = fixture.probe(&[
+        "--commit",
+        &probed_commit,
+        "--files",
+        files.to_str().unwrap(),
+    ]);
+    let records = fixture.records();
+
+    assert_eq!(run.exit_code, 0, "{}", run.stderr);
+    assert!(
+        run.stderr.starts_with(
+            "prober-replay: replayed 3 changes, 0 already recorded, 1 failed — 2 selected"
+        ),
+        "{}",
+        run.stderr
+    );
+
+    for (record, file) in records.iter().zip(["file-1.ts", "file-2.ts"]) {
+        let head = record["head"].as_str().unwrap();
+
+        assert_eq!(record["id"], file);
+        assert_eq!(record["base"], probed_commit.as_str());
+        assert_eq!(record["selection"]["revisions"]["head"], head);
+        assert_eq!(
+            fixture.git(&["diff", "--name-only", &probed_commit, head]),
+            format!("{file}\n")
+        );
+    }
+
+    assert_eq!(
+        records[2]["error"],
+        format!("file-3.ts is not a file at {probed_commit}")
+    );
+    assert_eq!(
+        fixture
+            .git(&[
+                "-C",
+                fixture.path("worktree").to_str().unwrap(),
+                "rev-parse",
+                "HEAD"
+            ])
+            .trim(),
+        probed_commit
+    );
+    assert_eq!(
+        fixture
+            .probe(&[
+                "--commit",
+                &probed_commit,
+                "--files",
+                files.to_str().unwrap()
+            ])
+            .stderr,
+        "prober-replay: nothing to probe, 3 files already recorded\n"
+    );
+}
+
+#[test]
+fn records_keep_the_first_hop_of_each_reason_unless_asked_for_every_hop() {
+    let fixture = ReplayFixture::with_commits(3);
+    let reason_lengths = |records: &[Value]| -> Vec<usize> {
+        records
+            .iter()
+            .map(|record| {
+                record["selection"]["reasons"]["a.test.ts"]
+                    .as_array()
+                    .unwrap()
+                    .len()
+            })
+            .collect()
+    };
+
+    fixture.replay_with_prober("reasoning-prober", &["--last", "2", "--full-reasons"]);
+
+    assert_eq!(reason_lengths(&fixture.records()), [3, 3]);
+
+    fs::remove_file(fixture.path("records.jsonl")).unwrap();
+    fixture.replay_with_prober("reasoning-prober", &["--last", "2"]);
+
+    assert_eq!(reason_lengths(&fixture.records()), [2, 2]);
 }

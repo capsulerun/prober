@@ -7,6 +7,40 @@ pub fn git(directory: &Path, arguments: &[&str]) -> Result<String> {
     run("git", Some(directory), arguments)
 }
 
+pub fn has_commit(repository: &Path, commit: &str) -> bool {
+    git(
+        repository,
+        &["cat-file", "-e", &format!("{commit}^{{commit}}")],
+    )
+    .is_ok()
+}
+
+pub fn fetch_missing_commits<'c>(repository: &Path, commits: impl IntoIterator<Item = &'c str>) {
+    let mut missing_commits: Vec<&str> = commits
+        .into_iter()
+        .filter(|commit| !has_commit(repository, commit))
+        .collect();
+
+    missing_commits.sort_unstable();
+    missing_commits.dedup();
+
+    if missing_commits.is_empty() {
+        return;
+    }
+
+    let mut fetch_arguments = vec!["fetch", "--quiet", "origin"];
+
+    fetch_arguments.extend(&missing_commits);
+
+    if git(repository, &fetch_arguments).is_ok() {
+        return;
+    }
+
+    for commit in missing_commits {
+        let _ = git(repository, &["fetch", "--quiet", "origin", commit]);
+    }
+}
+
 pub fn gh(arguments: &[&str]) -> Result<String> {
     run("gh", None, arguments)
 }

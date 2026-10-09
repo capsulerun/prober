@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::changes::Change;
 
+const FIRST_HOP_REASON_LENGTH: usize = 2;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ReplayRecord {
     pub id: String,
@@ -51,6 +53,20 @@ impl ReplayRecord {
                 .then(|| serde_json::from_slice(&prober_output.stdout).ok())
                 .flatten(),
             stderr: String::from_utf8_lossy(&prober_output.stderr).into_owned(),
+        }
+    }
+
+    pub fn keep_first_hops(&mut self) {
+        let reasons = self
+            .selection
+            .as_mut()
+            .and_then(|selection| selection.get_mut("reasons"))
+            .and_then(Value::as_object_mut);
+
+        for reason in reasons.into_iter().flat_map(|reasons| reasons.values_mut()) {
+            if let Some(hops) = reason.as_array_mut() {
+                hops.truncate(FIRST_HOP_REASON_LENGTH);
+            }
         }
     }
 

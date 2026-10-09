@@ -5,6 +5,7 @@ mod commands;
 mod config;
 mod failures;
 mod logs;
+mod probes;
 mod record;
 mod report;
 mod repository_files;
@@ -18,6 +19,7 @@ use clap::{Parser, Subcommand};
 
 use crate::collect::CollectArguments;
 use crate::failures::FailuresArguments;
+use crate::probes::ProbeArguments;
 use crate::report::ReportArguments;
 use crate::selections::SelectionsArguments;
 
@@ -37,6 +39,11 @@ enum Command {
     Selections(SelectionsArguments),
 
     #[command(
+        about = "Changes one file at a time at one commit and records the selection of each change"
+    )]
+    Probe(ProbeArguments),
+
+    #[command(
         about = "Downloads the failed runs of a CI workflow and their logs into a snapshot (needs gh)"
     )]
     Collect(CollectArguments),
@@ -53,6 +60,7 @@ enum Command {
 fn main() -> ExitCode {
     let outcome = match Arguments::parse().command {
         Command::Selections(arguments) => selections::run(&arguments),
+        Command::Probe(arguments) => probes::run(&arguments),
         Command::Collect(arguments) => collect::run(&arguments),
         Command::Failures(arguments) => failures::run(&arguments),
         Command::Report(arguments) => report::run(&arguments),

@@ -1,9 +1,10 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use clap::Args;
 use prober_core::files::RepoPath;
 use prober_core::outcomes::{TestOutcomes, TestStatus};
@@ -12,6 +13,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
+use crate::probes::read_paths;
 use crate::record::ReplayRecord;
 
 const SHORT_COMMIT_LENGTH: usize = 9;
@@ -19,6 +21,10 @@ const SHORT_COMMIT_LENGTH: usize = 9;
 const RECURRING_FAILURE_CHANGES: usize = 3;
 
 const LISTED_WIDENING_SITES: usize = 10;
+
+const LISTED_PROBE_FILES: usize = 10;
+
+const DEFAULT_CONFIGURATION: &str = "Default";
 
 #[derive(Debug, Args)]
 pub struct ReportArguments {
@@ -50,23 +56,59 @@ pub struct ReportArguments {
 
     #[arg(
         long,
+        value_name = "LABEL=RECORDS",
         requires = "merges",
-        help = "Records of the same merged changes replayed with inference off, compared in the report"
+        help = "Records of the same merged changes replayed in another configuration (with --prober-config), compared in the report; repeatable"
     )]
-    merges_without_inference: Option<PathBuf>,
+    compare_merges: Vec<Labelled>,
 
     #[arg(
         long,
+        value_name = "LABEL=RECORDS",
         requires = "failed_changes",
-        help = "Records of the same failed changes replayed with inference off, compared in the report"
+        help = "Records of the same failed changes replayed in the configuration of the same label; repeatable"
     )]
-    failed_changes_without_inference: Option<PathBuf>,
+    compare_failed_changes: Vec<Labelled>,
+
+    #[arg(
+        long,
+        value_name = "LABEL=RECORDS",
+        help = "Records of `probe`, reported against the --probe-tests of the same label; repeatable"
+    )]
+    probes: Vec<Labelled>,
+
+    #[arg(
+        long,
+        value_name = "LABEL=TESTS",
+        help = "Text file listing the test files the probes of the same label should reach, one per line; repeatable"
+    )]
+    probe_tests: Vec<Labelled>,
 
     #[arg(
         long,
         help = "Markdown file the report is written to [default: stdout]"
     )]
     output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct Labelled {
+    label: String,
+    path: PathBuf,
+}
+
+impl FromStr for Labelled {
+    type Err = String;
+
+    fn from_str(text: &str) -> std::result::Result<Self, Self::Err> {
+        match text.split_once('=') {
+            Some((label, path)) if !label.is_empty() && !path.is_empty() => Ok(Self {
+                label: label.to_owned(),
+                path: PathBuf::from(path),
+            }),
+            _ => Err(format!("expected LABEL=PATH, got {text:?}")),
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -122,41 +164,66 @@ impl SelectionFigures {
     }
 }
 
+impl SelectionFigures {
+    fn of_replayed(records: &[ReplayRecord]) -> Self {
+        let replayed_records: Vec<&ReplayRecord> = records
+            .iter()
+            .filter(|record| record.selection.is_some())
+            .collect();
+
+        Self::of(&replayed_records)
+    }
+}
+
 struct ConfigurationRow {
-    label: &'static str,
+    label: String,
     ratios: Option<Vec<f64>>,
     misses: Option<usize>,
 }
 
+struct ProbeSet {
+    label: String,
+    listed_tests: BTreeSet<RepoPath>,
+    probed: usize,
+    failed: usize,
+    ran_every_test: usize,
+    reaching: usize,
+    files_reaching_none: Vec<String>,
+    reached: BTreeSet<RepoPath>,
+    reached_only_by_widening: BTreeSet<RepoPath>,
+}
+
 pub fn run(arguments: &ReportArguments) -> Result<String> {
-    if arguments.merges.is_none() && arguments.failed_changes.is_none() {
-        bail!("--merges or --failed-changes is required");
+    if arguments.merges.is_none()
+        && arguments.failed_changes.is_none()
+        && arguments.probes.is_empty()
+    {
+        bail!("--merges, --failed-changes or --probes is required");
     }
 
     let mut markdown = format!("# Prober benchmark: {}\n", arguments.title);
     let mut summary_parts = Vec::new();
     let merge_records = read_optional_json_lines::<ReplayRecord>(arguments.merges.as_deref())?;
-    let merge_records_without_inference =
-        read_optional_json_lines::<ReplayRecord>(arguments.merges_without_inference.as_deref())?;
     let failed_change_records =
         read_optional_json_lines::<ReplayRecord>(arguments.failed_changes.as_deref())?;
-    let failed_change_records_without_inference = read_optional_json_lines::<ReplayRecord>(
-        arguments.failed_changes_without_inference.as_deref(),
-    )?;
     let failures = read_optional_json_lines::<RecordedFailure>(arguments.failures.as_deref())?;
+    let compared_merges = read_labelled_records(&arguments.compare_merges)?;
+    let compared_failed_changes = read_labelled_records(&arguments.compare_failed_changes)?;
     let miss_analysis = failed_change_records
         .as_deref()
         .zip(failures.as_deref())
         .map(|(records, failures)| MissAnalysis::analyze(records, failures))
         .transpose()?;
-    let miss_analysis_without_inference = failed_change_records_without_inference
-        .as_deref()
-        .zip(failures.as_deref())
-        .map(|(records, failures)| MissAnalysis::analyze(records, failures))
-        .transpose()?;
+    let compared_miss_analyses = match failures.as_deref() {
+        Some(failures) => compared_failed_changes
+            .iter()
+            .map(|(label, records)| Ok((label.as_str(), MissAnalysis::analyze(records, failures)?)))
+            .collect::<Result<Vec<_>>>()?,
+        None => Vec::new(),
+    };
 
     if let Some(merge_records) = &merge_records {
-        markdown.push_str(&savings_section(merge_records));
+        markdown.push_str(&savings_section(merge_records, &compared_merges));
         summary_parts.push(format!("{} merged changes", merge_records.len()));
     }
 
@@ -169,12 +236,21 @@ pub fn run(arguments: &ReportArguments) -> Result<String> {
         ));
     }
 
-    markdown.push_str(&configurations_section(
-        merge_records.as_deref(),
-        merge_records_without_inference.as_deref(),
-        miss_analysis.as_ref(),
-        miss_analysis_without_inference.as_ref(),
-    ));
+    if merge_records.is_some() || miss_analysis.is_some() {
+        markdown.push_str(&configurations_section(
+            merge_records.as_deref(),
+            &compared_merges,
+            miss_analysis.as_ref(),
+            &compared_miss_analyses,
+        ));
+    }
+
+    if !arguments.probes.is_empty() {
+        let probe_sets = probe_sets(&arguments.probes, &arguments.probe_tests)?;
+
+        markdown.push_str(&probes_section(&probe_sets));
+        summary_parts.push(format!("{} probe sets", probe_sets.len()));
+    }
 
     match &arguments.output {
         Some(output_path) => fs::write(output_path, &markdown)
@@ -188,7 +264,17 @@ pub fn run(arguments: &ReportArguments) -> Result<String> {
     ))
 }
 
-fn savings_section(records: &[ReplayRecord]) -> String {
+fn read_labelled_records(labelled: &[Labelled]) -> Result<Vec<(String, Vec<ReplayRecord>)>> {
+    labelled
+        .iter()
+        .map(|labelled| Ok((labelled.label.clone(), read_json_lines(&labelled.path)?)))
+        .collect()
+}
+
+fn savings_section(
+    records: &[ReplayRecord],
+    compared_merges: &[(String, Vec<ReplayRecord>)],
+) -> String {
     let replayed_records: Vec<&ReplayRecord> = records
         .iter()
         .filter(|record| record.selection.is_some())
@@ -218,17 +304,73 @@ fn savings_section(records: &[ReplayRecord]) -> String {
     let widening_sites = widening_sites_table(&replayed_records);
 
     section.push_str(&widening_sites);
-    let full_run_causes = full_run_causes(&replayed_records);
 
-    if !full_run_causes.is_empty() {
-        section.push_str("\n### Why every test ran\n\n| Cause | Changes |\n| --- | --- |\n");
+    let mut columns: Vec<(&str, Vec<&ReplayRecord>)> =
+        vec![(DEFAULT_CONFIGURATION, replayed_records)];
 
-        for (cause, change_count) in &full_run_causes {
-            section.push_str(&format!("| {cause} | {change_count} |\n"));
-        }
-    }
+    columns.extend(compared_merges.iter().map(|(label, records)| {
+        let replayed_records = records
+            .iter()
+            .filter(|record| record.selection.is_some())
+            .collect();
+
+        (label.as_str(), replayed_records)
+    }));
+    section.push_str(&full_runs_table(&columns));
 
     section
+}
+
+fn full_runs_table(columns: &[(&str, Vec<&ReplayRecord>)]) -> String {
+    let causes_by_column: Vec<BTreeMap<String, usize>> = columns
+        .iter()
+        .map(|(_, records)| full_run_causes(records))
+        .collect();
+    let full_runs: Vec<String> = columns
+        .iter()
+        .map(|(_, records)| {
+            records
+                .iter()
+                .filter(|record| record.mode() == Some("all"))
+                .count()
+                .to_string()
+        })
+        .collect();
+
+    if causes_by_column.iter().all(BTreeMap::is_empty) {
+        return String::new();
+    }
+
+    let causes: BTreeSet<&String> = causes_by_column.iter().flat_map(BTreeMap::keys).collect();
+    let mut table = if columns.len() == 1 {
+        String::from("\n### Why every test ran\n\n| Cause | Changes |\n| --- | --- |\n")
+    } else {
+        let labels: Vec<&str> = columns.iter().map(|(label, _)| *label).collect();
+
+        format!(
+            "\n### Why every test ran\n\n| Cause | {} |\n| --- |{}\n",
+            labels.join(" | "),
+            " --- |".repeat(columns.len())
+        )
+    };
+
+    for cause in causes {
+        let change_counts: Vec<String> = causes_by_column
+            .iter()
+            .map(|causes| causes.get(cause).copied().unwrap_or_default().to_string())
+            .collect();
+
+        table.push_str(&format!("| {cause} | {} |\n", change_counts.join(" | ")));
+    }
+
+    if columns.len() > 1 {
+        table.push_str(&format!(
+            "| **Changes running every test** | {} |\n",
+            full_runs.join(" | ")
+        ));
+    }
+
+    table
 }
 
 fn widening_summary(records: &[&ReplayRecord]) -> String {
@@ -313,58 +455,46 @@ fn widening_sites_table(records: &[&ReplayRecord]) -> String {
 
 fn configurations_section(
     merge_records: Option<&[ReplayRecord]>,
-    merge_records_without_inference: Option<&[ReplayRecord]>,
+    compared_merges: &[(String, Vec<ReplayRecord>)],
     miss_analysis: Option<&MissAnalysis>,
-    miss_analysis_without_inference: Option<&MissAnalysis>,
+    compared_miss_analyses: &[(&str, MissAnalysis)],
 ) -> String {
-    let figures_of = |records: Option<&[ReplayRecord]>| {
-        records.map(|records| {
-            let replayed_records: Vec<&ReplayRecord> = records
-                .iter()
-                .filter(|record| record.selection.is_some())
-                .collect();
+    let mut labels: Vec<&str> = Vec::new();
 
-            SelectionFigures::of(&replayed_records)
-        })
-    };
-    let figures = figures_of(merge_records);
-    let figures_without_inference = figures_of(merge_records_without_inference);
-    let has_inference_off =
-        figures_without_inference.is_some() || miss_analysis_without_inference.is_some();
-    let mut rows = Vec::new();
-
-    if has_inference_off {
-        rows.push(ConfigurationRow {
-            label: "Inference off, widening off (phase 1)",
-            ratios: figures_without_inference
-                .as_ref()
-                .map(|figures| figures.ratios_without_widening.clone()),
-            misses: miss_analysis_without_inference.map(MissAnalysis::misses_without_widening),
-        });
-        rows.push(ConfigurationRow {
-            label: "Inference off, widening on",
-            ratios: figures_without_inference
-                .as_ref()
-                .map(|figures| figures.ratios.clone()),
-            misses: miss_analysis_without_inference.map(|analysis| analysis.misses.len()),
-        });
+    for label in compared_merges
+        .iter()
+        .map(|(label, _)| label.as_str())
+        .chain(compared_miss_analyses.iter().map(|(label, _)| *label))
+    {
+        if !labels.contains(&label) {
+            labels.push(label);
+        }
     }
 
-    rows.push(ConfigurationRow {
-        label: "Inference on, widening off",
-        ratios: figures
-            .as_ref()
-            .map(|figures| figures.ratios_without_widening.clone()),
-        misses: miss_analysis.map(MissAnalysis::misses_without_widening),
-    });
-    rows.push(ConfigurationRow {
-        label: "**Inference on, widening on (default)**",
-        ratios: figures.as_ref().map(|figures| figures.ratios.clone()),
-        misses: miss_analysis.map(|analysis| analysis.misses.len()),
-    });
+    let mut rows = Vec::new();
+
+    for label in labels {
+        let figures = compared_merges
+            .iter()
+            .find(|(compared_label, _)| compared_label == label)
+            .map(|(_, records)| SelectionFigures::of_replayed(records));
+        let analysis = compared_miss_analyses
+            .iter()
+            .find(|(compared_label, _)| *compared_label == label)
+            .map(|(_, analysis)| analysis);
+
+        rows.extend(configuration_rows(label, figures, analysis, false));
+    }
+
+    rows.extend(configuration_rows(
+        DEFAULT_CONFIGURATION,
+        merge_records.map(SelectionFigures::of_replayed),
+        miss_analysis,
+        true,
+    ));
 
     let mut section = String::from(
-        "\n## Inference and widening\n\n| Configuration | Test files selected on merged changes | Misses on failed changes |\n| --- | --- | --- |\n",
+        "\n## Configurations\n\n| Configuration | Test files selected on merged changes | Misses on failed changes |\n| --- | --- | --- |\n",
     );
 
     for row in rows {
@@ -380,6 +510,213 @@ fn configurations_section(
     }
 
     section
+}
+
+fn configuration_rows(
+    label: &str,
+    figures: Option<SelectionFigures>,
+    miss_analysis: Option<&MissAnalysis>,
+    is_default: bool,
+) -> [ConfigurationRow; 2] {
+    let widening_on = format!("{label}, widening on");
+
+    [
+        ConfigurationRow {
+            label: format!("{label}, widening off"),
+            ratios: figures
+                .as_ref()
+                .map(|figures| figures.ratios_without_widening.clone()),
+            misses: miss_analysis.map(MissAnalysis::misses_without_widening),
+        },
+        ConfigurationRow {
+            label: if is_default {
+                format!("**{widening_on}**")
+            } else {
+                widening_on
+            },
+            ratios: figures.map(|figures| figures.ratios),
+            misses: miss_analysis.map(|analysis| analysis.misses.len()),
+        },
+    ]
+}
+
+fn probe_sets(probes: &[Labelled], probe_tests: &[Labelled]) -> Result<Vec<ProbeSet>> {
+    probes
+        .iter()
+        .map(|probes| {
+            let tests_path = probe_tests
+                .iter()
+                .find(|tests| tests.label == probes.label)
+                .ok_or_else(|| anyhow!("--probes {:?} has no --probe-tests", probes.label))?;
+            let listed_tests = read_paths(&tests_path.path)?
+                .into_iter()
+                .map(RepoPath::new)
+                .collect::<Result<BTreeSet<_>>>()?;
+            let records: Vec<ReplayRecord> = read_json_lines(&probes.path)?;
+
+            ProbeSet::analyze(&probes.label, &records, listed_tests)
+        })
+        .collect()
+}
+
+impl ProbeSet {
+    fn analyze(
+        label: &str,
+        records: &[ReplayRecord],
+        listed_tests: BTreeSet<RepoPath>,
+    ) -> Result<Self> {
+        let mut probe_set = ProbeSet {
+            label: label.to_owned(),
+            listed_tests,
+            probed: records.len(),
+            failed: 0,
+            ran_every_test: 0,
+            reaching: 0,
+            files_reaching_none: Vec::new(),
+            reached: BTreeSet::new(),
+            reached_only_by_widening: BTreeSet::new(),
+        };
+
+        for record in records {
+            let Some(selection_value) = &record.selection else {
+                probe_set.failed += 1;
+
+                continue;
+            };
+
+            if record.mode() == Some("all") {
+                probe_set.ran_every_test += 1;
+
+                continue;
+            }
+
+            let selection = RecordedSelection::parse(&selection_value.to_string())
+                .with_context(|| format!("selection of probe {}", record.id))?;
+            let reached: Vec<&RepoPath> = selection
+                .test_files
+                .iter()
+                .filter(|test| {
+                    probe_set.listed_tests.contains(*test)
+                        && !selection.widened_test_files.contains(*test)
+                })
+                .collect();
+
+            if reached.is_empty() {
+                probe_set.files_reaching_none.push(record.id.clone());
+            } else {
+                probe_set.reaching += 1;
+            }
+
+            probe_set.reached.extend(reached.into_iter().cloned());
+            probe_set.reached_only_by_widening.extend(
+                selection
+                    .widened_test_files
+                    .intersection(&probe_set.listed_tests)
+                    .cloned(),
+            );
+        }
+
+        let reached = &probe_set.reached;
+
+        probe_set
+            .reached_only_by_widening
+            .retain(|test| !reached.contains(test));
+
+        Ok(probe_set)
+    }
+
+    fn files_probed(&self) -> String {
+        let mut details = Vec::new();
+
+        if self.failed > 0 {
+            details.push(format!("{} failed", self.failed));
+        }
+
+        if self.ran_every_test > 0 {
+            details.push(format!("{} ran every test", self.ran_every_test));
+        }
+
+        if details.is_empty() {
+            return self.probed.to_string();
+        }
+
+        format!("{} ({})", self.probed, details.join(", "))
+    }
+
+    fn unreached_tests(&self) -> Vec<&str> {
+        self.listed_tests
+            .iter()
+            .filter(|test| !self.reached.contains(*test))
+            .map(RepoPath::as_str)
+            .collect()
+    }
+}
+
+fn probes_section(probe_sets: &[ProbeSet]) -> String {
+    let mut section = String::from(
+        "\n## Probed changes\n\nEach probe adds a line to one file at one commit and replays that change. A listed test counts as reached when its reason does not go through widening.\n\n| Probes | Files probed | Files reaching a listed test | Listed tests reached | Reached only by widening |\n| --- | --- | --- | --- | --- |\n",
+    );
+
+    for probe_set in probe_sets {
+        let replayed = probe_set.probed - probe_set.failed;
+
+        section.push_str(&format!(
+            "| {} | {} | {} ({}) | {} of {} ({}) | {} |\n",
+            probe_set.label,
+            probe_set.files_probed(),
+            probe_set.reaching,
+            format_ratio(share(probe_set.reaching, replayed)),
+            probe_set.reached.len(),
+            probe_set.listed_tests.len(),
+            format_ratio(share(probe_set.reached.len(), probe_set.listed_tests.len())),
+            probe_set.reached_only_by_widening.len(),
+        ));
+    }
+
+    for probe_set in probe_sets {
+        let unreached_tests = probe_set.unreached_tests();
+
+        if probe_set.files_reaching_none.is_empty() && unreached_tests.is_empty() {
+            continue;
+        }
+
+        section.push_str(&format!("\n### {}\n\n", probe_set.label));
+
+        if !probe_set.files_reaching_none.is_empty() {
+            section.push_str(&format!(
+                "- Files reaching no listed test: {}\n",
+                listed_paths(&probe_set.files_reaching_none)
+            ));
+        }
+
+        if !unreached_tests.is_empty() {
+            section.push_str(&format!(
+                "- Listed tests not reached: {}\n",
+                listed_paths(&unreached_tests)
+            ));
+        }
+    }
+
+    section
+}
+
+fn listed_paths(paths: &[impl AsRef<str>]) -> String {
+    let shown: Vec<String> = paths
+        .iter()
+        .take(LISTED_PROBE_FILES)
+        .map(|path| format!("`{}`", path.as_ref()))
+        .collect();
+    let more = paths.len().saturating_sub(LISTED_PROBE_FILES);
+
+    if more == 0 {
+        return shown.join(", ");
+    }
+
+    format!("{} and {more} more", shown.join(", "))
+}
+
+fn share(count: usize, total: usize) -> Option<f64> {
+    (total > 0).then(|| count as f64 / total as f64)
 }
 
 fn full_run_causes(records: &[&ReplayRecord]) -> BTreeMap<String, usize> {
