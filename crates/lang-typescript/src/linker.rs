@@ -282,6 +282,16 @@ impl TypeScriptLinker {
             graph.add_test_support(LANGUAGE, is_test_support_file);
         }
 
+        let present: HashSet<&RepoPath> = repo_files.iter().collect();
+
+        for removed_test in changes
+            .iter()
+            .flat_map(FileChange::touched_paths)
+            .filter(|path| !present.contains(path) && self.presets.is_test(path, false))
+        {
+            graph.add_removed_test(removed_test.clone());
+        }
+
         for group in &groups {
             graph.add_root_scope(RootScope {
                 directory: group.directory.clone(),

@@ -164,7 +164,12 @@ pub struct RuleLink {
 }
 
 impl RuleLink {
-    fn link_count(&self, from: impl Fn(FileId) -> bool, to: impl Fn(FileId) -> bool) -> usize {
+    fn link_count(
+        &self,
+        from: impl Fn(FileId) -> bool,
+        to: impl Fn(FileId) -> bool,
+        is_test: impl Fn(FileId) -> bool,
+    ) -> usize {
         let from_files: HashSet<FileId> = self
             .from
             .iter()
@@ -176,8 +181,10 @@ impl RuleLink {
             .iter()
             .filter(|file| from_files.contains(file))
             .count();
+        let tests_linked = from_files.iter().filter(|&&file| is_test(file)).count();
+        let product_targets = to_files.iter().filter(|&&file| !is_test(file)).count();
 
-        from_files.len() * to_files.len() - self_links
+        from_files.len() * to_files.len() - tests_linked * product_targets - self_links
     }
 }
 
@@ -227,6 +234,7 @@ pub struct TestFile {
 pub struct GraphBuilder {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
+    removed_tests: HashSet<FileId>,
     edges: Vec<Edge>,
     inferences: HashMap<(FileId, FileId, EdgeKind), Inference>,
     unresolved_sites: Vec<UnresolvedSite>,
@@ -256,6 +264,12 @@ impl GraphBuilder {
         self.test_languages.insert(test_file, language);
 
         test_file
+    }
+
+    pub fn add_removed_test(&mut self, path: RepoPath) {
+        let removed_test = self.files.intern(path);
+
+        self.removed_tests.insert(removed_test);
     }
 
     pub fn add_edge(&mut self, edge: Edge) {
@@ -326,7 +340,7 @@ impl GraphBuilder {
         rule_link.to.sort();
         rule_link.to.dedup();
 
-        let links = rule_link.link_count(|_| true, |_| true);
+        let links = rule_link.link_count(|_| true, |_| true, |file| self.is_or_was_test(file));
 
         self.rule_links.push(rule_link);
 
@@ -375,6 +389,10 @@ impl GraphBuilder {
         self.test_languages.contains_key(&file)
     }
 
+    fn is_or_was_test(&self, file: FileId) -> bool {
+        self.is_test(file) || self.removed_tests.contains(&file)
+    }
+
     pub(crate) fn ignore_links(
         &mut self,
         line: usize,
@@ -392,11 +410,17 @@ impl GraphBuilder {
             .into_iter()
             .partition(|edge| to.contains(&edge.dependent) && from.contains(&edge.dependency));
         let imports = ignored.iter().filter(|edge| is_import(edge)).count();
+        let test_languages = &self.test_languages;
+        let removed_tests = &self.removed_tests;
         let rule_links: usize = self
             .rule_links
             .iter()
             .map(|rule_link| {
-                rule_link.link_count(|file| from.contains(&file), |file| to.contains(&file))
+                rule_link.link_count(
+                    |file| from.contains(&file),
+                    |file| to.contains(&file),
+                    |file| test_languages.contains_key(&file) || removed_tests.contains(&file),
+                )
             })
             .sum();
         let ignored_links = IgnoredLinks {
@@ -522,6 +546,7 @@ impl GraphBuilder {
         let mut graph = Graph {
             files: self.files,
             test_languages: self.test_languages,
+            removed_tests: self.removed_tests,
             dependents_by_file,
             dependencies_by_file,
             inferences: self.inferences,
@@ -553,6 +578,7 @@ impl GraphBuilder {
 pub struct Graph {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
+    removed_tests: HashSet<FileId>,
     dependents_by_file: Vec<Vec<Edge>>,
     dependencies_by_file: Vec<Vec<Edge>>,
     inferences: HashMap<(FileId, FileId, EdgeKind), Inference>,
@@ -647,7 +673,7 @@ impl Graph {
                     kind: EdgeKind::Rule,
                 })
             })
-            .filter(move |edge| edge.dependent != file)
+            .filter(move |edge| edge.dependent != file && !self.loads_a_test(edge))
     }
 
     fn rule_dependencies(&self, file: FileId) -> impl Iterator<Item = Edge> + '_ {
@@ -659,7 +685,15 @@ impl Graph {
                     kind: EdgeKind::Rule,
                 })
             })
-            .filter(move |edge| edge.dependency != file)
+            .filter(move |edge| edge.dependency != file && !self.loads_a_test(edge))
+    }
+
+    fn loads_a_test(&self, edge: &Edge) -> bool {
+        self.is_or_was_test(edge.dependency) && !self.is_or_was_test(edge.dependent)
+    }
+
+    fn is_or_was_test(&self, file: FileId) -> bool {
+        self.is_test(file) || self.removed_tests.contains(&file)
     }
 
     fn rule_ignore_line(&self, edge: &Edge) -> Option<usize> {
@@ -1211,6 +1245,66 @@ mod tests {
                 .rule_link(&ignored_edge)
                 .map(|rule_link| rule_link.line),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn rule_links_never_make_product_code_depend_on_a_test_file() {
+        let linked = |ignores_loader: bool| {
+            let mut builder = GraphBuilder::default();
+            let loader = builder.add_file(repo_path("src/loader.ts"));
+            let plugin = builder.add_file(repo_path("extensions/a/index.ts"));
+            let plugin_test =
+                builder.add_test_file(repo_path("extensions/a/index.test.ts"), "typescript");
+            let meta_test = builder.add_test_file(repo_path("test/meta.test.ts"), "typescript");
+
+            builder.add_removed_test(repo_path("extensions/a/old.test.ts"));
+
+            let removed_test = builder.add_file(repo_path("extensions/a/old.test.ts"));
+            let links = builder.add_rule_link(RuleLink {
+                line: 1,
+                pattern: "extensions/**".to_owned(),
+                captures: Vec::new(),
+                from: vec![plugin, plugin_test, removed_test],
+                to: vec![loader, meta_test],
+            });
+            let ignored = ignores_loader.then(|| {
+                builder.ignore_links(
+                    5,
+                    HashSet::from([plugin, plugin_test, removed_test]),
+                    HashSet::from([loader]),
+                )
+            });
+
+            (builder.build(), links, ignored)
+        };
+        let (graph, links, _) = linked(false);
+        let (_, _, ignored) = linked(true);
+        let loader = graph.file_id(&repo_path("src/loader.ts")).unwrap();
+
+        assert_eq!(links, 4);
+        assert_eq!(ignored.map(|ignored| ignored.links), Some(1));
+        assert_eq!(
+            dependent_paths(&graph, "extensions/a/index.ts"),
+            [
+                ("src/loader.ts".to_owned(), EdgeKind::Rule),
+                ("test/meta.test.ts".to_owned(), EdgeKind::Rule),
+            ]
+        );
+        assert_eq!(
+            dependent_paths(&graph, "extensions/a/index.test.ts"),
+            [("test/meta.test.ts".to_owned(), EdgeKind::Rule)]
+        );
+        assert_eq!(
+            dependent_paths(&graph, "extensions/a/old.test.ts"),
+            [("test/meta.test.ts".to_owned(), EdgeKind::Rule)]
+        );
+        assert_eq!(
+            graph
+                .dependencies(loader)
+                .map(|edge| graph.path(edge.dependency).as_str())
+                .collect::<Vec<_>>(),
+            ["extensions/a/index.ts"]
         );
     }
 
