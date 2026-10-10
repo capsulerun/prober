@@ -470,6 +470,55 @@ fn members_resolve_through_imports_instances_bases_and_overrides() {
         uses_of(&graph, "src/square.ts", "new Square()"),
         ["src/base.ts#new Base()"]
     );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "square"),
+        ["src/square.ts#Square"]
+    );
+}
+
+#[test]
+fn properties_of_objects_with_spreads_or_computed_keys_use_the_whole_object() {
+    let project = TestProject::new(&[
+        (
+            "src/settings.ts",
+            r#"
+                const overrides = { retries: 5 };
+                const key = "max";
+
+                export const settings = { retries: 3, ...overrides };
+                export const limits = { [key]: 1, min: 0, lowest() { return this.min; } };
+                export const defaults = { retries: 3 };
+            "#,
+        ),
+        (
+            "src/app.ts",
+            r#"
+                import { defaults, limits, settings } from "./settings";
+
+                export const retries = () => settings.retries;
+                export const min = () => limits.min;
+                export const fallback = () => defaults.retries;
+            "#,
+        ),
+    ]);
+    let graph = project.link_symbols();
+
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "retries"),
+        ["src/settings.ts#settings"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "min"),
+        ["src/settings.ts#limits"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/settings.ts", "limits.lowest"),
+        ["src/settings.ts#limits"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "fallback"),
+        ["src/settings.ts#defaults.retries"]
+    );
 }
 
 #[test]

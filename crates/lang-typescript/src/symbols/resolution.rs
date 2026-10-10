@@ -853,6 +853,10 @@ impl<'l> Resolver<'l> {
             return Vec::new();
         }
 
+        if self.local(module, owner).shape == Some(Shape::Object { open: true }) {
+            return vec![Reached::symbol(module, owner)];
+        }
+
         let defined = self.defined(module, owner, key, place);
 
         if !defined.is_empty() {

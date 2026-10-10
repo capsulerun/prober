@@ -1110,20 +1110,33 @@ impl<'a> SymbolCollector<'_, 'a> {
             matches!(element, ClassElement::MethodDefinition(method) if method.kind == MethodDefinitionKind::Constructor)
         });
 
-        if !has_constructor && let Extends::Binding(base) = &extends {
+        self.drafts[owner].shape = Some(Shape::Class { extends });
+
+        if !has_constructor && let Some(base) = self.base_construction(owner) {
             self.drafts[owner]
                 .runs
                 .get_or_insert_with(RunsDraft::default)
                 .uses
-                .insert(Use::New(Box::new(base.clone())));
+                .insert(base);
         }
 
-        self.drafts[owner].shape = Some(Shape::Class { extends });
         self.owner = Some(owner);
         self.region = Some(Region::declaration(owner));
         self.class = Some(owner);
         self.collected_class = Some(class.span);
         self.visit_class(class);
+    }
+
+    fn base_construction(&self, class: usize) -> Option<Use> {
+        match &self.drafts[class].shape {
+            Some(Shape::Class {
+                extends: Extends::Binding(base),
+            }) => Some(Use::New(Box::new(base.clone()))),
+            Some(Shape::Class {
+                extends: Extends::Other,
+            }) => Some(Use::Local(class)),
+            _ => None,
+        }
     }
 
     fn extends(&self, class: &Class) -> Extends {
@@ -1843,20 +1856,9 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
 
         if matches!(call.callee, Expression::Super(_))
             && let Some(ThisValue::Class { class, .. }) = self.this_value
+            && let Some(base) = self.base_construction(class)
         {
-            let base = match &self.drafts[class].shape {
-                Some(Shape::Class {
-                    extends: Extends::Binding(base),
-                }) => Some(Use::New(Box::new(base.clone()))),
-                Some(Shape::Class {
-                    extends: Extends::Other,
-                }) => Some(Use::Local(class)),
-                _ => None,
-            };
-
-            if let Some(base) = base {
-                self.run(vec![base], Condition::Always);
-            }
+            self.run(vec![base], Condition::Always);
         }
 
         walk::walk_call_expression(self, call);
@@ -3132,11 +3134,11 @@ mod tests {
     #[test]
     fn classes_split_into_members_and_what_constructing_them_runs() {
         let source_text = r#"
-            import { Base, connect, register } from "./base";
+            import { Base, connect, initial, register } from "./base";
             export class Store extends Base {
                 static instance = new Store();
                 static { register(Store); }
-                private items: string[] = [];
+                private items: string[] = initial();
                 private handler = () => connect();
                 constructor(readonly name: string) { super(name); this.created = Date.now(); }
                 add(item: string) { this.items.push(item); return this.count(); }
@@ -3181,7 +3183,7 @@ mod tests {
                     &["./base#register()", "new Store()"],
                     &[(&["./base#register #0"], &["Store"])]
                 ),
-                ran("new Store()", &["new ./base#Base()"]),
+                ran("new Store()", &["./base#initial()", "new ./base#Base()"]),
             ]
         );
         assert_eq!(
@@ -3189,13 +3191,37 @@ mod tests {
             [
                 used("Store", &["./base#Base", "./base#register()"]),
                 used("static Store.instance", &["Store"]),
-                used("Store.items", &[]),
+                used("Store.items", &["./base#initial"]),
                 used("Store.handler", &["./base#connect"]),
                 used("Store.constructor", &[]),
                 used("Store.add", &["this Store.count", "this Store.items"]),
                 used("Store.count", &["this Store.items", "super Store.size()"]),
                 used("static Store.create", &["Store.instance"]),
                 used("Store.#secret", &["this Store.handler"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn constructing_a_class_whose_base_is_not_followed_runs_the_whole_class() {
+        let source_text = r#"
+            import { mixin, Base } from "./base";
+            export class Store extends mixin(Base) {}
+            export class Explicit extends mixin(Base) { constructor() { super(); } }
+            export const store = new Store();
+            export const explicit = new Explicit();
+        "#;
+
+        assert_eq!(
+            runs(source_text),
+            [
+                ran_holding(
+                    MODULE_INIT_NAME,
+                    &["./base#mixin()", "new Store()", "new Explicit()"],
+                    &[(&["./base#mixin #0"], &["./base#Base"])]
+                ),
+                ran("new Store()", &["Store"]),
+                ran("new Explicit()", &["Explicit"]),
             ]
         );
     }
