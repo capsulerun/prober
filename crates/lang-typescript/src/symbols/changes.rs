@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prober_core::symbols::{SymbolChangeKind, SymbolKind};
 
-use crate::symbols::{ExportTarget, Held, Imported, Keeping, ModuleSymbols, Place, Runs, Use};
+use crate::symbols::{
+    ExportTarget, Held, Imported, Keeping, ModuleSymbols, Place, Runs, Shape, Use,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Changed {
@@ -159,13 +161,17 @@ pub(crate) fn module_changes(base: &ModuleSymbols, head: &ModuleSymbols) -> Vec<
         }
     }
 
-    let classes: BTreeSet<usize> = changed
+    let whole_owners: BTreeSet<usize> = changed
         .iter()
         .filter_map(|changed| match changed {
             Changed::Symbol {
                 index,
                 kind: SymbolChangeKind::Modified,
-            } if head.symbols[*index].kind == SymbolKind::Class => Some(*index),
+            } if head.symbols[*index].kind == SymbolKind::Class
+                || no_longer_open(base, &base_names, head, *index) =>
+            {
+                Some(*index)
+            }
             _ => None,
         })
         .collect();
@@ -176,7 +182,7 @@ pub(crate) fn module_changes(base: &ModuleSymbols, head: &ModuleSymbols) -> Vec<
             _ => None,
         })
         .collect();
-    let members_of_classes: Vec<usize> = head
+    let members_of_whole_owners: Vec<usize> = head
         .symbols
         .iter()
         .enumerate()
@@ -184,12 +190,12 @@ pub(crate) fn module_changes(base: &ModuleSymbols, head: &ModuleSymbols) -> Vec<
             symbol
                 .member
                 .as_ref()
-                .is_some_and(|member| classes.contains(&member.owner))
+                .is_some_and(|member| whole_owners.contains(&member.owner))
         })
         .map(|(index, _)| index)
         .collect();
 
-    for index in owners.into_iter().chain(members_of_classes) {
+    for index in owners.into_iter().chain(members_of_whole_owners) {
         if modified.insert(index) {
             changed.push(Changed::Symbol {
                 index,
@@ -249,6 +255,22 @@ pub(crate) fn module_changes(base: &ModuleSymbols, head: &ModuleSymbols) -> Vec<
     );
 
     changed
+}
+
+fn no_longer_open(
+    base: &ModuleSymbols,
+    base_names: &BTreeMap<&str, usize>,
+    head: &ModuleSymbols,
+    index: usize,
+) -> bool {
+    let symbol = &head.symbols[index];
+
+    symbol.shape == Some(Shape::Object { open: false })
+        && base_names
+            .get(symbol.name.as_str())
+            .is_some_and(|&base_index| {
+                base.symbols[base_index].shape == Some(Shape::Object { open: true })
+            })
 }
 
 fn names(module: &ModuleSymbols) -> BTreeMap<&str, usize> {
@@ -612,6 +634,19 @@ mod tests {
             ]
         );
         assert_eq!(described_changes(base, &without_clear), ["Store modified"]);
+    }
+
+    #[test]
+    fn an_object_no_longer_spreading_changes_every_property() {
+        let base = "export const o = { a: 1, b: 2, ...extra };\nconst extra = { a: 3 };\n";
+        let closed = base.replace(", ...extra", "");
+        let added = base.replace("b: 2,", "b: 2, c: 4,");
+
+        assert_eq!(
+            described_changes(base, &closed),
+            ["o modified", "o.a modified", "o.b modified"]
+        );
+        assert_eq!(described_changes(base, &added), ["o modified", "o.c added"]);
     }
 
     #[test]

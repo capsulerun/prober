@@ -437,6 +437,7 @@ fn change_to_one_method_selects_the_tests_reaching_it_through_instances_and_this
         ("src/clear.test.ts", &clear_test),
     ]);
     let base_store = STORE.replace("return this.items.length;", "return this.items.length + 0;");
+    let base_clear = STORE.replace("this.items = [];", "this.items = [\"a\"];");
 
     assert_eq!(
         project.symbol_outcome_of(
@@ -462,6 +463,15 @@ fn change_to_one_method_selects_the_tests_reaching_it_through_instances_and_this
                 ]
             ),
         ])
+    );
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/store.ts", &base_clear)],
+                &[modified("src/store.ts")]
+            )
+            .selected_paths(),
+        ["src/add.test.ts", "src/clear.test.ts", "src/count.test.ts"]
     );
 }
 
