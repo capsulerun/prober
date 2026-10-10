@@ -545,3 +545,37 @@ fn change_to_one_property_of_an_object_selects_only_the_tests_reading_it() {
         )])
     );
 }
+
+#[test]
+fn a_change_read_through_a_runtime_key_names_the_read_in_the_reason() {
+    let handlers = "export const handlers = {\n  greet: (name: string) => `hi ${name}`,\n  shout: (name: string) => `HI ${name}`,\n};\n";
+    let project = TestProject::new(&[
+        ("src/handlers.ts", handlers),
+        (
+            "src/dispatch.ts",
+            "import { handlers } from \"./handlers\";\n\nexport const dispatch = (method: \"greet\" | \"shout\", name: string) => handlers[method](name);\n",
+        ),
+        (
+            "src/dispatch.test.ts",
+            "import { dispatch } from \"./dispatch\";\n\ntest(\"greet\", () => expect(dispatch(\"greet\", \"a\")).toBe(\"hi a\"));\n",
+        ),
+    ]);
+    let base_handlers = handlers.replace("`HI ${name}`", "`HI, ${name}`");
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("src/handlers.ts", &base_handlers)],
+            &[modified("src/handlers.ts")]
+        ),
+        selected(&[(
+            "src/dispatch.test.ts",
+            &[
+                "src/handlers.ts (modified)",
+                "-> handlers.shout changed",
+                "-> handlers.shout used by handlers in src/handlers.ts",
+                "-> handlers read by key by dispatch in src/dispatch.ts",
+                "-> dispatch used at load by src/dispatch.test.ts",
+            ]
+        )])
+    );
+}

@@ -44,6 +44,7 @@ pub(crate) enum Use {
     },
     Call(Box<Use>),
     New(Box<Use>),
+    Keyed(Box<Use>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -141,13 +142,14 @@ pub(crate) struct ModuleSymbols {
     pub star_exports: Vec<String>,
     pub loads: Vec<String>,
     pub held: Vec<Held>,
+    pub commands: Vec<String>,
 }
 
 impl Use {
     fn specifier(&self) -> Option<&str> {
         match self {
             Use::Module(specifier) | Use::Load(specifier) => Some(specifier),
-            Use::Call(called) | Use::New(called) => called.specifier(),
+            Use::Call(called) | Use::New(called) | Use::Keyed(called) => called.specifier(),
             Use::Local(_)
             | Use::Import { .. }
             | Use::Member { .. }

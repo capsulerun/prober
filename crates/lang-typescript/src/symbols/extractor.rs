@@ -211,6 +211,7 @@ pub(crate) fn extract_symbols<'a>(
         loads: Vec::new(),
         members: HashMap::new(),
         member_drafts: HashMap::new(),
+        commands: Commands::default(),
         owner: None,
         region: None,
         frames: Vec::new(),
@@ -244,6 +245,7 @@ pub(crate) fn extract_symbols<'a>(
         imports,
         star_exports,
         loads,
+        commands,
         ..
     } = collector;
 
@@ -311,6 +313,7 @@ pub(crate) fn extract_symbols<'a>(
         star_exports,
         loads,
         held,
+        commands: commands.definitions.into_iter().collect(),
     })
 }
 
@@ -352,6 +355,7 @@ struct SymbolCollector<'s, 'a> {
     loads: Vec<String>,
     members: HashMap<Span, usize>,
     member_drafts: HashMap<(usize, String, Place), usize>,
+    commands: Commands,
     owner: Option<usize>,
     region: Option<Region>,
     frames: Vec<Frame>,
@@ -363,6 +367,12 @@ struct SymbolCollector<'s, 'a> {
     ancestors: Vec<AstKind<'a>>,
     function: Option<(usize, FunctionFacts)>,
     fallback: Option<FallbackCause>,
+}
+
+#[derive(Default)]
+struct Commands {
+    variables: HashMap<SymbolId, Vec<String>>,
+    definitions: BTreeSet<String>,
 }
 
 impl<'a> SymbolCollector<'_, 'a> {
@@ -773,6 +783,62 @@ impl<'a> SymbolCollector<'_, 'a> {
         };
 
         self.members.insert(span, index);
+    }
+
+    fn command_path(&self, expression: &Expression) -> Option<Vec<String>> {
+        match expression.get_inner_expression() {
+            Expression::Identifier(identifier) => Some(
+                self.resolved_symbol(identifier)
+                    .and_then(|symbol| self.commands.variables.get(&symbol).cloned())
+                    .unwrap_or_default(),
+            ),
+            Expression::NewExpression(new) => match &new.callee {
+                Expression::Identifier(callee) if callee.name == "Command" => new
+                    .arguments
+                    .first()
+                    .and_then(Argument::as_expression)
+                    .and_then(literal_text)
+                    .and_then(command_name)
+                    .map(|name| vec![name]),
+                _ => None,
+            },
+            Expression::CallExpression(call) => self.call_command_path(call),
+            _ => None,
+        }
+    }
+
+    fn call_command_path(&self, call: &CallExpression) -> Option<Vec<String>> {
+        let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
+            return None;
+        };
+        let mut path = self.command_path(&member.object)?;
+
+        if member.property.name == "command" {
+            let name = call
+                .arguments
+                .first()
+                .and_then(Argument::as_expression)
+                .and_then(literal_text)
+                .and_then(command_name)?;
+
+            path.push(name);
+        }
+
+        Some(path)
+    }
+
+    fn define_command(&mut self, call: &CallExpression) {
+        let Expression::StaticMemberExpression(member) = call.callee.get_inner_expression() else {
+            return;
+        };
+
+        if member.property.name != "command" {
+            return;
+        }
+
+        if let Some(path) = self.call_command_path(call) {
+            self.commands.definitions.insert(path.join(" "));
+        }
     }
 
     fn register_optional_name(
@@ -1727,6 +1793,19 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
             self.bind_loaded_module(specifier, load, &declarator.id);
         }
 
+        let command = declarator
+            .init
+            .as_ref()
+            .and_then(|init| self.command_path(init))
+            .filter(|path| !path.is_empty());
+
+        if let (Some(path), BindingPattern::BindingIdentifier(identifier)) =
+            (command, &declarator.id)
+            && let Some(symbol) = identifier.symbol_id.get()
+        {
+            self.commands.variables.insert(symbol, path);
+        }
+
         walk::walk_variable_declarator(self, declarator);
     }
 
@@ -1784,11 +1863,18 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
             self.use_loaded_members(specifier, load, vec![name.clone()]);
         }
 
-        let symbol_use = match &member.object {
-            Expression::Identifier(object) => self
+        let symbol_use = match (&member.object, key) {
+            (Expression::Identifier(object), Some(key)) => self
                 .runtime_binding(object)
-                .map(|binding| binding_use(binding, key)),
-            Expression::ThisExpression(_) => key.and_then(|key| self.this_member(key)),
+                .map(|binding| binding_use(binding, Some(key))),
+            (Expression::Identifier(object), None) => self
+                .runtime_binding(object)
+                .map(|binding| Use::Keyed(Box::new(binding_use(binding, None)))),
+            (Expression::ThisExpression(_), Some(key)) => self.this_member(key),
+            (Expression::ThisExpression(_), None) => match self.this_value {
+                Some(ThisValue::Object(object)) => Some(Use::Keyed(Box::new(Use::Local(object)))),
+                _ => None,
+            },
             _ => None,
         };
 
@@ -1861,6 +1947,7 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
             self.run(vec![base], Condition::Always);
         }
 
+        self.define_command(call);
         walk::walk_call_expression(self, call);
     }
 
@@ -2153,6 +2240,13 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
     fn visit_ts_class_implements(&mut self, _: &TSClassImplements<'a>) {}
 }
 
+fn command_name(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .next()
+        .filter(|name| !name.starts_with('*'))
+        .map(str::to_owned)
+}
+
 fn called(symbol_use: Use) -> Use {
     Use::Call(Box::new(symbol_use))
 }
@@ -2402,6 +2496,7 @@ mod tests {
             } => format!("super {}", described_member(module, *class, member, *place)),
             Use::Call(called) => format!("{}()", describe_use(module, called)),
             Use::New(constructed) => format!("new {}()", describe_use(module, constructed)),
+            Use::Keyed(read) => format!("{}[key]", describe_use(module, read)),
         }
     }
 
@@ -2715,7 +2810,7 @@ mod tests {
                 used("a", &["./utils#*.format"]),
                 used("b", &["./utils#*.parse"]),
                 used("c", &["./utils#*"]),
-                used("d", &["./utils#*"]),
+                used("d", &["./utils#*[key]"]),
                 used("E", &["./utils#*.Button"]),
             ]
         );
@@ -3252,6 +3347,35 @@ mod tests {
             ]
         );
         assert_eq!(module.symbols[1].shape, Some(Shape::Object { open: true }));
+    }
+
+    #[test]
+    fn objects_read_by_a_runtime_key_and_command_paths_are_recorded() {
+        let source_text = r#"
+            import type { Command } from "commander";
+            export const handlers = { list: () => 1, add: () => 2 };
+            export function dispatch(method: string) { return handlers[method](); }
+            export function registerAgents(program: Command, name: string) {
+                const agents = program.command("agents").description("Manage agents");
+                agents.command("list").action(() => 1);
+                agents.command("add [name]").option("--json").action(() => 2);
+                agents.command("team").description("Teams").command("create").action(() => 3);
+                program.command(name).action(() => 4);
+                store.load().action(() => 5);
+            }
+        "#;
+
+        assert!(uses(source_text).contains(&used("dispatch", &["handlers[key]"])));
+        assert_eq!(
+            module_symbols(source_text).commands,
+            [
+                "agents",
+                "agents add",
+                "agents list",
+                "agents team",
+                "agents team create"
+            ]
+        );
     }
 
     #[test]

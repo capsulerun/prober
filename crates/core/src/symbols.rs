@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::files::FileId;
 use crate::graph::EdgeKind;
@@ -92,6 +92,12 @@ pub struct SymbolEdge {
     pub kind: EdgeKind,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Membership {
+    pub owner: SymbolId,
+    pub key: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FallbackCause {
     CommonJs,
@@ -151,6 +157,8 @@ pub(crate) struct SymbolTableBuilder {
     changes: Vec<SymbolChange>,
     compared_modules: Vec<FileId>,
     through: HashMap<SymbolEdge, Vec<FileId>>,
+    memberships: HashMap<SymbolId, Membership>,
+    dispatch_edges: HashSet<SymbolEdge>,
 }
 
 impl SymbolTableBuilder {
@@ -179,6 +187,14 @@ impl SymbolTableBuilder {
 
     pub(crate) fn add_fallback(&mut self, fallback: ModuleFallback) {
         self.fallbacks.push(fallback);
+    }
+
+    pub(crate) fn add_membership(&mut self, member: SymbolId, membership: Membership) {
+        self.memberships.insert(member, membership);
+    }
+
+    pub(crate) fn mark_dispatch(&mut self, edge: SymbolEdge) {
+        self.dispatch_edges.insert(edge);
     }
 
     pub(crate) fn add_module_changes(&mut self, file: FileId, changes: Vec<SymbolChange>) {
@@ -261,6 +277,8 @@ impl SymbolTableBuilder {
             changes: self.changes,
             changes_by_module,
             through: self.through,
+            memberships: self.memberships,
+            dispatch_edges: self.dispatch_edges,
         }
     }
 }
@@ -277,6 +295,8 @@ pub(crate) struct SymbolTable {
     changes: Vec<SymbolChange>,
     changes_by_module: HashMap<FileId, Vec<usize>>,
     through: HashMap<SymbolEdge, Vec<FileId>>,
+    memberships: HashMap<SymbolId, Membership>,
+    dispatch_edges: HashSet<SymbolEdge>,
 }
 
 impl SymbolTable {
@@ -338,6 +358,20 @@ impl SymbolTable {
 
     pub(crate) fn changes_of(&self, file: FileId) -> Option<&[usize]> {
         self.changes_by_module.get(&file).map(Vec::as_slice)
+    }
+
+    pub(crate) fn memberships(&self) -> impl Iterator<Item = (SymbolId, &Membership)> {
+        self.memberships
+            .iter()
+            .map(|(&member, membership)| (member, membership))
+    }
+
+    pub(crate) fn is_dispatch(&self, edge: &SymbolEdge) -> bool {
+        self.dispatch_edges.contains(edge)
+    }
+
+    pub(crate) fn dispatch_edges(&self) -> impl Iterator<Item = &SymbolEdge> {
+        self.dispatch_edges.iter()
     }
 }
 
