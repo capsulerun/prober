@@ -1036,6 +1036,10 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
             "extensions/telegram/package.json".to_owned(),
             r#"{ "name": "@app/telegram" }"#.to_owned(),
         ),
+        (
+            "extensions/telegram/index.test.ts".to_owned(),
+            "import { id } from \"./index\";\nexport const fixture = await import(process.env.FIXTURE!);\n".to_owned(),
+        ),
     ];
 
     for index in 0..10 {
@@ -1064,6 +1068,11 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
     let linked = repository.prober(&["--base", "main"]);
     let linked_scan = repository.prober(&["scan", "--format", "json"]).json();
 
+    repository.git(&["rm", "--quiet", "extensions/telegram/index.test.ts"]);
+    repository.commit_all("remove the extension test");
+
+    let removed_test = repository.prober(&["--base", "main"]);
+
     assert!(
         scan.stdout.contains(
             "Suggestions: 1\n  # src/loader.ts:1 widens to 10 test files: process.env.PLUGIN_ENTRY! is computed at runtime; declare what src/loader.ts loads (the repository's plugin folders extensions/{id}/, if it loads plugins), then set its unresolved sites aside\n  [[link]]\n  from = \"extensions/*/**\"\n  to = \"src/loader.ts\"\n\n  [[ignore]]\n  site = \"src/loader.ts\"\n"
@@ -1073,10 +1082,25 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
     );
     assert_eq!(
         widened.stderr,
-        "prober: selected 12/12 test files (100.0%), 10 added by widening\n"
+        "prober: selected 13/13 test files (100.0%), 11 added by widening\n"
     );
-    assert_eq!(linked.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
-    assert_eq!(linked_scan["unresolved"], json!([]));
+    assert_eq!(
+        linked.stdout,
+        "extensions/telegram/index.test.ts\nsrc/a.test.ts\nsrc/b.test.ts\n"
+    );
+    assert_eq!(removed_test.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(
+        linked_scan["unresolved"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|site| (
+                site["site"].as_str().unwrap(),
+                site["tests"].as_u64().unwrap()
+            ))
+            .collect::<Vec<_>>(),
+        [("extensions/telegram/index.test.ts:2", 1)]
+    );
     assert_eq!(
         linked_scan["config"]["rules"],
         json!([
