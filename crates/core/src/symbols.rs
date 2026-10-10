@@ -20,6 +20,8 @@ pub enum SymbolKind {
     Class,
     Variable,
     ModuleInit,
+    Member,
+    Call,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -284,6 +286,10 @@ impl SymbolTable {
 
     pub(crate) fn len(&self) -> usize {
         self.symbols.len()
+    }
+
+    pub(crate) fn all(&self) -> &[Symbol] {
+        &self.symbols
     }
 
     pub(crate) fn symbols_of(&self, file: FileId) -> &[SymbolId] {

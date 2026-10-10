@@ -1,52 +1,185 @@
-//! What a function does with each parameter while it is called: runs it, or only keeps it in what it returns, possibly by passing it to another function that keeps it.
+//! What a function does while it is called with each parameter and each local it declares: runs it, reads it, or only keeps it in what it returns, possibly by handing it to functions that keep it.
 
 use std::collections::{HashMap, HashSet};
 
-use oxc_ast::AstKind;
-use oxc_ast::ast::{
-    ArrowFunctionBody, BindingPattern, CallExpression, Expression, FormalParameters, Statement,
-};
+use oxc_ast::ast::{BindingPattern, FormalParameters, Statement};
 use oxc_semantic::SymbolId;
-use oxc_span::{GetSpan, Span};
+use oxc_span::Span;
 
-use crate::symbols::{Parameter, Use};
+use crate::symbols::placement::{End, Placement, bound_symbols};
+use crate::symbols::{Keeping, Parameter, Use};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Question {
+    Runs,
+    Matters,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Position {
+pub(crate) enum Flow {
     Run,
     Kept,
-    Passed(Use, usize),
-    Through(SymbolId),
+    Read,
+    Through(Vec<SymbolId>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fate {
+    pub flow: Flow,
+    pub keeping: Vec<Keeping>,
+    pub derived: bool,
+    pub read: bool,
+}
+
+impl Fate {
+    pub(crate) fn kept(keeping: Vec<Keeping>) -> Self {
+        Self {
+            flow: Flow::Kept,
+            keeping,
+            derived: false,
+            read: false,
+        }
+    }
+
+    pub(crate) fn run() -> Self {
+        Self {
+            flow: Flow::Run,
+            ..Self::kept(Vec::new())
+        }
+    }
+
+    pub(crate) fn through(locals: Vec<SymbolId>, keeping: Vec<Keeping>) -> Self {
+        Self {
+            flow: Flow::Through(locals),
+            ..Self::kept(keeping)
+        }
+    }
+
+    pub(crate) fn of(placement: Placement) -> Self {
+        let flow = match placement.end {
+            End::Stored | End::Dropped => Flow::Kept,
+            End::Read => Flow::Read,
+            End::Through(locals) => Flow::Through(locals),
+            End::Run => Flow::Run,
+        };
+
+        Self {
+            flow,
+            keeping: placement.keeping,
+            derived: placement.derived,
+            read: placement.read,
+        }
+    }
+
+    pub(crate) fn step(&self, question: Question) -> Step {
+        let counts = match question {
+            Question::Runs => !self.derived && self.flow == Flow::Run,
+            Question::Matters => self.read || matches!(self.flow, Flow::Run | Flow::Read),
+        };
+
+        match &self.flow {
+            _ if counts => Step::Counts,
+            Flow::Through(locals) if question == Question::Matters || !self.derived => {
+                Step::Through(locals.clone())
+            }
+            _ => Step::Kept,
+        }
+    }
+}
+
+pub(crate) enum Step {
+    Counts,
+    Kept,
+    Through(Vec<SymbolId>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Verdict {
+    Counts,
+    Held(Vec<Keeping>),
+    Kept,
+}
+
+impl Verdict {
+    pub(crate) fn of(counts: bool, kept_by: Vec<Keeping>) -> Self {
+        if counts {
+            Verdict::Counts
+        } else if kept_by.is_empty() {
+            Verdict::Kept
+        } else {
+            Verdict::Held(kept_by)
+        }
+    }
+}
+
+pub(crate) struct Pending {
+    pub locals: Vec<SymbolId>,
+    pub question: Question,
+    pub kept_by: Vec<Keeping>,
+    pub uses: Vec<Use>,
+    pub hole: Option<Span>,
 }
 
 pub(crate) struct FunctionFacts {
-    span: Span,
-    parameters: Vec<Option<SymbolId>>,
+    parameters: Vec<(Vec<SymbolId>, bool)>,
     watched: HashSet<SymbolId>,
-    positions: HashMap<SymbolId, Vec<Position>>,
+    fates: HashMap<SymbolId, Vec<Fate>>,
+    pending: Vec<Pending>,
 }
 
 impl FunctionFacts {
-    pub(crate) fn new(span: Span, parameters: &FormalParameters, body: &[Statement]) -> Self {
-        let parameters: Vec<Option<SymbolId>> = parameters
+    pub(crate) fn new(parameters: &FormalParameters, body: &[Statement]) -> Self {
+        let mut fates: HashMap<SymbolId, Vec<Fate>> = HashMap::new();
+        let mut positional: Vec<(Vec<SymbolId>, bool)> = parameters
             .items
             .iter()
-            .map(|parameter| match &parameter.pattern {
-                BindingPattern::BindingIdentifier(identifier) => identifier.symbol_id.get(),
-                _ => None,
+            .map(|parameter| {
+                let bound = bound_symbols(&parameter.pattern);
+
+                if parameter.accessibility.is_some() || parameter.readonly || parameter.r#override {
+                    for &symbol in &bound {
+                        fates
+                            .entry(symbol)
+                            .or_default()
+                            .push(Fate::kept(Vec::new()));
+                    }
+                }
+
+                (bound, false)
             })
             .collect();
-        let mut watched: HashSet<SymbolId> = parameters.iter().flatten().copied().collect();
+
+        if let Some(rest) = &parameters.rest {
+            match &rest.rest.argument {
+                BindingPattern::ArrayPattern(array) => {
+                    positional.extend(array.elements.iter().map(|element| {
+                        (
+                            element.as_ref().map(bound_symbols).unwrap_or_default(),
+                            false,
+                        )
+                    }));
+
+                    if let Some(rest) = &array.rest {
+                        positional.push((bound_symbols(&rest.argument), true));
+                    }
+                }
+                pattern => positional.push((bound_symbols(pattern), true)),
+            }
+        }
+
+        let parameters = positional;
+        let mut watched: HashSet<SymbolId> = parameters
+            .iter()
+            .flat_map(|(bound, _)| bound)
+            .copied()
+            .collect();
 
         for statement in body {
             match statement {
                 Statement::VariableDeclaration(variables) => {
                     for declarator in &variables.declarations {
-                        if let (BindingPattern::BindingIdentifier(identifier), Some(init)) =
-                            (&declarator.id, &declarator.init)
-                            && holds_functions(init)
-                        {
-                            watched.extend(identifier.symbol_id.get());
+                        if declarator.init.is_some() {
+                            watched.extend(bound_symbols(&declarator.id));
                         }
                     }
                 }
@@ -58,172 +191,83 @@ impl FunctionFacts {
         }
 
         Self {
-            span,
             parameters,
             watched,
-            positions: HashMap::new(),
+            fates,
+            pending: Vec::new(),
         }
     }
 
-    pub(crate) fn span(&self) -> Span {
-        self.span
+    pub(crate) fn watches(&self, locals: &[SymbolId]) -> bool {
+        locals.iter().all(|local| self.watched.contains(local))
     }
 
-    pub(crate) fn watches(&self, symbol: SymbolId) -> bool {
-        self.watched.contains(&symbol)
+    pub(crate) fn record(&mut self, symbol: SymbolId, fate: Fate) {
+        self.fates.entry(symbol).or_default().push(fate);
     }
 
-    pub(crate) fn record(&mut self, symbol: SymbolId, position: Position) {
-        self.positions.entry(symbol).or_default().push(position);
+    pub(crate) fn defer(&mut self, pending: Pending) {
+        self.pending.push(pending);
     }
 
-    pub(crate) fn into_parameters(self) -> Vec<Parameter> {
-        self.parameters
+    pub(crate) fn finish(self) -> (Vec<Parameter>, Vec<(Verdict, Pending)>) {
+        let parameters = self
+            .parameters
             .iter()
-            .map(|symbol| {
-                let mut passed = Vec::new();
-                let mut visiting = HashSet::new();
-                let kept =
-                    symbol.is_some_and(|symbol| self.kept(symbol, &mut passed, &mut visiting));
+            .map(|(bound, rest)| {
+                let (kept, passed) = match self.verdict(bound, Question::Runs, &[]) {
+                    Verdict::Counts => (false, Vec::new()),
+                    Verdict::Held(passed) => (true, passed),
+                    Verdict::Kept => (true, Vec::new()),
+                };
 
                 Parameter {
                     kept,
-                    passed: if kept { passed } else { Vec::new() },
+                    passed,
+                    rest: *rest,
                 }
             })
-            .collect()
+            .collect();
+        let verdicts = self
+            .pending
+            .iter()
+            .map(|pending| self.verdict(&pending.locals, pending.question, &pending.kept_by))
+            .collect::<Vec<_>>();
+
+        (parameters, verdicts.into_iter().zip(self.pending).collect())
     }
 
-    fn kept(
+    fn verdict(&self, locals: &[SymbolId], question: Question, kept_by: &[Keeping]) -> Verdict {
+        let mut passed = kept_by.to_vec();
+        let mut visiting = HashSet::new();
+        let counts = locals
+            .iter()
+            .any(|&local| self.counts(local, question, &mut passed, &mut visiting));
+
+        Verdict::of(counts, if counts { kept_by.to_vec() } else { passed })
+    }
+
+    fn counts(
         &self,
         symbol: SymbolId,
-        passed: &mut Vec<(Use, usize)>,
+        question: Question,
+        passed: &mut Vec<Keeping>,
         visiting: &mut HashSet<SymbolId>,
     ) -> bool {
         if !visiting.insert(symbol) {
-            return true;
+            return false;
         }
 
-        self.positions
-            .get(&symbol)
-            .into_iter()
-            .flatten()
-            .all(|position| match position {
-                Position::Run => false,
-                Position::Kept => true,
-                Position::Passed(callee, argument) => {
-                    passed.push((callee.clone(), *argument));
+        self.fates.get(&symbol).into_iter().flatten().any(|fate| {
+            passed.extend(fate.keeping.iter().cloned());
 
-                    true
-                }
-                Position::Through(local) => {
-                    self.watched.contains(local) && self.kept(*local, passed, visiting)
-                }
-            })
+            match fate.step(question) {
+                Step::Counts => true,
+                Step::Kept => false,
+                Step::Through(locals) => locals.into_iter().any(|local| {
+                    !self.watched.contains(&local) || self.counts(local, question, passed, visiting)
+                }),
+            }
+        })
     }
-}
-
-pub(crate) fn position(
-    ancestors: &[AstKind],
-    function_span: Span,
-    reference_span: Span,
-    callee_use: &dyn Fn(&CallExpression) -> Option<Use>,
-) -> Position {
-    let Some(function_index) = ancestors
-        .iter()
-        .rposition(|kind| is_function(kind) && kind.span() == function_span)
-    else {
-        return Position::Run;
-    };
-    let nested = ancestors[function_index + 1..]
-        .iter()
-        .position(is_function)
-        .map(|offset| function_index + 1 + offset);
-    let (mut index, mut span) = match nested {
-        Some(nested) => (nested, ancestors[nested].span()),
-        None => (ancestors.len(), reference_span),
-    };
-
-    while index > function_index + 1 {
-        index -= 1;
-
-        match ancestors[index] {
-            AstKind::ParenthesizedExpression(_)
-            | AstKind::TSAsExpression(_)
-            | AstKind::TSSatisfiesExpression(_)
-            | AstKind::TSNonNullExpression(_)
-            | AstKind::ObjectProperty(_)
-            | AstKind::ObjectExpression(_)
-            | AstKind::ArrayExpression(_)
-            | AstKind::ConditionalExpression(_)
-            | AstKind::LogicalExpression(_) => span = ancestors[index].span(),
-            AstKind::ReturnStatement(_) => return Position::Kept,
-            AstKind::CallExpression(call) => {
-                let argument = call
-                    .arguments
-                    .iter()
-                    .position(|argument| argument.span() == span);
-
-                return match (argument, callee_use(call)) {
-                    (Some(argument), Some(callee)) => Position::Passed(callee, argument),
-                    _ => Position::Run,
-                };
-            }
-            AstKind::VariableDeclarator(declarator) => {
-                return match (&declarator.id, &declarator.init) {
-                    (BindingPattern::BindingIdentifier(identifier), Some(init))
-                        if init.span() == span =>
-                    {
-                        identifier
-                            .symbol_id
-                            .get()
-                            .map_or(Position::Run, Position::Through)
-                    }
-                    _ => Position::Run,
-                };
-            }
-            AstKind::FunctionBody(_) => {
-                return match ancestors.get(index + 1) {
-                    Some(AstKind::Function(function)) => function
-                        .id
-                        .as_ref()
-                        .and_then(|id| id.symbol_id.get())
-                        .map_or(Position::Run, Position::Through),
-                    _ => Position::Run,
-                };
-            }
-            _ => return Position::Run,
-        }
-    }
-
-    match ancestors[function_index] {
-        AstKind::ArrowFunctionExpression(arrow) => match &arrow.body {
-            ArrowFunctionBody::FunctionBody(_) => Position::Run,
-            body => {
-                if body.to_expression().span() == span {
-                    Position::Kept
-                } else {
-                    Position::Run
-                }
-            }
-        },
-        _ => Position::Run,
-    }
-}
-
-fn is_function(kind: &AstKind) -> bool {
-    matches!(
-        kind,
-        AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
-    )
-}
-
-fn holds_functions(expression: &Expression) -> bool {
-    matches!(
-        expression.get_inner_expression(),
-        Expression::ArrowFunctionExpression(_)
-            | Expression::FunctionExpression(_)
-            | Expression::ObjectExpression(_)
-            | Expression::ArrayExpression(_)
-    )
 }

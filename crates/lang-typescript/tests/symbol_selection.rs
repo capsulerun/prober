@@ -358,3 +358,180 @@ fn closed_mock_of_a_barrel_cuts_the_symbols_resolved_through_it() {
         ["src/reader.test.ts"]
     );
 }
+
+const FACTORY: &str = "export function createHandlers(prefix: string) {\n  return {\n    greet: (name: string) => `${prefix} ${name}`,\n    shout: (name: string) => `${prefix} ${name}!`,\n  };\n}\n";
+
+fn factory_project() -> TestProject {
+    TestProject::new(&[
+        ("src/factory.ts", FACTORY),
+        (
+            "src/handlers.ts",
+            "import { createHandlers } from \"./factory\";\n\nexport const handlers = createHandlers(\"hello\");\nexport const version = 1;\n",
+        ),
+        (
+            "src/greet.test.ts",
+            "import { handlers } from \"./handlers\";\n\ntest(\"greet\", () => expect(handlers.greet(\"a\")).toBe(\"hello a\"));\n",
+        ),
+        (
+            "src/version.test.ts",
+            "import { version } from \"./handlers\";\n\ntest(\"version\", () => expect(version).toBe(1));\n",
+        ),
+    ])
+}
+
+#[test]
+fn change_inside_what_a_factory_called_at_load_creates_selects_only_the_users_of_its_result() {
+    let project = factory_project();
+    let base_factory = FACTORY.replace("`${prefix} ${name}`", "`${prefix}, ${name}`");
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("src/factory.ts", &base_factory)],
+            &[modified("src/factory.ts")]
+        ),
+        selected(&[(
+            "src/greet.test.ts",
+            &[
+                "src/factory.ts (modified)",
+                "-> createHandlers changed",
+                "-> createHandlers used by handlers in src/handlers.ts",
+                "-> handlers used at load by src/greet.test.ts",
+            ]
+        )])
+    );
+}
+
+#[test]
+fn change_to_what_a_factory_runs_when_called_at_load_selects_every_test_loading_the_caller() {
+    let project = factory_project();
+    let base_factory = FACTORY.replace("{\n  return", "{\n  console.log(prefix);\n  return");
+
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/factory.ts", &base_factory)],
+                &[modified("src/factory.ts")]
+            )
+            .selected_paths(),
+        ["src/greet.test.ts", "src/version.test.ts"]
+    );
+}
+
+const STORE: &str = "export class Store {\n  private items: string[] = [];\n\n  add(item: string) {\n    this.items.push(item);\n    return this.count();\n  }\n\n  count() {\n    return this.items.length;\n  }\n\n  clear() {\n    this.items = [];\n  }\n}\n";
+
+fn store_test(method: &str, call: &str) -> String {
+    format!(
+        "import {{ Store }} from \"./store\";\n\nconst store = new Store();\n\ntest(\"{method}\", () => expect(store.{call}).toBeDefined());\n"
+    )
+}
+
+#[test]
+fn change_to_one_method_selects_the_tests_reaching_it_through_instances_and_this() {
+    let add_test = store_test("add", "add(\"a\")");
+    let count_test = store_test("count", "count()");
+    let clear_test = store_test("clear", "clear()");
+    let project = TestProject::new(&[
+        ("src/store.ts", STORE),
+        ("src/add.test.ts", &add_test),
+        ("src/count.test.ts", &count_test),
+        ("src/clear.test.ts", &clear_test),
+    ]);
+    let base_store = STORE.replace("return this.items.length;", "return this.items.length + 0;");
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("src/store.ts", &base_store)],
+            &[modified("src/store.ts")]
+        ),
+        selected(&[
+            (
+                "src/add.test.ts",
+                &[
+                    "src/store.ts (modified)",
+                    "-> Store.count changed",
+                    "-> Store.count used by Store.add in src/store.ts",
+                    "-> Store.add used at load by src/add.test.ts",
+                ]
+            ),
+            (
+                "src/count.test.ts",
+                &[
+                    "src/store.ts (modified)",
+                    "-> Store.count changed",
+                    "-> Store.count used at load by src/count.test.ts",
+                ]
+            ),
+        ])
+    );
+}
+
+#[test]
+fn override_reaches_the_callers_through_this_and_an_inherited_method_the_subclass_users() {
+    let shape = "export class Shape {\n  describe() {\n    return `area ${this.area()}`;\n  }\n\n  area() {\n    return 0;\n  }\n}\n";
+    let square = "import { Shape } from \"./shape\";\n\nexport class Square extends Shape {\n  area() {\n    return 4;\n  }\n}\n";
+    let project = TestProject::new(&[
+        ("src/shape.ts", shape),
+        ("src/square.ts", square),
+        (
+            "src/shape.test.ts",
+            "import { Shape } from \"./shape\";\n\nconst shape = new Shape();\n\ntest(\"shape\", () => expect(shape.describe()).toBe(\"area 0\"));\n",
+        ),
+        (
+            "src/square.test.ts",
+            "import { Square } from \"./square\";\n\nconst square = new Square();\n\ntest(\"square\", () => expect(square.area()).toBe(4));\n",
+        ),
+    ]);
+    let base_square = square.replace("return 4;", "return 2 * 2;");
+    let base_shape = shape.replace("`area ${this.area()}`", "`area: ${this.area()}`");
+
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/square.ts", &base_square)],
+                &[modified("src/square.ts")]
+            )
+            .selected_paths(),
+        ["src/square.test.ts", "src/shape.test.ts"]
+    );
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/shape.ts", &base_shape)],
+                &[modified("src/shape.ts")]
+            )
+            .selected_paths(),
+        ["src/shape.test.ts"]
+    );
+}
+
+#[test]
+fn change_to_one_property_of_an_object_selects_only_the_tests_reading_it() {
+    let handlers = "export const handlers = {\n  greet: (name: string) => `hi ${name}`,\n  shout: (name: string) => `HI ${name}`,\n};\n";
+    let project = TestProject::new(&[
+        ("src/handlers.ts", handlers),
+        (
+            "src/greet.test.ts",
+            "import { handlers } from \"./handlers\";\n\ntest(\"greet\", () => expect(handlers.greet(\"a\")).toBe(\"hi a\"));\n",
+        ),
+        (
+            "src/shout.test.ts",
+            "import { handlers } from \"./handlers\";\n\ntest(\"shout\", () => expect(handlers[\"shout\"](\"a\")).toBe(\"HI a\"));\n",
+        ),
+    ]);
+    let base_handlers = handlers.replace("`HI ${name}`", "`HI, ${name}`");
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("src/handlers.ts", &base_handlers)],
+            &[modified("src/handlers.ts")]
+        ),
+        selected(&[(
+            "src/shout.test.ts",
+            &[
+                "src/handlers.ts (modified)",
+                "-> handlers.shout changed",
+                "-> handlers.shout used at load by src/shout.test.ts",
+            ]
+        )])
+    );
+}

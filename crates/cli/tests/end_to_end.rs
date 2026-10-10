@@ -1252,7 +1252,7 @@ fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
             "modules": ["src/x.ts", "src/y.ts"],
             "tests": 1,
             "symbols": {
-                "symbols": 6,
+                "symbols": 7,
                 "cycles": [{ "symbols": 2, "modules": 2, "tests": 1, "leading_in": 2 }],
                 "file_level": [],
             },
@@ -1260,6 +1260,8 @@ fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
     );
     assert_eq!(scan["stats"]["import_cycles"], 1);
     assert_eq!(scan["stats"]["modules_in_import_cycles"], 2);
+    assert_eq!(scan["symbols"]["members"], 0);
+    assert_eq!(scan["symbols"]["calls"], 1);
 
     let text_run = repository.prober(&["scan"]);
 
@@ -1268,7 +1270,7 @@ fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
             "Import cycles: 1 with 2 or more modules, 2 modules in them
   modules  tests  directories
         2      1  src 2
-                  symbol level: 6 symbols, 2 symbols in 2 modules still form a cycle pulling in 1 tests, 2 symbols lead into it (33.3%)
+                  symbol level: 7 symbols, 2 symbols in 2 modules still form a cycle pulling in 1 tests, 2 symbols lead into it (28.6%)
 "
         ),
         "{}",

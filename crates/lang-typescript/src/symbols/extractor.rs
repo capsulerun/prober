@@ -1,18 +1,20 @@
-//! The symbols of one module, read from its syntax tree: top-level declarations and the module initialisation, what each of them uses at runtime, and the module's imports, exports and loads.
+//! The symbols of one module, read from its syntax tree: top-level declarations, the members of classes and object literals, and the module initialisation; what each of them uses, what loading the module, calling a function or constructing a class runs, and the module's imports, exports and loads.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use oxc_ast::AstKind;
 use oxc_ast::ast::{
     AccessorProperty, Argument, ArrowFunctionBody, ArrowFunctionExpression, AssignmentExpression,
-    AwaitExpression, BindingPattern, CallExpression, Class, ComputedMemberExpression, Declaration,
-    Decorator, ExportDefaultDeclarationKind, Expression, FormalParameters, Function, FunctionType,
-    IdentifierReference, ImportDeclarationSpecifier, ImportExpression, ImportOrExportKind,
-    JSXMemberExpression, JSXMemberExpressionObject, ModuleExportName, NewExpression, Program,
-    PropertyDefinition, Statement, StaticBlock, StaticMemberExpression, TSClassImplements,
-    TSModuleReference, TSType, TSTypeAnnotation, TSTypeParameterDeclaration,
-    TSTypeParameterInstantiation, TaggedTemplateExpression, UnaryExpression, UnaryOperator,
-    UpdateExpression, VariableDeclarator,
+    AssignmentOperator, AwaitExpression, BindingPattern, CallExpression, Class, ClassElement,
+    ComputedMemberExpression, Declaration, Decorator, ExportDefaultDeclarationKind, Expression,
+    FormalParameters, Function, FunctionType, IdentifierReference, ImportDeclarationSpecifier,
+    ImportExpression, ImportOrExportKind, JSXMemberExpression, JSXMemberExpressionObject,
+    MethodDefinition, MethodDefinitionKind, ModuleExportName, NewExpression, ObjectExpression,
+    ObjectProperty, ObjectPropertyKind, PrivateFieldExpression, Program, PropertyDefinition,
+    PropertyKey, SimpleAssignmentTarget, Statement, StaticBlock, StaticMemberExpression,
+    TSClassImplements, TSModuleReference, TSType, TSTypeAnnotation, TSTypeParameterDeclaration,
+    TSTypeParameterInstantiation, TaggedTemplateExpression, ThisExpression, UnaryExpression,
+    UnaryOperator, UpdateExpression, VariableDeclarator,
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Token;
@@ -21,13 +23,17 @@ use oxc_span::{GetSpan, Span};
 use prober_core::symbols::{FallbackCause, LineRange, MODULE_INIT_NAME, SymbolKind};
 
 use crate::imports::{is_require, literal_text, loads_module};
-use crate::symbols::fingerprint::Fingerprint;
-use crate::symbols::parameters::{FunctionFacts, position};
+use crate::symbols::fingerprint::{Fingerprint, pieces};
+use crate::symbols::parameters::{Fate, FunctionFacts, Pending, Question, Step, Verdict};
+use crate::symbols::placement::{Bindings, Boundary, End, is_object_assign, placement};
 use crate::symbols::{
-    ExportTarget, ImportBinding, Imported, LoadArgument, LocalSymbol, ModuleSymbols, Parameter, Use,
+    ExportTarget, Extends, Held, ImportBinding, Imported, Keeping, LocalSymbol, Membership,
+    ModuleSymbols, Parameter, Place, Runs, Shape, Use,
 };
 
 const DEFAULT_EXPORT: &str = "default";
+
+const CONSTRUCTOR: &str = "constructor";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Binding {
@@ -35,16 +41,33 @@ enum Binding {
     Import(usize),
 }
 
+#[derive(Default)]
+struct HeldDraft {
+    spans: Vec<Span>,
+    uses: BTreeSet<Use>,
+}
+
+#[derive(Default)]
+struct RunsDraft {
+    spans: Vec<Span>,
+    holes: Vec<Span>,
+    uses: BTreeSet<Use>,
+    held: BTreeMap<Vec<Keeping>, HeldDraft>,
+}
+
 struct Draft {
     name: String,
     kind: SymbolKind,
     spans: Vec<Span>,
     names: Vec<Span>,
+    holes: Vec<Span>,
     uses: BTreeSet<Use>,
-    load_uses: BTreeSet<Use>,
-    load_arguments: Vec<usize>,
     parameters: Vec<Parameter>,
     runs_at_load: bool,
+    load: RunsDraft,
+    member: Option<Membership>,
+    shape: Option<Shape>,
+    runs: Option<RunsDraft>,
 }
 
 impl Draft {
@@ -54,24 +77,118 @@ impl Draft {
             kind,
             spans: Vec::new(),
             names: Vec::new(),
+            holes: Vec::new(),
             uses: BTreeSet::new(),
-            load_uses: BTreeSet::new(),
-            load_arguments: Vec::new(),
             parameters: Vec::new(),
             runs_at_load: false,
+            load: RunsDraft::default(),
+            member: None,
+            shape: None,
+            runs: None,
         }
     }
-}
-
-struct DraftArgument {
-    callee: Use,
-    index: usize,
-    uses: BTreeSet<Use>,
 }
 
 enum PendingExport {
     Binding(SymbolId),
     Target(ExportTarget),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Region {
+    sink: usize,
+    declaration: Option<usize>,
+    boundary: Boundary,
+    function: Option<Span>,
+    boundary_index: usize,
+}
+
+impl Region {
+    fn statement() -> Self {
+        Self {
+            sink: ModuleSymbols::INIT,
+            declaration: None,
+            boundary: Boundary::Declaration,
+            function: None,
+            boundary_index: 0,
+        }
+    }
+
+    fn declaration(declaration: usize) -> Self {
+        Self {
+            declaration: Some(declaration),
+            ..Self::statement()
+        }
+    }
+
+    fn function(sink: usize, boundary: Boundary, function: Span) -> Self {
+        Self {
+            sink,
+            declaration: None,
+            boundary,
+            function: Some(function),
+            boundary_index: usize::MAX,
+        }
+    }
+
+    fn field(class: usize, boundary_index: usize) -> Self {
+        Self {
+            sink: class,
+            declaration: None,
+            boundary: Boundary::Constructor,
+            function: None,
+            boundary_index,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Mode {
+    Run,
+    Deferred,
+    Kept(Vec<Keeping>, Option<Vec<SymbolId>>),
+}
+
+struct Frame {
+    index: usize,
+    mode: Mode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThisValue {
+    Class { class: usize, place: Place },
+    Object(usize),
+}
+
+struct Callee {
+    call: Span,
+    pure: bool,
+    wrap: fn(Use) -> Use,
+}
+
+enum Condition {
+    Always,
+    Held(Vec<Keeping>),
+    Through(Vec<SymbolId>, Vec<Keeping>, Question),
+}
+
+impl Condition {
+    fn of(fate: Fate, question: Question) -> Option<Self> {
+        match fate.step(question) {
+            Step::Counts => Some(Condition::Always),
+            Step::Kept if fate.keeping.is_empty() => None,
+            Step::Kept => Some(Condition::Held(fate.keeping)),
+            Step::Through(locals) => Some(Condition::Through(locals, fate.keeping, question)),
+        }
+    }
+}
+
+struct Context {
+    owner: Option<usize>,
+    region: Option<Region>,
+    frames: Vec<Frame>,
+    this_value: Option<ThisValue>,
+    member_function: Option<Span>,
 }
 
 pub(crate) fn extract_symbols<'a>(
@@ -92,14 +209,18 @@ pub(crate) fn extract_symbols<'a>(
         exports: Vec::new(),
         star_exports: Vec::new(),
         loads: Vec::new(),
-        owner: ModuleSymbols::INIT,
-        deferred: 0,
+        members: HashMap::new(),
+        member_drafts: HashMap::new(),
+        owner: None,
+        region: None,
+        frames: Vec::new(),
+        this_value: None,
+        member_function: None,
+        class: None,
+        collected_class: None,
         narrowed_loads: HashSet::new(),
         ancestors: Vec::new(),
         function: None,
-        arguments: Vec::new(),
-        argument: None,
-        load_call: None,
         fallback: None,
     };
 
@@ -123,46 +244,63 @@ pub(crate) fn extract_symbols<'a>(
         imports,
         star_exports,
         loads,
-        arguments,
         ..
     } = collector;
-    let mut load_uses = BTreeSet::new();
+
+    for index in 0..drafts.len() {
+        if let Some(owner) = drafts[index].member.as_ref().map(|member| member.owner) {
+            let spans = drafts[index].spans.clone();
+
+            drafts[owner].holes.extend(spans);
+        }
+    }
+
+    let mut init_runs = drafts[ModuleSymbols::INIT].runs.take().unwrap_or_default();
     let mut load_spans = Vec::new();
-    let mut load_arguments = Vec::new();
 
-    for draft in drafts.iter().skip(1).filter(|draft| draft.runs_at_load) {
-        load_uses.extend(draft.load_uses.iter().cloned());
+    for draft in drafts.iter_mut().skip(1).filter(|draft| draft.runs_at_load) {
+        let load = std::mem::take(&mut draft.load);
+
         load_spans.extend(draft.spans.iter().copied());
-        load_arguments.extend(draft.load_arguments.iter().map(|&argument| {
-            let argument = &arguments[argument];
+        init_runs.holes.extend(load.holes);
+        init_runs.uses.extend(load.uses);
 
-            LoadArgument {
-                callee: argument.callee.clone(),
-                index: argument.index,
-                uses: argument.uses.iter().cloned().collect(),
-            }
-        }));
+        for (kept_by, held) in load.held {
+            let init_held = init_runs.held.entry(kept_by).or_default();
+
+            init_held.spans.extend(held.spans);
+            init_held.uses.extend(held.uses);
+        }
     }
 
     let init = &mut drafts[ModuleSymbols::INIT];
 
-    init.uses.extend(load_uses);
     init.spans.extend(load_spans);
     init.spans.sort();
+    init.holes = init_runs.holes;
+    init.uses = init_runs.uses;
 
+    let held = held_groups(&fingerprint, init_runs.held);
     let symbols = drafts
         .into_iter()
         .map(|draft| LocalSymbol {
-            hash: fingerprint.hash(&draft.spans, &draft.names),
-            lines: draft
-                .spans
-                .iter()
-                .map(|&span| line_range(&line_starts, span))
-                .collect(),
+            hash: fingerprint.hash(&draft.spans, &draft.holes, &draft.names),
+            lines: lines(&line_starts, &draft.spans, &draft.holes),
+            runs: draft
+                .runs
+                .filter(|runs| !runs_as_whole(draft.kind, &draft.uses, runs))
+                .map(|runs| Runs {
+                    hash: fingerprint.hash(&runs.spans, &runs.holes, &draft.names),
+                    lines: lines(&line_starts, &runs.spans, &runs.holes),
+                    uses: runs.uses.into_iter().collect(),
+                    held: held_groups(&fingerprint, runs.held),
+                }),
             name: draft.name,
             kind: draft.kind,
             uses: draft.uses.into_iter().collect(),
             parameters: draft.parameters,
+            member: draft.member,
+            shape: draft.shape,
         })
         .collect();
 
@@ -172,8 +310,36 @@ pub(crate) fn extract_symbols<'a>(
         exports,
         star_exports,
         loads,
-        load_arguments,
+        held,
     })
+}
+
+fn lines(line_starts: &[usize], spans: &[Span], holes: &[Span]) -> Vec<LineRange> {
+    let mut lines: Vec<LineRange> = pieces(spans, holes)
+        .into_iter()
+        .map(|piece| line_range(line_starts, piece))
+        .collect();
+
+    lines.dedup();
+
+    lines
+}
+
+fn runs_as_whole(kind: SymbolKind, uses: &BTreeSet<Use>, runs: &RunsDraft) -> bool {
+    kind == SymbolKind::Function
+        && runs.holes.is_empty()
+        && runs.held.is_empty()
+        && runs.uses == *uses
+}
+
+fn held_groups(fingerprint: &Fingerprint, held: BTreeMap<Vec<Keeping>, HeldDraft>) -> Vec<Held> {
+    held.into_iter()
+        .map(|(kept_by, held)| Held {
+            kept_by,
+            hash: fingerprint.hash(&held.spans, &[], &[]),
+            uses: held.uses.into_iter().collect(),
+        })
+        .collect()
 }
 
 struct SymbolCollector<'s, 'a> {
@@ -184,19 +350,23 @@ struct SymbolCollector<'s, 'a> {
     exports: Vec<(String, PendingExport)>,
     star_exports: Vec<String>,
     loads: Vec<String>,
-    owner: usize,
-    deferred: usize,
+    members: HashMap<Span, usize>,
+    member_drafts: HashMap<(usize, String, Place), usize>,
+    owner: Option<usize>,
+    region: Option<Region>,
+    frames: Vec<Frame>,
+    this_value: Option<ThisValue>,
+    member_function: Option<Span>,
+    class: Option<usize>,
+    collected_class: Option<Span>,
     narrowed_loads: HashSet<Span>,
     ancestors: Vec<AstKind<'a>>,
-    function: Option<FunctionFacts>,
-    arguments: Vec<DraftArgument>,
-    argument: Option<usize>,
-    load_call: Option<(Span, Vec<Option<usize>>)>,
+    function: Option<(usize, FunctionFacts)>,
     fallback: Option<FallbackCause>,
 }
 
 impl<'a> SymbolCollector<'_, 'a> {
-    fn register(&mut self, statement: &Statement) {
+    fn register(&mut self, statement: &Statement<'a>) {
         match statement {
             Statement::ImportDeclaration(import) => {
                 if import.import_kind == ImportOrExportKind::Type {
@@ -324,6 +494,12 @@ impl<'a> SymbolCollector<'_, 'a> {
                             expression.span(),
                         );
 
+                        if let Expression::ObjectExpression(object) =
+                            expression.get_inner_expression()
+                        {
+                            self.register_object_members(object, index);
+                        }
+
                         Some(index)
                     }
                 };
@@ -350,7 +526,7 @@ impl<'a> SymbolCollector<'_, 'a> {
         }
     }
 
-    fn register_declaration(&mut self, declaration: &Declaration) -> Vec<(String, usize)> {
+    fn register_declaration(&mut self, declaration: &Declaration<'a>) -> Vec<(String, usize)> {
         match declaration {
             Declaration::VariableDeclaration(variables) if !variables.declare => variables
                 .declarations
@@ -425,7 +601,7 @@ impl<'a> SymbolCollector<'_, 'a> {
         }
     }
 
-    fn register_declarator(&mut self, declarator: &VariableDeclarator) -> Vec<(String, usize)> {
+    fn register_declarator(&mut self, declarator: &VariableDeclarator<'a>) -> Vec<(String, usize)> {
         let mut bound = Vec::new();
 
         binding_identifiers(&declarator.id, &mut bound);
@@ -444,8 +620,16 @@ impl<'a> SymbolCollector<'_, 'a> {
                     .init
                     .as_ref()
                     .map_or(SymbolKind::Variable, expression_kind);
+                let index = self.add_draft(names.join(", "), kind, declarator.span);
 
-                self.add_draft(names.join(", "), kind, declarator.span)
+                if let (BindingPattern::BindingIdentifier(_), Some(init)) =
+                    (&declarator.id, &declarator.init)
+                    && let Expression::ObjectExpression(object) = init.get_inner_expression()
+                {
+                    self.register_object_members(object, index);
+                }
+
+                index
             }
         };
 
@@ -483,22 +667,112 @@ impl<'a> SymbolCollector<'_, 'a> {
         )
     }
 
-    fn register_class(&mut self, class: &Class, anonymous_name: &str) -> Option<usize> {
+    fn register_class(&mut self, class: &Class<'a>, anonymous_name: &str) -> Option<usize> {
         if class.declare {
             return None;
         }
 
-        Some(
-            self.register_optional_name(
-                class
-                    .id
-                    .as_ref()
-                    .map(|id| (&*id.name, id.symbol_id.get(), id.span)),
-                anonymous_name,
-                SymbolKind::Class,
-                class.span,
-            ),
-        )
+        let index = self.register_optional_name(
+            class
+                .id
+                .as_ref()
+                .map(|id| (&*id.name, id.symbol_id.get(), id.span)),
+            anonymous_name,
+            SymbolKind::Class,
+            class.span,
+        );
+
+        self.register_class_members(class, index);
+
+        Some(index)
+    }
+
+    fn register_class_members(&mut self, class: &Class<'a>, owner: usize) {
+        let mut construction = RunsDraft::default();
+
+        for element in &class.body.body {
+            match element {
+                ClassElement::MethodDefinition(method)
+                    if method.kind == MethodDefinitionKind::Constructor =>
+                {
+                    construction.spans.push(method.span);
+                    self.add_member(owner, CONSTRUCTOR.to_owned(), Place::Instance, method.span);
+                }
+                ClassElement::MethodDefinition(method) => {
+                    if let Some(key) = member_key(&method.key) {
+                        self.add_member(owner, key, place(method.r#static), method.span);
+                    }
+                }
+                ClassElement::PropertyDefinition(property) => {
+                    if property.declare {
+                        continue;
+                    }
+
+                    if !property.r#static && property.value.is_some() {
+                        construction.spans.push(property.span);
+                    }
+
+                    if let Some(key) = member_key(&property.key) {
+                        self.add_member(owner, key, place(property.r#static), property.span);
+                    }
+                }
+                ClassElement::AccessorProperty(property) => {
+                    if !property.r#static && property.value.is_some() {
+                        construction.spans.push(property.span);
+                    }
+
+                    if let Some(key) = member_key(&property.key) {
+                        self.add_member(owner, key, place(property.r#static), property.span);
+                    }
+                }
+                ClassElement::StaticBlock(_) | ClassElement::TSIndexSignature(_) => {}
+            }
+        }
+
+        self.drafts[owner].runs = Some(construction);
+    }
+
+    fn register_object_members(&mut self, object: &ObjectExpression<'a>, owner: usize) {
+        let mut open = false;
+
+        for property in &object.properties {
+            match property {
+                ObjectPropertyKind::ObjectProperty(property) => match member_key(&property.key) {
+                    Some(key) => self.add_member(owner, key, Place::Own, property.span),
+                    None => open = true,
+                },
+                ObjectPropertyKind::SpreadProperty(_) => open = true,
+            }
+        }
+
+        self.drafts[owner].shape = Some(Shape::Object { open });
+    }
+
+    fn add_member(&mut self, owner: usize, key: String, place: Place, span: Span) {
+        let index = match self.member_drafts.get(&(owner, key.clone(), place)) {
+            Some(&index) => {
+                self.drafts[index].spans.push(span);
+
+                index
+            }
+            None => {
+                let in_class = self.drafts[owner].kind == SymbolKind::Class;
+                let name = member_name(&self.drafts[owner].name, &key, place, in_class);
+                let index = self.add_draft(name, SymbolKind::Member, span);
+
+                self.drafts[index].member = Some(Membership {
+                    owner,
+                    key: key.clone(),
+                    place,
+                    assigns: Vec::new(),
+                });
+                self.member_drafts.insert((owner, key, place), index);
+
+                index
+            }
+        };
+
+        self.members.insert(span, index);
     }
 
     fn register_optional_name(
@@ -622,21 +896,28 @@ impl<'a> SymbolCollector<'_, 'a> {
                     });
 
                     if let Some(index) = default_draft {
-                        self.owner = index;
+                        self.collect_value(index, Some(expression));
                         self.visit_expression(expression);
+                        self.finish_function();
                     }
                 }
             },
             statement => match statement.as_declaration() {
                 Some(declaration) => self.collect_declaration(declaration),
                 None => {
-                    self.owner = ModuleSymbols::INIT;
+                    self.region = Some(Region::statement());
                     self.visit_statement(statement);
                 }
             },
         }
 
-        self.owner = ModuleSymbols::INIT;
+        self.owner = None;
+        self.region = None;
+        self.frames.clear();
+        self.this_value = None;
+        self.member_function = None;
+        self.class = None;
+        self.collected_class = None;
     }
 
     fn collect_declaration(&mut self, declaration: &Declaration<'a>) {
@@ -652,8 +933,9 @@ impl<'a> SymbolCollector<'_, 'a> {
                     });
 
                     if let Some(owner) = owner {
-                        self.owner = owner;
-                        self.collect_declarator(declarator);
+                        self.collect_value(owner, declarator.init.as_ref());
+                        self.visit_variable_declarator(declarator);
+                        self.finish_function();
                     }
                 }
             }
@@ -668,7 +950,7 @@ impl<'a> SymbolCollector<'_, 'a> {
                     .get()
                     .and_then(|symbol| self.local_binding(symbol))
                 {
-                    self.owner = owner;
+                    self.collect_value(owner, None);
                     self.visit_ts_enum_body(&enumeration.body);
                 }
             }
@@ -679,7 +961,7 @@ impl<'a> SymbolCollector<'_, 'a> {
                     .get()
                     .and_then(|symbol| self.local_binding(symbol))
                 {
-                    self.owner = owner;
+                    self.collect_value(owner, None);
                     self.visit_ts_namespace_declaration_body(&namespace.body);
                 }
             }
@@ -692,7 +974,7 @@ impl<'a> SymbolCollector<'_, 'a> {
                     .get()
                     .and_then(|symbol| self.local_binding(symbol))
                 {
-                    self.owner = owner;
+                    self.collect_value(owner, None);
                     self.visit_ts_module_reference(&import_equals.module_reference);
                 }
             }
@@ -700,19 +982,17 @@ impl<'a> SymbolCollector<'_, 'a> {
         }
     }
 
-    fn collect_declarator(&mut self, declarator: &VariableDeclarator<'a>) {
-        match declarator
-            .init
-            .as_ref()
-            .map(Expression::get_inner_expression)
-        {
+    fn collect_value(&mut self, owner: usize, init: Option<&Expression<'a>>) {
+        self.owner = Some(owner);
+
+        match init.map(Expression::get_inner_expression) {
             Some(Expression::ArrowFunctionExpression(arrow)) => {
                 let body: &[Statement] = match &arrow.body {
                     ArrowFunctionBody::FunctionBody(body) => &body.statements,
                     _ => &[],
                 };
 
-                self.function = Some(FunctionFacts::new(arrow.span, &arrow.params, body));
+                self.start_function(owner, arrow.span, &arrow.params, body);
             }
             Some(Expression::FunctionExpression(function)) => {
                 let body = function
@@ -720,49 +1000,74 @@ impl<'a> SymbolCollector<'_, 'a> {
                     .as_ref()
                     .map_or(&[][..], |body| &body.statements);
 
-                self.function = Some(FunctionFacts::new(function.span, &function.params, body));
+                self.start_function(owner, function.span, &function.params, body);
             }
-            Some(Expression::CallExpression(call)) => {
-                if let Some(callee) = self.callee_use(call) {
-                    let held = call
-                        .arguments
-                        .iter()
-                        .enumerate()
-                        .map(|(index, argument)| {
-                            argument
-                                .as_expression()
-                                .is_some_and(may_be_kept)
-                                .then(|| self.add_argument(callee.clone(), index))
-                        })
-                        .collect();
+            init => {
+                self.region = Some(Region::declaration(owner));
 
-                    self.load_call = Some((call.span, held));
+                if let Some(shape) = init.and_then(|init| self.value_shape(init)) {
+                    self.drafts[owner].shape.get_or_insert(shape);
                 }
             }
-            _ => {}
         }
-
-        self.visit_variable_declarator(declarator);
-        self.load_call = None;
-        self.finish_function();
     }
 
-    fn add_argument(&mut self, callee: Use, index: usize) -> usize {
-        self.arguments.push(DraftArgument {
-            callee,
-            index,
-            uses: BTreeSet::new(),
+    fn start_function(
+        &mut self,
+        owner: usize,
+        span: Span,
+        parameters: &FormalParameters,
+        body: &[Statement],
+    ) {
+        self.drafts[owner].runs = Some(RunsDraft {
+            spans: vec![span],
+            ..RunsDraft::default()
         });
-        self.drafts[self.owner]
-            .load_arguments
-            .push(self.arguments.len() - 1);
+        self.region = Some(Region::function(owner, Boundary::Function, span));
+        self.function = Some((owner, FunctionFacts::new(parameters, body)));
+    }
 
-        self.arguments.len() - 1
+    fn value_shape(&self, init: &Expression) -> Option<Shape> {
+        match init {
+            Expression::NewExpression(new) => {
+                let Expression::Identifier(callee) = new.callee.get_inner_expression() else {
+                    return None;
+                };
+
+                Some(Shape::Instance(binding_use(
+                    self.runtime_binding(callee)?,
+                    None,
+                )))
+            }
+            callee if is_object_assign(callee) => Some(Shape::Assign),
+            _ => None,
+        }
     }
 
     fn finish_function(&mut self) {
-        if let Some(function) = self.function.take() {
-            self.drafts[self.owner].parameters = function.into_parameters();
+        let Some((owner, function)) = self.function.take() else {
+            return;
+        };
+        let (parameters, pending) = function.finish();
+
+        self.drafts[owner].parameters = parameters;
+
+        for (verdict, pending) in pending {
+            let runs = self.drafts[owner]
+                .runs
+                .get_or_insert_with(RunsDraft::default);
+
+            match verdict {
+                Verdict::Counts => runs.uses.extend(pending.uses),
+                Verdict::Held(kept_by) => {
+                    let held = runs.held.entry(kept_by).or_default();
+
+                    held.uses.extend(pending.uses);
+                    held.spans.extend(pending.hole);
+                    runs.holes.extend(pending.hole);
+                }
+                Verdict::Kept => runs.holes.extend(pending.hole),
+            }
         }
     }
 
@@ -781,8 +1086,8 @@ impl<'a> SymbolCollector<'_, 'a> {
                 .as_ref()
                 .map_or(&[][..], |body| &body.statements);
 
-            self.owner = owner;
-            self.function = Some(FunctionFacts::new(function.span, &function.params, body));
+            self.owner = Some(owner);
+            self.start_function(owner, function.span, &function.params, body);
             self.visit_function(function, ScopeFlags::Function);
             self.finish_function();
         }
@@ -793,13 +1098,56 @@ impl<'a> SymbolCollector<'_, 'a> {
             return;
         }
 
-        if let Some(owner) = self.owner_of(
+        let Some(owner) = self.owner_of(
             class.id.as_ref().and_then(|id| id.symbol_id.get()),
             anonymous_name,
             class.span,
-        ) {
-            self.owner = owner;
-            self.visit_class(class);
+        ) else {
+            return;
+        };
+        let extends = self.extends(class);
+        let has_constructor = class.body.body.iter().any(|element| {
+            matches!(element, ClassElement::MethodDefinition(method) if method.kind == MethodDefinitionKind::Constructor)
+        });
+
+        if !has_constructor && let Extends::Binding(base) = &extends {
+            self.drafts[owner]
+                .runs
+                .get_or_insert_with(RunsDraft::default)
+                .uses
+                .insert(Use::New(Box::new(base.clone())));
+        }
+
+        self.drafts[owner].shape = Some(Shape::Class { extends });
+        self.owner = Some(owner);
+        self.region = Some(Region::declaration(owner));
+        self.class = Some(owner);
+        self.collected_class = Some(class.span);
+        self.visit_class(class);
+    }
+
+    fn extends(&self, class: &Class) -> Extends {
+        let Some(heritage) = &class.heritage else {
+            return Extends::Nothing;
+        };
+
+        match heritage.expression.get_inner_expression() {
+            Expression::Identifier(base) => self
+                .runtime_binding(base)
+                .map_or(Extends::Other, |binding| {
+                    Extends::Binding(binding_use(binding, None))
+                }),
+            Expression::StaticMemberExpression(member) => match &member.object {
+                Expression::Identifier(namespace) => match self.runtime_binding(namespace) {
+                    Some(binding) => Extends::Binding(binding_use(
+                        binding,
+                        Some(member.property.name.to_string()),
+                    )),
+                    None => Extends::Other,
+                },
+                _ => Extends::Other,
+            },
+            _ => Extends::Other,
         }
     }
 
@@ -818,47 +1166,287 @@ impl<'a> SymbolCollector<'_, 'a> {
         }
     }
 
-    fn record(&mut self, binding: Binding, member: Option<String>) {
-        let symbol_use = match binding {
-            Binding::Local(index) if index == self.owner => return,
-            Binding::Local(index) => Use::Local(index),
-            Binding::Import(index) => Use::Import {
-                binding: index,
-                member,
-            },
+    fn enter_context(&mut self, context: Context) -> Context {
+        Context {
+            owner: std::mem::replace(&mut self.owner, context.owner),
+            region: std::mem::replace(&mut self.region, context.region),
+            frames: std::mem::replace(&mut self.frames, context.frames),
+            this_value: std::mem::replace(&mut self.this_value, context.this_value),
+            member_function: std::mem::replace(&mut self.member_function, context.member_function),
+        }
+    }
+
+    fn restore_context(&mut self, context: Context) {
+        self.enter_context(context);
+    }
+
+    fn record(&mut self, symbol_use: Use) {
+        let Some(owner) = self.owner else {
+            return;
         };
 
-        self.add_use(symbol_use);
+        if symbol_use != Use::Local(owner) {
+            self.drafts[owner].uses.insert(symbol_use);
+        }
     }
 
-    fn add_use(&mut self, symbol_use: Use) {
-        let draft = &mut self.drafts[self.owner];
+    fn use_binding(&mut self, symbol_use: Use, span: Span) {
+        let recorded = match self.callee_of(span) {
+            Some(callee) if !self.result_escapes(callee.call) => (callee.wrap)(symbol_use.clone()),
+            _ => symbol_use.clone(),
+        };
 
-        match self.argument {
-            Some(argument) => {
-                self.arguments[argument].uses.insert(symbol_use.clone());
-            }
-            None => {
-                draft.load_uses.insert(symbol_use.clone());
-            }
+        self.record(recorded);
+        self.run_occurrence(symbol_use, span);
+    }
+
+    fn result_escapes(&self, call: Span) -> bool {
+        let outside = &self.ancestors[..self.ancestors.len() - 1];
+        let boundary = outside
+            .iter()
+            .rposition(|kind| {
+                matches!(
+                    kind,
+                    AstKind::Function(_) | AstKind::ArrowFunctionExpression(_)
+                )
+            })
+            .map_or((0, Boundary::Declaration), |index| {
+                (index, Boundary::Nested)
+            });
+        let placement = placement(outside, boundary, call, self);
+        let contained = placement.derived || matches!(placement.end, End::Dropped | End::Read);
+
+        !placement.keeping.is_empty() || !contained
+    }
+
+    fn mode(&self) -> &Mode {
+        self.frames.last().map_or(&Mode::Run, |frame| &frame.mode)
+    }
+
+    fn runs(&self) -> bool {
+        self.region.is_some() && *self.mode() != Mode::Deferred
+    }
+
+    fn boundary(&self) -> (usize, Boundary) {
+        match (self.frames.last(), self.region) {
+            (Some(frame), _) => (frame.index, Boundary::Nested),
+            (None, Some(region)) => (region.boundary_index, region.boundary),
+            (None, None) => (self.ancestors.len(), Boundary::Nested),
+        }
+    }
+
+    fn fate(&self, span: Span) -> Fate {
+        self.fate_in(&self.ancestors, span)
+    }
+
+    fn fate_in(&self, ancestors: &[AstKind<'a>], span: Span) -> Fate {
+        Fate::of(placement(ancestors, self.boundary(), span, self))
+    }
+
+    fn reference_fate(&self, span: Span) -> Fate {
+        match self.mode() {
+            Mode::Deferred => Fate::kept(Vec::new()),
+            Mode::Kept(kept_by, None) => Fate::kept(kept_by.clone()),
+            Mode::Kept(kept_by, Some(locals)) => Fate::through(locals.clone(), kept_by.clone()),
+            Mode::Run if self.callee_of(span).is_some() => Fate::run(),
+            Mode::Run => self.fate(span),
+        }
+    }
+
+    fn callee_of(&self, span: Span) -> Option<Callee> {
+        match self.ancestors.last() {
+            Some(AstKind::CallExpression(call)) if call.callee.span() == span => Some(Callee {
+                call: call.span,
+                pure: call.pure,
+                wrap: called,
+            }),
+            Some(AstKind::NewExpression(new)) if new.callee.span() == span => Some(Callee {
+                call: new.span,
+                pure: new.pure,
+                wrap: constructed,
+            }),
+            _ => None,
+        }
+    }
+
+    fn run_occurrence(&mut self, symbol_use: Use, span: Span) {
+        if !self.runs() {
+            return;
         }
 
-        draft.uses.insert(symbol_use);
+        let condition = match self.callee_of(span) {
+            Some(callee) => {
+                if !callee.pure {
+                    self.run(vec![(callee.wrap)(symbol_use.clone())], Condition::Always);
+                }
+
+                let outside = &self.ancestors[..self.ancestors.len() - 1];
+
+                Condition::of(self.fate_in(outside, callee.call), Question::Runs)
+            }
+            None => Condition::of(self.fate(span), Question::Matters),
+        };
+
+        if let Some(condition) = condition {
+            self.run(vec![symbol_use], condition);
+        }
     }
 
-    fn callee_use(&self, call: &CallExpression) -> Option<Use> {
-        match call.callee.get_inner_expression() {
-            Expression::Identifier(callee) => match self.runtime_binding(callee)? {
-                Binding::Local(index) => Some(Use::Local(index)),
-                Binding::Import(index) => Some(Use::Import {
-                    binding: index,
-                    member: None,
-                }),
+    fn run(&mut self, uses: Vec<Use>, condition: Condition) {
+        let Some(region) = self.region else {
+            return;
+        };
+        let condition = match self.mode() {
+            Mode::Deferred => return,
+            Mode::Kept(kept_by, None) => Condition::Held(kept_by.clone()),
+            Mode::Kept(kept_by, Some(locals)) => {
+                Condition::Through(locals.clone(), kept_by.clone(), Question::Runs)
+            }
+            Mode::Run => condition,
+        };
+        let kept_by = match condition {
+            Condition::Always => None,
+            Condition::Held(kept_by) => Some(kept_by),
+            Condition::Through(locals, kept_by, question) => match &mut self.function {
+                Some((_, function)) if function.watches(&locals) => {
+                    function.defer(Pending {
+                        locals,
+                        question,
+                        kept_by,
+                        uses,
+                        hole: None,
+                    });
+
+                    return;
+                }
+                _ => None,
             },
+        };
+        let runs = self.region_runs(region);
+
+        match kept_by {
+            Some(kept_by) => runs.held.entry(kept_by).or_default().uses.extend(uses),
+            None => runs.uses.extend(uses),
+        }
+    }
+
+    fn region_runs(&mut self, region: Region) -> &mut RunsDraft {
+        match region.declaration {
+            Some(declaration) => &mut self.drafts[declaration].load,
+            None => self.drafts[region.sink]
+                .runs
+                .get_or_insert_with(RunsDraft::default),
+        }
+    }
+
+    fn add_hole(&mut self, span: Span) {
+        if let Some(region) = self.region {
+            self.region_runs(region).holes.push(span);
+        }
+    }
+
+    fn enter_function(
+        &mut self,
+        span: Span,
+        declared: Option<SymbolId>,
+        visit: impl FnOnce(&mut Self),
+    ) {
+        if let Some(region) = &mut self.region
+            && region.function == Some(span)
+        {
+            region.boundary_index = self.ancestors.len();
+            visit(self);
+
+            return;
+        }
+
+        if self.region.is_none() {
+            visit(self);
+
+            return;
+        }
+
+        let mode = match self.mode() {
+            Mode::Deferred => Mode::Deferred,
+            Mode::Kept(kept_by, locals) => Mode::Kept(kept_by.clone(), locals.clone()),
+            Mode::Run => {
+                let fate = match declared {
+                    Some(symbol) => Fate::through(vec![symbol], Vec::new()),
+                    None => self.fate(span),
+                };
+
+                self.frame_mode(fate, span)
+            }
+        };
+
+        self.frames.push(Frame {
+            index: self.ancestors.len(),
+            mode,
+        });
+        visit(self);
+        self.frames.pop();
+    }
+
+    fn frame_mode(&mut self, fate: Fate, span: Span) -> Mode {
+        let watched = |collector: &Self, locals: &[SymbolId]| {
+            collector
+                .function
+                .as_ref()
+                .is_some_and(|(_, function)| function.watches(locals))
+        };
+
+        match fate.step(Question::Runs) {
+            Step::Counts => Mode::Run,
+            Step::Kept if fate.keeping.is_empty() => {
+                self.add_hole(span);
+
+                Mode::Deferred
+            }
+            Step::Kept => {
+                self.hold(&fate.keeping, span);
+
+                Mode::Kept(fate.keeping, None)
+            }
+            Step::Through(locals) if watched(self, &locals) => {
+                if let Some((_, function)) = &mut self.function {
+                    function.defer(Pending {
+                        locals: locals.clone(),
+                        question: Question::Runs,
+                        kept_by: fate.keeping.clone(),
+                        uses: Vec::new(),
+                        hole: Some(span),
+                    });
+                }
+
+                Mode::Kept(fate.keeping, Some(locals))
+            }
+            Step::Through(_) => Mode::Run,
+        }
+    }
+
+    fn hold(&mut self, kept_by: &[Keeping], span: Span) {
+        let Some(region) = self.region else {
+            return;
+        };
+        let runs = self.region_runs(region);
+
+        runs.holes.push(span);
+        runs.held
+            .entry(kept_by.to_vec())
+            .or_default()
+            .spans
+            .push(span);
+    }
+
+    fn call_use(&self, callee: &Expression) -> Option<Use> {
+        match callee.get_inner_expression() {
+            Expression::Identifier(callee) => {
+                Some(binding_use(self.runtime_binding(callee)?, None))
+            }
             Expression::StaticMemberExpression(member) => match &member.object {
                 Expression::Identifier(object) => match self.runtime_binding(object)? {
-                    Binding::Import(index) => Some(Use::Import {
-                        binding: index,
+                    Binding::Import(binding) => Some(Use::Import {
+                        binding,
                         member: Some(member.property.name.to_string()),
                     }),
                     Binding::Local(_) => None,
@@ -873,21 +1461,19 @@ impl<'a> SymbolCollector<'_, 'a> {
         let Some(symbol) = self.resolved_symbol(reference) else {
             return;
         };
-        let Some(function) = &self.function else {
-            return;
-        };
+        let watched = self
+            .function
+            .as_ref()
+            .is_some_and(|(_, function)| function.watches(&[symbol]));
 
-        if !function.watches(symbol) {
+        if !watched {
             return;
         }
 
-        let reference_position =
-            position(&self.ancestors, function.span(), reference.span, &|call| {
-                self.callee_use(call)
-            });
+        let fate = self.reference_fate(reference.span);
 
-        if let Some(function) = &mut self.function {
-            function.record(symbol, reference_position);
+        if let Some((_, function)) = &mut self.function {
+            function.record(symbol, fate);
         }
     }
 
@@ -912,20 +1498,36 @@ impl<'a> SymbolCollector<'_, 'a> {
         })
     }
 
-    fn runs_now(&mut self) {
-        if self.deferred == 0 {
-            self.drafts[self.owner].runs_at_load = true;
+    fn this_member(&self, member: String) -> Option<Use> {
+        match self.this_value? {
+            ThisValue::Class { class, place } => Some(Use::This {
+                class,
+                member,
+                place,
+            }),
+            ThisValue::Object(object) => Some(Use::Member {
+                symbol: object,
+                member,
+            }),
         }
     }
 
-    fn later(&mut self, visit: impl FnOnce(&mut Self)) {
-        self.deferred += 1;
-        visit(self);
-        self.deferred -= 1;
+    fn runs_now(&mut self) {
+        if self.frames.is_empty()
+            && let Some(Region {
+                declaration: Some(declaration),
+                ..
+            }) = self.region
+        {
+            self.drafts[declaration].runs_at_load = true;
+        }
     }
 
     fn use_module(&mut self, specifier: &str) {
-        self.add_use(Use::Module(specifier.to_owned()));
+        let symbol_use = Use::Module(specifier.to_owned());
+
+        self.record(symbol_use.clone());
+        self.run(vec![symbol_use], Condition::Always);
     }
 
     fn load_narrowed(&mut self, specifier: &str, load: Span) -> usize {
@@ -934,7 +1536,11 @@ impl<'a> SymbolCollector<'_, 'a> {
             specifier: specifier.to_owned(),
             imported: Imported::Dynamic,
         });
-        self.add_use(Use::Load(specifier.to_owned()));
+
+        let symbol_use = Use::Load(specifier.to_owned());
+
+        self.record(symbol_use.clone());
+        self.run(vec![symbol_use], Condition::Always);
 
         self.imports.len() - 1
     }
@@ -943,7 +1549,13 @@ impl<'a> SymbolCollector<'_, 'a> {
         let binding = self.load_narrowed(specifier, load);
 
         for member in members {
-            self.record(Binding::Import(binding), Some(member));
+            let symbol_use = Use::Import {
+                binding,
+                member: Some(member),
+            };
+
+            self.record(symbol_use.clone());
+            self.run(vec![symbol_use], Condition::Always);
         }
     }
 
@@ -980,6 +1592,88 @@ impl<'a> SymbolCollector<'_, 'a> {
             BindingPattern::ArrayPattern(_) | BindingPattern::AssignmentPattern(_) => false,
         }
     }
+
+    fn writes_member(&self, assignment: &AssignmentExpression) -> bool {
+        let plain_object = |object: &Expression| match object {
+            Expression::ThisExpression(_) => true,
+            Expression::Identifier(identifier) => !self.is_unresolved(identifier),
+            _ => false,
+        };
+
+        assignment.operator == AssignmentOperator::Assign
+            && assignment
+                .left
+                .as_simple_assignment_target()
+                .is_some_and(|target| match target {
+                    SimpleAssignmentTarget::StaticMemberExpression(member) => {
+                        plain_object(&member.object)
+                    }
+                    SimpleAssignmentTarget::PrivateFieldExpression(field) => {
+                        plain_object(&field.object)
+                    }
+                    SimpleAssignmentTarget::ComputedMemberExpression(member) => {
+                        plain_object(&member.object) && literal_text(&member.expression).is_some()
+                    }
+                    _ => false,
+                })
+    }
+
+    fn visit_class_field(
+        &mut self,
+        span: Span,
+        is_static: bool,
+        decorators: &[Decorator<'a>],
+        key: &PropertyKey<'a>,
+        value: Option<&Expression<'a>>,
+    ) {
+        let Some(class) = self.class else {
+            return;
+        };
+        let member = self.members.get(&span).copied().unwrap_or(class);
+        let saved_owner = self.owner.replace(member);
+
+        for decorator in decorators {
+            self.visit_decorator(decorator);
+        }
+
+        self.owner = Some(class);
+        self.visit_property_key(key);
+
+        if let Some(value) = value {
+            let region = if is_static {
+                self.region
+            } else {
+                self.add_hole(value.span());
+
+                Some(Region::field(class, self.ancestors.len() - 1))
+            };
+            let saved = self.enter_context(Context {
+                owner: Some(member),
+                region,
+                frames: Vec::new(),
+                this_value: Some(ThisValue::Class {
+                    class,
+                    place: place(is_static),
+                }),
+                member_function: None,
+            });
+
+            self.visit_expression(value);
+            self.restore_context(saved);
+        }
+
+        self.owner = saved_owner;
+    }
+}
+
+impl Bindings for SymbolCollector<'_, '_> {
+    fn callee_use(&self, callee: &Expression) -> Option<Use> {
+        self.call_use(callee)
+    }
+
+    fn is_local(&self, reference: &IdentifierReference) -> bool {
+        self.resolved_symbol(reference).is_some() && self.runtime_binding(reference).is_none()
+    }
 }
 
 impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
@@ -999,7 +1693,19 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
         }
 
         if let Some(binding) = self.runtime_binding(reference) {
-            self.record(binding, None);
+            self.use_binding(binding_use(binding, None), reference.span);
+        }
+    }
+
+    fn visit_this_expression(&mut self, this: &ThisExpression) {
+        let whole = match self.this_value {
+            Some(ThisValue::Class { class, .. }) => Some(class),
+            Some(ThisValue::Object(object)) => Some(object),
+            None => None,
+        };
+
+        if let Some(whole) = whole {
+            self.use_binding(Use::Local(whole), this.span);
         }
     }
 
@@ -1016,48 +1722,80 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
             self.use_loaded_members(specifier, load, vec![member.property.name.to_string()]);
         }
 
-        if let Expression::Identifier(object) = &member.object {
-            if object.name == "module"
-                && member.property.name == "exports"
-                && self.is_unresolved(object)
-            {
-                self.fallback.get_or_insert(FallbackCause::CommonJs);
-            }
+        let name = member.property.name.to_string();
+        let symbol_use = match &member.object {
+            Expression::Identifier(object) => {
+                if object.name == "module" && name == "exports" && self.is_unresolved(object) {
+                    self.fallback.get_or_insert(FallbackCause::CommonJs);
+                }
 
-            if let Some(binding @ Binding::Import(_)) = self.runtime_binding(object) {
-                self.record(binding, Some(member.property.name.to_string()));
-
-                return;
+                self.runtime_binding(object)
+                    .map(|binding| binding_use(binding, Some(name)))
             }
+            Expression::ThisExpression(_) => self.this_member(name),
+            Expression::Super(_) => match self.this_value {
+                Some(ThisValue::Class { class, place }) => Some(Use::Super {
+                    class,
+                    member: name,
+                    place,
+                }),
+                _ => None,
+            },
+            _ => None,
+        };
+
+        match symbol_use {
+            Some(symbol_use) => self.use_binding(symbol_use, member.span),
+            None => walk::walk_static_member_expression(self, member),
         }
+    }
 
-        walk::walk_static_member_expression(self, member);
+    fn visit_private_field_expression(&mut self, field: &PrivateFieldExpression<'a>) {
+        let symbol_use = match &field.object {
+            Expression::ThisExpression(_) => self.this_member(format!("#{}", field.field.name)),
+            _ => None,
+        };
+
+        match symbol_use {
+            Some(symbol_use) => self.use_binding(symbol_use, field.span),
+            None => walk::walk_private_field_expression(self, field),
+        }
     }
 
     fn visit_computed_member_expression(&mut self, member: &ComputedMemberExpression<'a>) {
+        let key = literal_text(&member.expression).map(str::to_owned);
+
         if let Some((specifier, load)) = loaded_module(&member.object)
-            && let Some(name) = literal_text(&member.expression)
+            && let Some(name) = &key
         {
-            self.use_loaded_members(specifier, load, vec![name.to_owned()]);
+            self.use_loaded_members(specifier, load, vec![name.clone()]);
         }
 
-        if let Expression::Identifier(object) = &member.object
-            && let Some(binding @ Binding::Import(_)) = self.runtime_binding(object)
-        {
-            self.record(binding, literal_text(&member.expression).map(str::to_owned));
-            self.visit_expression(&member.expression);
+        let symbol_use = match &member.object {
+            Expression::Identifier(object) => self
+                .runtime_binding(object)
+                .map(|binding| binding_use(binding, key)),
+            Expression::ThisExpression(_) => key.and_then(|key| self.this_member(key)),
+            _ => None,
+        };
 
-            return;
+        match symbol_use {
+            Some(symbol_use) => {
+                self.use_binding(symbol_use, member.span);
+                self.visit_expression(&member.expression);
+            }
+            None => walk::walk_computed_member_expression(self, member),
         }
-
-        walk::walk_computed_member_expression(self, member);
     }
 
     fn visit_jsx_member_expression(&mut self, member: &JSXMemberExpression<'a>) {
         if let JSXMemberExpressionObject::IdentifierReference(object) = &member.object
             && let Some(binding @ Binding::Import(_)) = self.runtime_binding(object)
         {
-            self.record(binding, Some(member.property.name.to_string()));
+            self.use_binding(
+                binding_use(binding, Some(member.property.name.to_string())),
+                member.span,
+            );
 
             return;
         }
@@ -1103,28 +1841,25 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
             self.use_module(specifier);
         }
 
-        let held = self
-            .load_call
-            .take_if(|(span, _)| *span == call.span)
-            .map(|(_, held)| held);
+        if matches!(call.callee, Expression::Super(_))
+            && let Some(ThisValue::Class { class, .. }) = self.this_value
+        {
+            let base = match &self.drafts[class].shape {
+                Some(Shape::Class {
+                    extends: Extends::Binding(base),
+                }) => Some(Use::New(Box::new(base.clone()))),
+                Some(Shape::Class {
+                    extends: Extends::Other,
+                }) => Some(Use::Local(class)),
+                _ => None,
+            };
 
-        match held {
-            Some(held) => {
-                let kind = AstKind::CallExpression(self.alloc(call));
-
-                self.enter_node(kind);
-                self.visit_expression(&call.callee);
-
-                for (argument, held_argument) in call.arguments.iter().zip(held) {
-                    self.argument = held_argument;
-                    self.visit_argument(argument);
-                    self.argument = None;
-                }
-
-                self.leave_node(kind);
+            if let Some(base) = base {
+                self.run(vec![base], Condition::Always);
             }
-            None => walk::walk_call_expression(self, call),
         }
+
+        walk::walk_call_expression(self, call);
     }
 
     fn visit_import_expression(&mut self, import_expression: &ImportExpression<'a>) {
@@ -1154,7 +1889,48 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
 
     fn visit_assignment_expression(&mut self, assignment: &AssignmentExpression<'a>) {
         self.runs_now();
-        walk::walk_assignment_expression(self, assignment);
+
+        let assigned =
+            assignment
+                .left
+                .as_simple_assignment_target()
+                .and_then(|target| match target {
+                    SimpleAssignmentTarget::StaticMemberExpression(member)
+                        if matches!(member.object, Expression::ThisExpression(_)) =>
+                    {
+                        Some(member.property.name.to_string())
+                    }
+                    SimpleAssignmentTarget::PrivateFieldExpression(field)
+                        if matches!(field.object, Expression::ThisExpression(_)) =>
+                    {
+                        Some(format!("#{}", field.field.name))
+                    }
+                    _ => None,
+                });
+
+        if let Some(key) = assigned
+            && let Some(ThisValue::Class {
+                class,
+                place: Place::Instance,
+            }) = self.this_value
+            && let Some(owner) = self.owner
+            && let Some(member) = &mut self.drafts[owner].member
+            && member.owner == class
+            && !member.assigns.contains(&key)
+        {
+            member.assigns.push(key);
+        }
+
+        let kind = AstKind::AssignmentExpression(self.alloc(assignment));
+
+        self.enter_node(kind);
+
+        if !self.writes_member(assignment) {
+            self.visit_assignment_target(&assignment.left);
+        }
+
+        self.visit_expression(&assignment.right);
+        self.leave_node(kind);
     }
 
     fn visit_update_expression(&mut self, update: &UpdateExpression<'a>) {
@@ -1182,47 +1958,186 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
 
     fn visit_static_block(&mut self, static_block: &StaticBlock<'a>) {
         self.runs_now();
+
+        let Some(class) = self.class else {
+            walk::walk_static_block(self, static_block);
+
+            return;
+        };
+        let saved_owner = self.owner.replace(class);
+        let saved_this = self.this_value.replace(ThisValue::Class {
+            class,
+            place: Place::Own,
+        });
+
         walk::walk_static_block(self, static_block);
+        self.owner = saved_owner;
+        self.this_value = saved_this;
     }
 
-    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
-        self.later(|collector| walk::walk_function(collector, function, flags));
+    fn visit_class(&mut self, class: &Class<'a>) {
+        if self.collected_class == Some(class.span) {
+            walk::walk_class(self, class);
+
+            return;
+        }
+
+        let saved = self.class.take();
+
+        walk::walk_class(self, class);
+        self.class = saved;
     }
 
-    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
-        self.later(|collector| walk::walk_arrow_function_expression(collector, arrow));
+    fn visit_method_definition(&mut self, method: &MethodDefinition<'a>) {
+        let Some(class) = self.class else {
+            walk::walk_method_definition(self, method);
+
+            return;
+        };
+        let member = self.members.get(&method.span).copied().unwrap_or(class);
+        let kind = AstKind::MethodDefinition(self.alloc(method));
+
+        self.enter_node(kind);
+
+        let saved_owner = self.owner.replace(member);
+
+        for decorator in &method.decorators {
+            self.visit_decorator(decorator);
+        }
+
+        self.owner = Some(class);
+        self.visit_property_key(&method.key);
+        self.add_hole(method.value.span);
+
+        let (flags, region) = match method.kind {
+            MethodDefinitionKind::Constructor => (
+                ScopeFlags::Function | ScopeFlags::Constructor,
+                Some(Region::function(
+                    class,
+                    Boundary::Constructor,
+                    method.value.span,
+                )),
+            ),
+            MethodDefinitionKind::Get => (ScopeFlags::Function | ScopeFlags::GetAccessor, None),
+            MethodDefinitionKind::Set => (ScopeFlags::Function | ScopeFlags::SetAccessor, None),
+            MethodDefinitionKind::Method => (ScopeFlags::Function, None),
+        };
+        let facts = region.map(|_| {
+            let body = method
+                .value
+                .body
+                .as_ref()
+                .map_or(&[][..], |body| &body.statements);
+
+            (class, FunctionFacts::new(&method.value.params, body))
+        });
+        let saved_function = std::mem::replace(&mut self.function, facts);
+        let saved = self.enter_context(Context {
+            owner: Some(member),
+            region,
+            frames: Vec::new(),
+            this_value: Some(ThisValue::Class {
+                class,
+                place: place(method.r#static),
+            }),
+            member_function: Some(method.value.span),
+        });
+
+        self.visit_function(&method.value, flags);
+        self.finish_function();
+        self.restore_context(saved);
+        self.function = saved_function;
+        self.owner = saved_owner;
+        self.leave_node(kind);
     }
 
     fn visit_property_definition(&mut self, property: &PropertyDefinition<'a>) {
-        for decorator in &property.decorators {
-            self.visit_decorator(decorator);
+        if self.class.is_none() {
+            walk::walk_property_definition(self, property);
+
+            return;
         }
 
-        self.visit_property_key(&property.key);
+        let kind = AstKind::PropertyDefinition(self.alloc(property));
 
-        if let Some(value) = &property.value {
-            if property.r#static {
-                self.visit_expression(value);
-            } else {
-                self.later(|collector| collector.visit_expression(value));
-            }
-        }
+        self.enter_node(kind);
+        self.visit_class_field(
+            property.span,
+            property.r#static,
+            &property.decorators,
+            &property.key,
+            property.value.as_ref(),
+        );
+        self.leave_node(kind);
     }
 
     fn visit_accessor_property(&mut self, property: &AccessorProperty<'a>) {
-        for decorator in &property.decorators {
-            self.visit_decorator(decorator);
+        if self.class.is_none() {
+            walk::walk_accessor_property(self, property);
+
+            return;
         }
 
-        self.visit_property_key(&property.key);
+        let kind = AstKind::AccessorProperty(self.alloc(property));
 
-        if let Some(value) = &property.value {
-            if property.r#static {
-                self.visit_expression(value);
-            } else {
-                self.later(|collector| collector.visit_expression(value));
-            }
+        self.enter_node(kind);
+        self.visit_class_field(
+            property.span,
+            property.r#static,
+            &property.decorators,
+            &property.key,
+            property.value.as_ref(),
+        );
+        self.leave_node(kind);
+    }
+
+    fn visit_object_property(&mut self, property: &ObjectProperty<'a>) {
+        let Some(&member) = self.members.get(&property.span) else {
+            walk::walk_object_property(self, property);
+
+            return;
+        };
+        let object = self.drafts[member]
+            .member
+            .as_ref()
+            .map_or(member, |membership| membership.owner);
+        let saved_owner = self.owner.replace(member);
+        let saved_this = self.this_value;
+        let saved_member_function = self.member_function;
+
+        if let Expression::FunctionExpression(function) = property.value.get_inner_expression() {
+            self.this_value = Some(ThisValue::Object(object));
+            self.member_function = Some(function.span);
         }
+
+        walk::walk_object_property(self, property);
+        self.owner = saved_owner;
+        self.this_value = saved_this;
+        self.member_function = saved_member_function;
+    }
+
+    fn visit_function(&mut self, function: &Function<'a>, flags: ScopeFlags) {
+        let this_value = if self.member_function == Some(function.span) {
+            self.this_value
+        } else {
+            None
+        };
+        let saved_this = std::mem::replace(&mut self.this_value, this_value);
+        let declared = function
+            .is_declaration()
+            .then(|| function.id.as_ref().and_then(|id| id.symbol_id.get()))
+            .flatten();
+
+        self.enter_function(function.span, declared, |collector| {
+            walk::walk_function(collector, function, flags);
+        });
+        self.this_value = saved_this;
+    }
+
+    fn visit_arrow_function_expression(&mut self, arrow: &ArrowFunctionExpression<'a>) {
+        self.enter_function(arrow.span, None, |collector| {
+            walk::walk_arrow_function_expression(collector, arrow);
+        });
     }
 
     fn visit_ts_type(&mut self, _: &TSType<'a>) {}
@@ -1236,14 +2151,57 @@ impl<'a> Visit<'a> for SymbolCollector<'_, 'a> {
     fn visit_ts_class_implements(&mut self, _: &TSClassImplements<'a>) {}
 }
 
-fn may_be_kept(argument: &Expression) -> bool {
-    matches!(
-        argument.get_inner_expression(),
-        Expression::ArrowFunctionExpression(_)
-            | Expression::FunctionExpression(_)
-            | Expression::Identifier(_)
-            | Expression::StaticMemberExpression(_)
-    )
+fn called(symbol_use: Use) -> Use {
+    Use::Call(Box::new(symbol_use))
+}
+
+fn constructed(symbol_use: Use) -> Use {
+    Use::New(Box::new(symbol_use))
+}
+
+fn binding_use(binding: Binding, member: Option<String>) -> Use {
+    match (binding, member) {
+        (Binding::Local(symbol), None) => Use::Local(symbol),
+        (Binding::Local(symbol), Some(member)) => Use::Member { symbol, member },
+        (Binding::Import(binding), member) => Use::Import { binding, member },
+    }
+}
+
+fn place(is_static: bool) -> Place {
+    if is_static {
+        Place::Own
+    } else {
+        Place::Instance
+    }
+}
+
+fn member_key(key: &PropertyKey) -> Option<String> {
+    key.static_name()
+        .map(|name| name.into_owned())
+        .or_else(|| key.private_name().map(|name| format!("#{name}")))
+}
+
+fn member_name(owner: &str, key: &str, place: Place, in_class: bool) -> String {
+    let access = if is_identifier_name(key) {
+        format!("{owner}.{key}")
+    } else {
+        format!("{owner}[{key:?}]")
+    };
+
+    match place {
+        Place::Own if in_class => format!("static {access}"),
+        Place::Own | Place::Instance => access,
+    }
+}
+
+fn is_identifier_name(key: &str) -> bool {
+    let name = key.strip_prefix('#').unwrap_or(key);
+    let mut chars = name.chars();
+
+    chars
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_' || first == '$')
+        && chars.all(|next| next.is_alphanumeric() || next == '_' || next == '$')
 }
 
 fn loaded_module<'e>(expression: &'e Expression<'e>) -> Option<(&'e str, Span)> {
@@ -1427,7 +2385,124 @@ mod tests {
             }
             Use::Module(specifier) => format!("module {specifier}"),
             Use::Load(specifier) => format!("load {specifier}"),
+            Use::Member { symbol, member } => {
+                format!("{}.{member}", module.symbols[*symbol].name)
+            }
+            Use::This {
+                class,
+                member,
+                place,
+            } => format!("this {}", described_member(module, *class, member, *place)),
+            Use::Super {
+                class,
+                member,
+                place,
+            } => format!("super {}", described_member(module, *class, member, *place)),
+            Use::Call(called) => format!("{}()", describe_use(module, called)),
+            Use::New(constructed) => format!("new {}()", describe_use(module, constructed)),
         }
+    }
+
+    fn described_member(
+        module: &ModuleSymbols,
+        class: usize,
+        member: &str,
+        place: Place,
+    ) -> String {
+        let class = &module.symbols[class].name;
+
+        match place {
+            Place::Own => format!("static {class}.{member}"),
+            Place::Instance => format!("{class}.{member}"),
+        }
+    }
+
+    fn described_uses(module: &ModuleSymbols, uses: &[Use]) -> Vec<String> {
+        uses.iter()
+            .map(|symbol_use| describe_use(module, symbol_use))
+            .collect()
+    }
+
+    fn described_held(module: &ModuleSymbols, held: &[Held]) -> Vec<(Vec<String>, Vec<String>)> {
+        held.iter()
+            .map(|held| {
+                let kept_by = held
+                    .kept_by
+                    .iter()
+                    .map(|keeping| described_keeping(module, keeping))
+                    .collect();
+
+                (kept_by, described_uses(module, &held.uses))
+            })
+            .collect()
+    }
+
+    fn described_keeping(module: &ModuleSymbols, keeping: &Keeping) -> String {
+        format!(
+            "{} #{}",
+            describe_use(module, &keeping.callee),
+            keeping.index
+        )
+    }
+
+    type DescribedRuns = (String, Vec<String>, Vec<(Vec<String>, Vec<String>)>);
+
+    fn runs(source_text: &str) -> Vec<DescribedRuns> {
+        let module = module_symbols(source_text);
+        let init = (
+            MODULE_INIT_NAME.to_owned(),
+            described_uses(&module, &module.symbols[ModuleSymbols::INIT].uses),
+            described_held(&module, &module.held),
+        );
+        let others = module.symbols.iter().filter_map(|symbol| {
+            let runs = symbol.runs.as_ref()?;
+
+            let name = if symbol.kind == SymbolKind::Class {
+                format!("new {}()", symbol.name)
+            } else {
+                format!("{}()", symbol.name)
+            };
+
+            Some((
+                name,
+                described_uses(&module, &runs.uses),
+                described_held(&module, &runs.held),
+            ))
+        });
+
+        std::iter::once(init).chain(others).collect()
+    }
+
+    fn ran(name: &str, uses: &[&str]) -> DescribedRuns {
+        (
+            name.to_owned(),
+            uses.iter()
+                .map(|&symbol_use| symbol_use.to_owned())
+                .collect(),
+            Vec::new(),
+        )
+    }
+
+    fn ran_holding(name: &str, uses: &[&str], held: &[(&[&str], &[&str])]) -> DescribedRuns {
+        let held = held
+            .iter()
+            .map(|(kept_by, uses)| {
+                (
+                    kept_by.iter().map(|&keeping| keeping.to_owned()).collect(),
+                    uses.iter()
+                        .map(|&symbol_use| symbol_use.to_owned())
+                        .collect(),
+                )
+            })
+            .collect();
+
+        (
+            name.to_owned(),
+            uses.iter()
+                .map(|&symbol_use| symbol_use.to_owned())
+                .collect(),
+            held,
+        )
     }
 
     fn uses(source_text: &str) -> Vec<(String, Vec<String>)> {
@@ -1514,9 +2589,11 @@ mod tests {
                 ("load", SymbolKind::Function),
                 ("helper", SymbolKind::Function),
                 ("Store", SymbolKind::Class),
+                ("Store.save", SymbolKind::Member),
                 ("Base", SymbolKind::Class),
                 ("VALUE", SymbolKind::Variable),
                 ("DEFAULTS", SymbolKind::Variable),
+                ("DEFAULTS.a", SymbolKind::Member),
                 ("left, right", SymbolKind::Variable),
                 ("pair", SymbolKind::Function),
                 ("Color", SymbolKind::Variable),
@@ -1527,13 +2604,15 @@ mod tests {
         assert_eq!(
             uses(source_text),
             [
-                used(MODULE_INIT_NAME, &["pair"]),
+                used(MODULE_INIT_NAME, &["pair()"]),
                 used("load", &["helper"]),
                 used("helper", &["VALUE"]),
-                used("Store", &["load", "Base", "DEFAULTS"]),
+                used("Store", &["Base"]),
+                used("Store.save", &["load", "DEFAULTS"]),
                 used("Base", &[]),
                 used("VALUE", &[]),
-                used("DEFAULTS", &["VALUE"]),
+                used("DEFAULTS", &[]),
+                used("DEFAULTS.a", &["VALUE"]),
                 used("left, right", &["pair"]),
                 used("pair", &[]),
                 used("Color", &[]),
@@ -1559,7 +2638,8 @@ mod tests {
     }
 
     #[test]
-    fn module_initialisation_uses_top_level_statements_and_declarations_running_at_load() {
+    fn module_initialisation_runs_top_level_code_and_calls_at_load_but_not_what_declarations_store()
+    {
         let source_text = r#"
             import { register } from "./registry";
             import { createLogger } from "./logger";
@@ -1576,23 +2656,37 @@ mod tests {
         "#;
 
         assert_eq!(
-            uses(source_text),
+            runs(source_text),
             [
-                used(
+                ran_holding(
                     MODULE_INIT_NAME,
                     &[
                         "log",
-                        "handlers",
                         "decorate",
-                        "./registry#register",
-                        "./logger#createLogger"
-                    ]
+                        "./registry#register()",
+                        "./logger#createLogger()",
+                        "new Widget()"
+                    ],
+                    &[(&["./registry#register #0"], &["handlers"])]
                 ),
+                ran("new Widget()", &[]),
+                ran("new Lazy()", &["new Lazy()"]),
+                ran("new Decorated()", &[]),
+                ran("makeMap()", &[]),
+            ]
+        );
+        assert_eq!(
+            uses(source_text)[1..],
+            [
                 used("log", &["./logger#createLogger"]),
-                used("handlers", &["./registry#register"]),
+                used("handlers", &[]),
+                used("handlers.start", &["./registry#register"]),
                 used("ready", &["log"]),
-                used("Widget", &["log"]),
+                used("Widget", &[]),
+                used("static Widget.instance", &["Widget"]),
+                used("Widget.render", &["log"]),
                 used("Lazy", &[]),
+                used("Lazy.instance", &["Lazy"]),
                 used("Decorated", &["decorate"]),
                 used("decorate", &[]),
                 used("isTag", &["makeMap"]),
@@ -1720,9 +2814,7 @@ mod tests {
                         let passed = parameter
                             .passed
                             .iter()
-                            .map(|(callee, argument)| {
-                                format!("{} #{argument}", describe_use(&module, callee))
-                            })
+                            .map(|keeping| described_keeping(&module, keeping))
                             .collect();
 
                         (parameter.kept, passed)
@@ -1777,62 +2869,44 @@ mod tests {
                 parameters("stored", &[(false, &[])]),
                 parameters("viaLocal", &[(true, &[]), (true, &[])]),
                 parameters("arrow", &[(true, &[])]),
-                parameters("unused", &[(true, &[]), (false, &[])]),
+                parameters("unused", &[(true, &[]), (true, &[])]),
             ]
         );
     }
 
     #[test]
     fn declarations_running_at_load_hand_their_callbacks_to_the_functions_they_call() {
-        let module = module_symbols(
-            r#"
-                import { createLazyRuntimeModule } from "./lazy";
-                const loadRuntime = createLazyRuntimeModule(() => import("./runtime"));
-                const value = compute(helper, { limit: LIMIT });
-                const LIMIT = 3;
-                function helper() { return 1; }
-                function compute(callback: () => number, options: { limit: number }) { return callback() + options.limit; }
-                export { loadRuntime, value };
-            "#,
-        );
-        let load_arguments: Vec<(String, usize, Vec<String>)> = module
-            .load_arguments
-            .iter()
-            .map(|argument| {
-                let uses = argument
-                    .uses
-                    .iter()
-                    .map(|symbol_use| describe_use(&module, symbol_use))
-                    .collect();
-
-                (
-                    describe_use(&module, &argument.callee),
-                    argument.index,
-                    uses,
-                )
-            })
-            .collect();
-        let init = &module.symbols[ModuleSymbols::INIT];
+        let source_text = r#"
+            import { createLazyRuntimeModule } from "./lazy";
+            const loadRuntime = createLazyRuntimeModule(() => import("./runtime"));
+            const value = compute(helper, { limit: LIMIT });
+            const LIMIT = 3;
+            function helper() { return 1; }
+            function compute(callback: () => number, options: { limit: number }) { return callback() + options.limit; }
+            export { loadRuntime, value };
+        "#;
 
         assert_eq!(
-            load_arguments,
-            [
-                (
-                    "./lazy#createLazyRuntimeModule".to_owned(),
-                    0,
-                    vec!["module ./runtime".to_owned()]
-                ),
-                ("compute".to_owned(), 0, vec!["helper".to_owned()]),
-            ]
+            runs(source_text)[0],
+            ran_holding(
+                MODULE_INIT_NAME,
+                &["compute()", "./lazy#createLazyRuntimeModule()"],
+                &[
+                    (&["compute #0"], &["helper"]),
+                    (&["compute #1"], &["LIMIT"]),
+                    (
+                        &["./lazy#createLazyRuntimeModule #0"],
+                        &["module ./runtime"]
+                    ),
+                ]
+            )
         );
         assert_eq!(
-            init.uses
-                .iter()
-                .map(|symbol_use| describe_use(&module, symbol_use))
-                .collect::<Vec<_>>(),
-            ["LIMIT", "compute", "./lazy#createLazyRuntimeModule"]
+            module_symbols(source_text).symbols[ModuleSymbols::INIT]
+                .lines
+                .len(),
+            2
         );
-        assert_eq!(init.lines.len(), 2);
     }
 
     #[test]
@@ -1976,5 +3050,206 @@ mod tests {
         assert_eq!(original, renamed);
         assert_ne!(original[0], changed[0]);
         assert_ne!(original[1], changed[1]);
+    }
+
+    #[test]
+    fn calling_a_function_at_load_runs_its_statements_not_the_functions_it_returns() {
+        let source_text = r#"
+            import { log } from "./log";
+            export function createHandlers(prefix: string) {
+                log(prefix);
+                const greet = async (name: string) => (await import("./greeting")).format(prefix, name);
+                return { greet, shout: (name: string) => import("./shouting").then(({ shout }) => shout(name)) };
+            }
+            export const handlers = createHandlers("hello");
+        "#;
+
+        assert_eq!(
+            runs(source_text),
+            [
+                ran(MODULE_INIT_NAME, &["createHandlers()"]),
+                ran("createHandlers()", &["./log#log()"]),
+            ]
+        );
+        assert_eq!(
+            uses(source_text)[1..],
+            [
+                used(
+                    "createHandlers",
+                    &[
+                        "./greeting#import().format",
+                        "./shouting#import().shout",
+                        "load ./greeting",
+                        "load ./shouting",
+                        "./log#log()"
+                    ]
+                ),
+                used("handlers", &["createHandlers"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn reads_that_decide_what_runs_count_and_dropped_results_need_only_what_the_call_runs() {
+        let source_text = r#"
+            import { FLAG, LIMIT, register, save, load, render } from "./lib";
+            if (FLAG) register();
+            export const label = LIMIT > 3 ? "many" : "few";
+            export function store(value: string) {
+                save(value);
+                if (load(value)) return render(value);
+                return `${LIMIT}`;
+            }
+        "#;
+
+        assert_eq!(
+            runs(source_text),
+            [
+                ran(MODULE_INIT_NAME, &["./lib#FLAG", "./lib#register()"]),
+                ran(
+                    "store()",
+                    &["./lib#save()", "./lib#load()", "./lib#render()"]
+                ),
+            ]
+        );
+        assert_eq!(
+            uses(source_text)[1..],
+            [
+                used("label", &["./lib#LIMIT"]),
+                used(
+                    "store",
+                    &[
+                        "./lib#LIMIT",
+                        "./lib#render",
+                        "./lib#save()",
+                        "./lib#load()"
+                    ]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn classes_split_into_members_and_what_constructing_them_runs() {
+        let source_text = r#"
+            import { Base, connect, register } from "./base";
+            export class Store extends Base {
+                static instance = new Store();
+                static { register(Store); }
+                private items: string[] = [];
+                private handler = () => connect();
+                constructor(readonly name: string) { super(name); this.created = Date.now(); }
+                add(item: string) { this.items.push(item); return this.count(); }
+                count() { return super.size() + this.items.length; }
+                static create() { return Store.instance; }
+                #secret() { return this.handler(); }
+            }
+        "#;
+        let module = module_symbols(source_text);
+        let members: Vec<(&str, Place, Vec<&str>)> = module
+            .symbols
+            .iter()
+            .filter_map(|symbol| {
+                let member = symbol.member.as_ref()?;
+
+                Some((
+                    symbol.name.as_str(),
+                    member.place,
+                    member.assigns.iter().map(String::as_str).collect(),
+                ))
+            })
+            .collect();
+
+        assert_eq!(
+            members,
+            [
+                ("static Store.instance", Place::Own, vec![]),
+                ("Store.items", Place::Instance, vec![]),
+                ("Store.handler", Place::Instance, vec![]),
+                ("Store.constructor", Place::Instance, vec!["created"]),
+                ("Store.add", Place::Instance, vec![]),
+                ("Store.count", Place::Instance, vec![]),
+                ("static Store.create", Place::Own, vec![]),
+                ("Store.#secret", Place::Instance, vec![]),
+            ]
+        );
+        assert_eq!(
+            runs(source_text),
+            [
+                ran_holding(
+                    MODULE_INIT_NAME,
+                    &["./base#register()", "new Store()"],
+                    &[(&["./base#register #0"], &["Store"])]
+                ),
+                ran("new Store()", &["new ./base#Base()"]),
+            ]
+        );
+        assert_eq!(
+            uses(source_text)[1..],
+            [
+                used("Store", &["./base#Base", "./base#register()"]),
+                used("static Store.instance", &["Store"]),
+                used("Store.items", &[]),
+                used("Store.handler", &["./base#connect"]),
+                used("Store.constructor", &[]),
+                used("Store.add", &["this Store.count", "this Store.items"]),
+                used("Store.count", &["this Store.items", "super Store.size()"]),
+                used("static Store.create", &["Store.instance"]),
+                used("Store.#secret", &["this Store.handler"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn object_literals_split_into_properties_read_by_name() {
+        let source_text = r#"
+            import { send } from "./send";
+            export const handlers = {
+                "chat.send": (text: string) => send(text),
+                ping() { return this["chat.send"]("ping"); },
+                ...extra,
+            };
+            const extra = { quiet: true };
+            export const reply = () => handlers.ping();
+        "#;
+        let module = module_symbols(source_text);
+
+        assert_eq!(
+            uses(source_text)[1..],
+            [
+                used("handlers", &["extra"]),
+                used("handlers[\"chat.send\"]", &["./send#send"]),
+                used("handlers.ping", &["handlers.chat.send"]),
+                used("extra", &[]),
+                used("extra.quiet", &[]),
+                used("reply", &["handlers.ping"]),
+            ]
+        );
+        assert_eq!(module.symbols[1].shape, Some(Shape::Object { open: true }));
+    }
+
+    #[test]
+    fn callbacks_stay_out_of_what_runs_when_handed_on_only_to_be_kept() {
+        let source_text = r#"
+            export function define(...[method, handler]: [string, () => void]) {
+                return Object.assign((request: unknown) => handler(request), { method });
+            }
+            export function inject({ run, label }: { run: () => void; label: string }) {
+                const { name } = { name: label };
+                return Object.freeze({ run, name });
+            }
+            export class Lifecycle {
+                constructor(readonly options: { run: () => void }) {}
+            }
+        "#;
+
+        assert_eq!(
+            parameters_of(source_text),
+            [
+                parameters("define", &[(true, &[]), (true, &[])]),
+                parameters("inject", &[(true, &[])]),
+                parameters("Lifecycle", &[(true, &[])]),
+            ]
+        );
     }
 }
