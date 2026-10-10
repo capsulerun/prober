@@ -16,7 +16,9 @@ use prober_core::symbols::FallbackCause;
 use rayon::prelude::*;
 
 use crate::build_mapping::BuildMapping;
-use crate::conventions::{LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file};
+use crate::conventions::{
+    LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file, is_test_support_file,
+};
 use crate::dynamic::evaluator::{Evaluator, LoadScope};
 use crate::dynamic::spawn::Programs;
 use crate::dynamic::summarizer::{SummaryScope, summarize_program};
@@ -275,6 +277,10 @@ impl TypeScriptLinker {
             .collect();
 
         graph.add_language(LANGUAGE, |path| is_module_file(path) && !is_test_file(path));
+
+        if self.inference.test_support {
+            graph.add_test_support(LANGUAGE, is_test_support_file);
+        }
 
         for group in &groups {
             graph.add_root_scope(RootScope {

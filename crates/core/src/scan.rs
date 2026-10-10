@@ -51,6 +51,8 @@ pub struct UnresolvedSiteReach {
     pub expression: String,
     pub cause: UnresolvedCause,
     pub tests: usize,
+    pub modules: usize,
+    pub in_test_code: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -66,6 +68,7 @@ pub struct ScanReport {
     pub unresolved_sites: Vec<UnresolvedSiteReach>,
     pub missing_file_sites: Vec<MissingFileSite>,
     pub tests_reached_by_unresolved_sites: usize,
+    pub test_support: Vec<RepoPath>,
     pub unreachable_modules: Vec<RepoPath>,
     pub unreachable_other_files: Vec<RepoPath>,
     pub root_scopes: Vec<RootScope>,
@@ -84,11 +87,19 @@ pub struct ScanReport {
 impl ScanReport {
     pub fn new(graph: &Graph, repo_files: &[RepoPath], config_hash: String) -> Self {
         let (inferred_sites, links_by_kind) = inferred_sites(graph);
-        let (unresolved_sites, tests_reached_by_unresolved_sites) = unresolved_sites(graph);
+        let (unresolved_sites, tests_reached_by_unresolved_sites) =
+            unresolved_sites(graph, repo_files);
+        let mut test_support: Vec<RepoPath> = graph
+            .test_support_files()
+            .map(|file| graph.path(file).clone())
+            .collect();
         let missing_file_sites = missing_file_sites(graph);
         let (unreachable_modules, unreachable_other_files) = unreachable_files(graph, repo_files);
         let (hub_files, smoke_set) = hubs::hubs_and_smoke_set(graph, repo_files);
         let test_count = graph.test_files_by_path().len();
+
+        test_support.sort();
+
         let suggestions = suggestions::suggestions(
             &unresolved_sites,
             &inferred_sites,
@@ -102,6 +113,7 @@ impl ScanReport {
             unresolved_sites,
             missing_file_sites,
             tests_reached_by_unresolved_sites,
+            test_support,
             unreachable_modules,
             unreachable_other_files,
             root_scopes: graph.root_scopes().to_vec(),
@@ -194,8 +206,10 @@ impl ScanReport {
                     expression: &unresolved_site.expression,
                     cause: unresolved_site.cause.key(),
                     tests: unresolved_site.tests,
+                    modules: unresolved_site.modules,
                 })
                 .collect(),
+            test_support: self.test_support.iter().map(RepoPath::as_str).collect(),
             missing: self
                 .missing_file_sites
                 .iter()
@@ -326,6 +340,7 @@ impl ScanReport {
                 links_by_kind: &self.links_by_kind,
                 unresolved_sites: self.unresolved_sites.len(),
                 tests_reached_by_unresolved_sites: self.tests_reached_by_unresolved_sites,
+                test_support_modules: self.test_support.len(),
                 missing_file_sites: self.missing_file_sites.len(),
                 tests_total: self.test_count,
                 unreachable_files: self.unreachable_file_count(),
@@ -650,7 +665,7 @@ impl ScanReport {
     }
 
     fn write_unresolved_sites(&self, text: &mut String) {
-        let _ = writeln!(
+        let _ = write!(
             text,
             "Unresolved sites: {}, reaching {} of {} test files ({})",
             self.unresolved_sites.len(),
@@ -661,6 +676,20 @@ impl ScanReport {
                 self.test_count as f64
             )
         );
+
+        if !self.unresolved_sites.is_empty() && !self.test_support.is_empty() {
+            let _ = write!(
+                text,
+                "; changes to the {} test support modules (named as test code, run only by tests) trigger only the {} sites in test code",
+                self.test_support.len(),
+                self.unresolved_sites
+                    .iter()
+                    .filter(|unresolved_site| unresolved_site.in_test_code)
+                    .count()
+            );
+        }
+
+        text.push('\n');
 
         let rows: Vec<(usize, String)> = self
             .unresolved_sites
@@ -765,8 +794,9 @@ fn inferred_sites(graph: &Graph) -> (Vec<InferredSite>, BTreeMap<&'static str, u
     (inferred_sites, links_by_kind)
 }
 
-fn unresolved_sites(graph: &Graph) -> (Vec<UnresolvedSiteReach>, usize) {
+fn unresolved_sites(graph: &Graph, repo_files: &[RepoPath]) -> (Vec<UnresolvedSiteReach>, usize) {
     let mut tests_by_file: HashMap<FileId, usize> = HashMap::new();
+    let mut modules_by_scope: HashMap<(&str, bool), usize> = HashMap::new();
     let mut unresolved_sites: Vec<UnresolvedSiteReach> = graph
         .unresolved_sites()
         .iter()
@@ -775,6 +805,15 @@ fn unresolved_sites(graph: &Graph) -> (Vec<UnresolvedSiteReach>, usize) {
             let tests = *tests_by_file
                 .entry(unresolved_site.file)
                 .or_insert_with(|| tests_depending_on(graph, [unresolved_site.file]).len());
+            let in_test_code = graph.is_test_code(unresolved_site.file);
+            let modules = *modules_by_scope
+                .entry((unresolved_site.language, in_test_code))
+                .or_insert_with(|| {
+                    repo_files
+                        .iter()
+                        .filter(|path| graph.site_can_load(unresolved_site, path))
+                        .count()
+                });
 
             UnresolvedSiteReach {
                 site: format!(
@@ -785,6 +824,8 @@ fn unresolved_sites(graph: &Graph) -> (Vec<UnresolvedSiteReach>, usize) {
                 expression: unresolved_site.expression.clone(),
                 cause: unresolved_site.cause,
                 tests,
+                modules,
+                in_test_code,
             }
         })
         .collect();
@@ -1070,6 +1111,7 @@ struct JsonScan<'a> {
     schema_version: u32,
     inferred: Vec<JsonInferredSite<'a>>,
     unresolved: Vec<JsonUnresolvedSite<'a>>,
+    test_support: Vec<&'a str>,
     missing: Vec<JsonMissingFileSite<'a>>,
     unreachable: JsonUnreachableFiles<'a>,
     root_scopes: Vec<JsonRootScope<'a>>,
@@ -1207,6 +1249,7 @@ struct JsonUnresolvedSite<'a> {
     expression: &'a str,
     cause: &'static str,
     tests: usize,
+    modules: usize,
 }
 
 #[derive(Serialize)]
@@ -1228,6 +1271,7 @@ struct JsonScanStats<'a> {
     links_by_kind: &'a BTreeMap<&'static str, usize>,
     unresolved_sites: usize,
     tests_reached_by_unresolved_sites: usize,
+    test_support_modules: usize,
     missing_file_sites: usize,
     tests_total: usize,
     unreachable_files: usize,
@@ -1398,6 +1442,95 @@ Import cycles: 0 with 2 or more modules, 0 modules in them
 Suggestions: 0
 "
         );
+    }
+
+    #[test]
+    fn scan_tells_which_modules_trigger_the_unresolved_sites_of_product_and_test_code() {
+        let mut builder = GraphBuilder::default();
+        let edges = [
+            ("src/worker.test.ts", "src/worker.ts"),
+            ("src/worker.test.ts", "src/worker.test-support.ts"),
+            (
+                "src/worker.test-support.ts",
+                "src/fake-pool.test-support.ts",
+            ),
+        ];
+
+        builder.add_test_file(repo_path("src/worker.test.ts"), "typescript");
+        builder.add_language("typescript", |path| {
+            path.as_str().ends_with(".ts") && !path.as_str().ends_with(".test.ts")
+        });
+        builder.add_test_support("typescript", |path| {
+            path.as_str().contains(".test-support.")
+        });
+
+        for (dependent_path, dependency_path) in edges {
+            let dependent = builder.add_file(repo_path(dependent_path));
+            let dependency = builder.add_file(repo_path(dependency_path));
+
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind: EdgeKind::Import,
+            });
+        }
+
+        for (path, line) in [("src/worker.ts", 5), ("src/worker.test-support.ts", 9)] {
+            let file = builder.add_file(repo_path(path));
+
+            builder.add_unresolved_site(UnresolvedSite {
+                file,
+                line,
+                expression: "request.moduleUrl".to_owned(),
+                cause: UnresolvedCause::Parameter,
+                language: "typescript",
+            });
+        }
+
+        let graph = builder.build();
+        let repo_files: Vec<RepoPath> = [
+            "src/worker.ts",
+            "src/worker.test.ts",
+            "src/worker.test-support.ts",
+            "src/fake-pool.test-support.ts",
+            "src/pool.ts",
+            "README.md",
+        ]
+        .into_iter()
+        .map(repo_path)
+        .collect();
+        let scan_report = ScanReport::new(&graph, &repo_files, String::new());
+        let json_scan: serde_json::Value = serde_json::from_str(&scan_report.to_json()).unwrap();
+
+        assert_eq!(
+            scan_report.to_text().split("\n\n").nth(1),
+            Some(
+                "Unresolved sites: 2, reaching 1 of 1 test files (100.0%); changes to the 2 test support modules (named as test code, run only by tests) trigger only the 1 sites in test code
+  tests  site
+      1  src/worker.test-support.ts:9  request.moduleUrl: comes from a function parameter
+      1  src/worker.ts:5  request.moduleUrl: comes from a function parameter"
+            )
+        );
+        assert_eq!(
+            json_scan["unresolved"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|site| (
+                    site["site"].as_str().unwrap(),
+                    site["modules"].as_u64().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [("src/worker.test-support.ts:9", 4), ("src/worker.ts:5", 2)]
+        );
+        assert_eq!(
+            json_scan["test_support"],
+            serde_json::json!([
+                "src/fake-pool.test-support.ts",
+                "src/worker.test-support.ts"
+            ])
+        );
+        assert_eq!(json_scan["stats"]["test_support_modules"], 2);
     }
 
     #[test]
@@ -1604,6 +1737,7 @@ Suggestions: 0
                 "expression": "request.moduleUrl",
                 "cause": "parameter",
                 "tests": 1,
+                "modules": 7,
             })
         );
         assert_eq!(
@@ -1621,6 +1755,7 @@ Suggestions: 0
                 "links_by_kind": { "glob": 2 },
                 "unresolved_sites": 1,
                 "tests_reached_by_unresolved_sites": 1,
+                "test_support_modules": 0,
                 "missing_file_sites": 1,
                 "tests_total": 2,
                 "unreachable_files": 3,

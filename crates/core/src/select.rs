@@ -2,7 +2,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::changes::FileChange;
-use crate::files::FileId;
+use crate::files::{FileId, RepoPath};
 use crate::graph::{ContentChange, Edge, EdgeKind, Graph, UnresolvedSite};
 use crate::symbols::{SymbolEdge, SymbolId, SymbolKind, SymbolTarget};
 
@@ -14,6 +14,7 @@ pub enum Widening {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Relaxation {
+    TestSupport,
     Ignores,
     Mocks,
     Content,
@@ -166,6 +167,14 @@ impl<'g> Traversal<'g> {
             .dependents(file)
             .map(|edge| (edge, false))
             .chain(ignored)
+    }
+
+    fn site_can_load(self, site: &UnresolvedSite, path: &RepoPath) -> bool {
+        if self.is_relaxed(Relaxation::TestSupport) {
+            return self.graph.can_load(site.language, path);
+        }
+
+        self.graph.site_can_load(site, path)
     }
 
     fn widening_sites(self) -> impl Iterator<Item = (Link, &'g UnresolvedSite)> {
@@ -591,7 +600,7 @@ fn discover_dependents<'a>(
         let loadable_change = changes_by_path.iter().find(|change| {
             change
                 .touched_paths()
-                .any(|path| graph.can_load(unresolved_site.language, path))
+                .any(|path| traversal.site_can_load(unresolved_site, path))
         });
         let Some(&change) = loadable_change else {
             continue;
@@ -920,6 +929,9 @@ mod tests {
 
         builder.add_language("typescript", |path| {
             path.as_str().ends_with(".ts") && !path.as_str().ends_with(".test.ts")
+        });
+        builder.add_test_support("typescript", |path| {
+            path.as_str().contains(".test-support.")
         });
 
         for test_file in test_files {
@@ -1292,6 +1304,69 @@ mod tests {
         assert_eq!(
             widening_sites(&graph, &[renamed_to_markdown]),
             [("src/worker.test.ts".to_owned(), Some(0))]
+        );
+    }
+
+    #[test]
+    fn test_support_triggers_only_the_unresolved_sites_in_test_code() {
+        let graph = graph_with_unresolved_sites(
+            &[
+                "src/worker.test.ts",
+                "src/a.test.ts",
+                "src/load.test.ts",
+                "src/fresh.test.ts",
+            ],
+            &[
+                ("src/worker.test.ts", Import, "src/worker.ts"),
+                ("src/a.test.ts", Import, "src/a.test-support.ts"),
+                ("src/load.test.ts", Import, "src/load.test-support.ts"),
+            ],
+            &[
+                ("src/worker.ts", 313),
+                ("src/load.test-support.ts", 4),
+                ("src/fresh.test.ts", 12),
+            ],
+        );
+        let test_support_change = [modified("src/a.test-support.ts")];
+        let relaxed: Vec<(&str, Option<usize>)> = select_relaxed(
+            &graph,
+            &test_support_change,
+            Widening::Scoped,
+            Some(Relaxation::TestSupport),
+        )
+        .iter()
+        .map(|selected_test| {
+            (
+                graph.path(selected_test.file).as_str(),
+                selected_test.reason.widening_site(),
+            )
+        })
+        .collect();
+
+        assert_eq!(
+            widening_sites(&graph, &test_support_change),
+            [
+                ("src/a.test.ts".to_owned(), None),
+                ("src/fresh.test.ts".to_owned(), Some(0)),
+                ("src/load.test.ts".to_owned(), Some(1)),
+            ]
+        );
+        assert_eq!(
+            widening_sites(&graph, &[modified("src/b.ts")]),
+            [
+                ("src/fresh.test.ts".to_owned(), Some(0)),
+                ("src/load.test.ts".to_owned(), Some(1)),
+                ("src/worker.test.ts".to_owned(), Some(2)),
+            ]
+        );
+        assert_eq!(
+            relaxed,
+            [
+                ("src/a.test.ts", None),
+                ("src/fresh.test.ts", Some(0)),
+                ("src/load.test.ts", Some(1)),
+                ("src/worker.test.ts", Some(2)),
+            ]
         );
     }
 

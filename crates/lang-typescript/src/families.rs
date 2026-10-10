@@ -4,12 +4,10 @@ use std::collections::{BTreeSet, HashMap};
 
 use prober_core::files::RepoPath;
 
-use crate::conventions::is_asset_file;
+use crate::conventions::{FIXTURE_DIRECTORIES, is_asset_file};
 use crate::workspaces::parent_directory;
 
 const TEST_DIRECTORIES: [&str; 3] = ["__tests__", "test", "tests"];
-
-const FIXTURE_DIRECTORIES: [&str; 2] = ["fixtures", "__fixtures__"];
 
 const TEST_MARKERS: [&str; 2] = ["test", "spec"];
 

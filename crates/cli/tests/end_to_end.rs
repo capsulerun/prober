@@ -959,6 +959,65 @@ fn why_explains_a_selected_test_and_the_rule_leaving_another_out() {
 }
 
 #[test]
+fn test_support_change_selects_its_tests_without_widening_product_loaders() {
+    let repository = TestRepository::with_files_on_main(&[
+        (
+            "src/loader.ts",
+            "export const plugin = await import(process.env.PLUGIN_ENTRY!);\n",
+        ),
+        (
+            "src/loader.test.ts",
+            r#"import { plugin } from "./loader";"#,
+        ),
+        ("src/c.test-support.ts", "export const expected = 1;\n"),
+        (
+            "src/c.test.ts",
+            "import { expected } from \"./c.test-support\";\n\ntest(\"c\", () => expect(expected).toBe(1));\n",
+        ),
+        ("extensions/telegram/index.ts", "export const id = 1;\n"),
+        (
+            "extensions/telegram/index.test.ts",
+            "import { id } from \"./index\";\n\ntest(\"id\", () => expect(id).toBe(1));\n",
+        ),
+    ]);
+
+    repository.change_and_commit("src/c.test-support.ts", "export const expected = 2;\n");
+
+    let test_support_change = repository.prober(&["--base", "main"]);
+    let why_not_widened = repository.prober(&["why", "src/loader.test.ts", "--base", "main"]);
+    let scan = repository.prober(&["scan"]);
+
+    repository.change_and_commit("extensions/telegram/index.ts", "export const id = 2;\n");
+
+    let plugin_change = repository.prober(&["--base", "main"]);
+
+    assert_eq!(test_support_change.stdout, "src/c.test.ts\n");
+    assert_eq!(
+        test_support_change.stderr,
+        "prober: selected 1/5 test files (20.0%)\n"
+    );
+    assert_eq!(
+        why_not_widened.stdout,
+        "src/loader.test.ts is not selected: it is reached only through unresolved sites of product code, and changes to test support (src/c.test-support.ts) trigger only sites in test code:\n  src/c.test-support.ts (modified)\n  -> widened: unresolved dynamic import at src/loader.ts:1 (process.env.PLUGIN_ENTRY!)\n  -> loaded by src/loader.test.ts\n"
+    );
+    assert!(
+        scan.stdout.contains(
+            "Unresolved sites: 1, reaching 1 of 5 test files (20.0%); changes to the 1 test support modules (named as test code, run only by tests) trigger only the 0 sites in test code\n"
+        ),
+        "{}",
+        scan.stdout
+    );
+    assert_eq!(
+        plugin_change.stdout,
+        "extensions/telegram/index.test.ts\nsrc/c.test.ts\nsrc/loader.test.ts\n"
+    );
+    assert_eq!(
+        plugin_change.stderr,
+        "prober: selected 3/5 test files (60.0%), 1 added by widening\n"
+    );
+}
+
+#[test]
 fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
     let mut files = vec![
         (
@@ -966,8 +1025,16 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
             "export const plugin = await import(process.env.PLUGIN_ENTRY!);\n".to_owned(),
         ),
         (
+            "src/channels.ts".to_owned(),
+            "const id = process.env.CHANNEL;\nexport const channel = await import(`../extensions/${id}/index.js`);\n".to_owned(),
+        ),
+        (
             "extensions/telegram/index.ts".to_owned(),
             "export const id = 1;".to_owned(),
+        ),
+        (
+            "extensions/telegram/package.json".to_owned(),
+            r#"{ "name": "@app/telegram" }"#.to_owned(),
         ),
     ];
 
@@ -991,7 +1058,7 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
 
     repository.write(
         "prober.toml",
-        "[[link]]\nfrom = \"extensions/*/index.ts\"\nto = \"src/loader.ts\"\n\n[[ignore]]\nsite = \"src/loader.ts\"\n",
+        "[[link]]\nfrom = \"extensions/*/**\"\nto = \"src/loader.ts\"\n\n[[ignore]]\nsite = \"src/loader.ts\"\n",
     );
 
     let linked = repository.prober(&["--base", "main"]);
@@ -999,7 +1066,7 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
 
     assert!(
         scan.stdout.contains(
-            "Suggestions: 1\n  # src/loader.ts:1 widens to 10 test files: process.env.PLUGIN_ENTRY! is computed at runtime; declare what src/loader.ts loads, then set its unresolved sites aside\n  [[link]]\n  from = \"path/to/what/it/loads/**\"\n  to = \"src/loader.ts\"\n\n  [[ignore]]\n  site = \"src/loader.ts\"\n"
+            "Suggestions: 1\n  # src/loader.ts:1 widens to 10 test files: process.env.PLUGIN_ENTRY! is computed at runtime; declare what src/loader.ts loads (the repository's plugin folders extensions/{id}/, if it loads plugins), then set its unresolved sites aside\n  [[link]]\n  from = \"extensions/*/**\"\n  to = \"src/loader.ts\"\n\n  [[ignore]]\n  site = \"src/loader.ts\"\n"
         ),
         "{}",
         scan.stdout
@@ -1015,8 +1082,8 @@ fn scan_suggests_declaring_what_a_loader_loads_and_setting_its_site_aside() {
         json!([
             {
                 "line": 1,
-                "rule": "[[link]] from \"extensions/*/index.ts\" to \"src/loader.ts\"",
-                "links": 1,
+                "rule": "[[link]] from \"extensions/*/**\" to \"src/loader.ts\"",
+                "links": 2,
                 "sites": 0,
                 "unlinked": [],
             },
@@ -1202,6 +1269,7 @@ fn scan_reports_inferred_links_unresolved_sites_and_unreachable_files() {
             "expression": "request.moduleUrl",
             "cause": "parameter",
             "tests": 1,
+            "modules": 6,
         }])
     );
     assert_eq!(

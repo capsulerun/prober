@@ -235,6 +235,7 @@ pub struct GraphBuilder {
     changed_contracts: HashSet<FileId>,
     asset_blind_tests: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
+    test_support_names: HashMap<&'static str, ModuleFilter>,
     ignored_edges: Vec<IgnoredEdge>,
     set_aside_sites: Vec<SetAsideSite>,
     root_scopes: Vec<RootScope>,
@@ -309,6 +310,10 @@ impl GraphBuilder {
 
     pub fn add_language(&mut self, language: &'static str, loads: ModuleFilter) {
         self.module_filters.insert(language, loads);
+    }
+
+    pub fn add_test_support(&mut self, language: &'static str, names_test_support: ModuleFilter) {
+        self.test_support_names.insert(language, names_test_support);
     }
 
     pub fn add_root_scope(&mut self, root_scope: RootScope) {
@@ -514,7 +519,7 @@ impl GraphBuilder {
             }
         }
 
-        Graph {
+        let mut graph = Graph {
             files: self.files,
             test_languages: self.test_languages,
             dependents_by_file,
@@ -535,7 +540,12 @@ impl GraphBuilder {
             rule_ignores: self.rule_ignores,
             symbols: self.symbols.build(),
             commands: self.commands,
-        }
+            test_support: HashSet::new(),
+        };
+
+        graph.test_support = test_support(&graph, &self.test_support_names);
+
+        graph
     }
 }
 
@@ -561,6 +571,7 @@ pub struct Graph {
     rule_ignores: Vec<RuleIgnore>,
     symbols: SymbolTable,
     commands: HashMap<FileId, Vec<String>>,
+    test_support: HashSet<FileId>,
 }
 
 impl Graph {
@@ -688,6 +699,26 @@ impl Graph {
 
     pub fn is_module(&self, path: &RepoPath) -> bool {
         self.module_filters.values().any(|loads| loads(path))
+    }
+
+    pub fn is_test_support(&self, file: FileId) -> bool {
+        self.test_support.contains(&file)
+    }
+
+    pub fn test_support_files(&self) -> impl Iterator<Item = FileId> + '_ {
+        self.test_support.iter().copied()
+    }
+
+    pub fn is_test_code(&self, file: FileId) -> bool {
+        self.is_test(file) || self.is_test_support(file)
+    }
+
+    pub fn site_can_load(&self, site: &UnresolvedSite, path: &RepoPath) -> bool {
+        let is_test_support = self
+            .file_id(path)
+            .is_some_and(|file| self.is_test_support(file));
+
+        self.can_load(site.language, path) && (self.is_test_code(site.file) || !is_test_support)
     }
 
     pub fn unresolved_sites(&self) -> &[UnresolvedSite] {
@@ -857,6 +888,50 @@ impl Graph {
             .iter()
             .map(|(&file, commands)| (file, commands.as_slice()))
     }
+}
+
+fn test_support(
+    graph: &Graph,
+    test_support_names: &HashMap<&'static str, ModuleFilter>,
+) -> HashSet<FileId> {
+    let runs = |edge: &Edge| !matches!(edge.kind, EdgeKind::TypeOnly | EdgeKind::Contains);
+    let mut test_support: HashSet<FileId> = graph
+        .files
+        .iter()
+        .filter(|&(file, path)| {
+            !graph.is_test(file)
+                && test_support_names
+                    .values()
+                    .any(|names_test_support| names_test_support(path))
+        })
+        .map(|(file, _)| file)
+        .collect();
+    let mut dropped: Vec<FileId> = test_support
+        .iter()
+        .copied()
+        .filter(|&file| {
+            graph.dependents(file).any(|edge| {
+                runs(&edge)
+                    && !graph.is_test(edge.dependent)
+                    && !test_support.contains(&edge.dependent)
+            })
+        })
+        .collect();
+
+    while let Some(file) = dropped.pop() {
+        if !test_support.remove(&file) {
+            continue;
+        }
+
+        dropped.extend(
+            graph
+                .dependencies(file)
+                .filter(|edge| runs(edge) && test_support.contains(&edge.dependency))
+                .map(|edge| edge.dependency),
+        );
+    }
+
+    test_support
 }
 
 fn rule_links_at<'g>(
@@ -1167,6 +1242,75 @@ mod tests {
         assert!(graph.can_load("python", &repo_path("docs/a.md")));
         assert!(graph.is_module(&repo_path("src/a.ts")));
         assert!(!graph.is_module(&repo_path("docs/a.md")));
+    }
+
+    #[test]
+    fn test_support_is_named_as_test_code_and_run_only_by_tests_and_test_support() {
+        let mut builder = GraphBuilder::default();
+        let edges = [
+            ("src/a.test.ts", EdgeKind::Import, "src/a.test-support.ts"),
+            ("src/c.ts", EdgeKind::TypeOnly, "src/a.test-support.ts"),
+            ("src/a.test-support.ts", EdgeKind::Import, "test/env.ts"),
+            ("test/env.ts", EdgeKind::Import, "test/clock.ts"),
+            ("test/clock.ts", EdgeKind::Import, "test/env.ts"),
+            ("src/a.test-support.ts", EdgeKind::Import, "src/a.ts"),
+            ("src/b.test.ts", EdgeKind::Import, "src/b.test-support.ts"),
+            ("src/b.ts", EdgeKind::Import, "src/b.test-support.ts"),
+            ("src/b.test-support.ts", EdgeKind::Import, "test/server.ts"),
+            ("src/d.test.ts", EdgeKind::Import, "test/plugin.ts"),
+            ("config/plugins.json", EdgeKind::Lists, "test/plugin.ts"),
+            ("src/d.test.ts", EdgeKind::Import, "extensions/x/index.ts"),
+            (
+                "src/d.test.ts",
+                EdgeKind::Import,
+                "extensions/x/x.test-support.ts",
+            ),
+            ("extensions/x", EdgeKind::Contains, "extensions/x/index.ts"),
+            (
+                "extensions/x",
+                EdgeKind::Contains,
+                "extensions/x/x.test-support.ts",
+            ),
+        ];
+
+        for test in ["src/a.test.ts", "src/b.test.ts", "src/d.test.ts"] {
+            builder.add_test_file(repo_path(test), "typescript");
+        }
+
+        for (dependent, kind, dependency) in edges {
+            let dependent = builder.add_file(repo_path(dependent));
+            let dependency = builder.add_file(repo_path(dependency));
+
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind,
+            });
+        }
+
+        builder.add_file(repo_path("test/setup.ts"));
+        builder.add_test_support("typescript", |path| {
+            path.as_str().starts_with("test/") || path.as_str().contains(".test-support.")
+        });
+
+        let graph = builder.build();
+        let mut test_support: Vec<&str> = graph
+            .test_support_files()
+            .map(|file| graph.path(file).as_str())
+            .collect();
+
+        test_support.sort_unstable();
+
+        assert_eq!(
+            test_support,
+            [
+                "extensions/x/x.test-support.ts",
+                "src/a.test-support.ts",
+                "test/clock.ts",
+                "test/env.ts",
+                "test/setup.ts"
+            ]
+        );
     }
 
     #[test]
