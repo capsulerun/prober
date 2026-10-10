@@ -617,6 +617,115 @@ fn loads_that_cannot_be_known_are_unresolved_with_their_cause() {
 }
 
 #[test]
+fn test_support_triggers_only_the_unresolved_sites_of_test_code() {
+    let project = TestProject::new(&[
+        (
+            "src/loader.ts",
+            "export const plugin = await import(process.env.PLUGIN_ENTRY!);\n",
+        ),
+        (
+            "src/loader.test.ts",
+            "import { plugin } from \"./loader\";\n",
+        ),
+        ("src/a.ts", "export const a = 1;\n"),
+        (
+            "src/a.test-support.ts",
+            "import { env } from \"../test/helpers/env\";\n\nexport const expected = env;\n",
+        ),
+        ("test/helpers/env.ts", "export const env = 1;\n"),
+        (
+            "src/a.test.ts",
+            "import { a } from \"./a\";\nimport { expected } from \"./a.test-support\";\n",
+        ),
+        ("src/shared.test-support.ts", "export const shared = 1;\n"),
+        (
+            "src/b.ts",
+            "import { shared } from \"./shared.test-support\";\n\nexport const b = shared;\n",
+        ),
+        (
+            "test/fixtures/plugin/index.ts",
+            "export const plugin = 1;\n",
+        ),
+        (
+            "src/fixture.test.ts",
+            "import { plugin } from \"../test/fixtures/plugin/index\";\n",
+        ),
+        ("extensions/telegram/index.ts", "export const id = 1;\n"),
+        (
+            "extensions/telegram/index.test.ts",
+            "import { id } from \"./index\";\n",
+        ),
+        (
+            "test/helpers/load-fixture.ts",
+            "export const fixture = await import(process.env.FIXTURE!);\n",
+        ),
+        (
+            "src/fixture-loader.test.ts",
+            "import { fixture } from \"../test/helpers/load-fixture\";\n",
+        ),
+    ]);
+    let graph = project.link();
+    let mut test_support: Vec<&str> = graph
+        .test_support_files()
+        .map(|file| graph.path(file).as_str())
+        .collect();
+    let selected = |path: &str| selected_tests(&graph, &[change(path, ChangeKind::Modified)]);
+
+    test_support.sort_unstable();
+
+    assert_eq!(
+        test_support,
+        [
+            "src/a.test-support.ts",
+            "test/helpers/env.ts",
+            "test/helpers/load-fixture.ts"
+        ]
+    );
+    assert_eq!(
+        selected("test/helpers/env.ts"),
+        ["src/a.test.ts", "src/fixture-loader.test.ts"]
+    );
+    assert_eq!(
+        selected("src/shared.test-support.ts"),
+        ["src/fixture-loader.test.ts", "src/loader.test.ts"]
+    );
+    assert_eq!(
+        selected("test/fixtures/plugin/index.ts"),
+        [
+            "src/fixture.test.ts",
+            "src/fixture-loader.test.ts",
+            "src/loader.test.ts"
+        ]
+    );
+    assert_eq!(
+        selected("extensions/telegram/index.ts"),
+        [
+            "extensions/telegram/index.test.ts",
+            "src/fixture-loader.test.ts",
+            "src/loader.test.ts"
+        ]
+    );
+
+    let without_test_support = project.link_with(InferenceSettings {
+        test_support: false,
+        ..InferenceSettings::default()
+    });
+
+    assert_eq!(without_test_support.test_support_files().count(), 0);
+    assert_eq!(
+        selected_tests(
+            &without_test_support,
+            &[change("test/helpers/env.ts", ChangeKind::Modified)]
+        ),
+        [
+            "src/a.test.ts",
+            "src/fixture-loader.test.ts",
+            "src/loader.test.ts"
+        ]
+    );
+}
+
+#[test]
 fn load_of_a_missing_file_links_the_paths_it_names_without_widening() {
     let project = TestProject::new(&[
         (

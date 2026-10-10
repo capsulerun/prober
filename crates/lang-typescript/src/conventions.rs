@@ -72,6 +72,12 @@ const ASSET_EXTENSIONS: &[&str] = &[
 
 const TEST_FILE_MARKERS: [&str; 2] = ["test", "spec"];
 
+const TEST_SUPPORT_WORDS: [&str; 5] = ["spec", "specs", "test", "testing", "tests"];
+
+const TEST_SUPPORT_DIRECTORIES: [&str; 2] = ["__mocks__", "__tests__"];
+
+pub(crate) const FIXTURE_DIRECTORIES: [&str; 2] = ["fixtures", "__fixtures__"];
+
 const PLUGIN_MANIFEST_NAMES: [&str; 3] = ["package.json", "plugin.json", "manifest.json"];
 
 const PLUGIN_MANIFEST_SUFFIX: &str = ".plugin.json";
@@ -114,6 +120,44 @@ pub fn is_test_file(path: &RepoPath) -> bool {
 
 pub fn is_module_file(path: &RepoPath) -> bool {
     is_source_file(path) || file_name(path).ends_with(".json")
+}
+
+pub fn is_test_support_file(path: &RepoPath) -> bool {
+    let (directory, file_name) = path
+        .as_str()
+        .rsplit_once('/')
+        .unwrap_or(("", path.as_str()));
+    let directories: Vec<&str> = directory.split('/').collect();
+    let name_parts: Vec<&str> = file_name.split('.').collect();
+    let (stem, inner_parts) = match name_parts.as_slice() {
+        [stem, inner_parts @ .., _] => (*stem, inner_parts),
+        _ => (file_name, &[][..]),
+    };
+    let names_test_code = directories.iter().any(|directory| {
+        TEST_SUPPORT_DIRECTORIES.contains(directory) || after_test_word(directory).is_some()
+    }) || inner_parts
+        .iter()
+        .any(|part| after_test_word(part).is_some())
+        || after_test_word(stem).is_some_and(|rest| !rest.is_empty());
+    let in_fixtures = directories
+        .iter()
+        .any(|directory| FIXTURE_DIRECTORIES.contains(directory));
+
+    is_module_file(path) && !is_test_file(path) && names_test_code && !in_fixtures
+}
+
+fn after_test_word(name: &str) -> Option<&str> {
+    let word_end = name
+        .char_indices()
+        .skip(1)
+        .find(|(_, character)| !character.is_ascii_lowercase())
+        .map_or(name.len(), |(index, _)| index);
+    let (word, rest) = name.split_at(word_end);
+
+    TEST_SUPPORT_WORDS
+        .iter()
+        .any(|test_word| word.eq_ignore_ascii_case(test_word))
+        .then_some(rest)
 }
 
 pub fn is_runner_config(path: &RepoPath) -> bool {
@@ -204,6 +248,52 @@ mod tests {
 
         for other_file in other_files {
             assert!(!is_test_file(&repo_path(other_file)), "{other_file}");
+        }
+    }
+
+    #[test]
+    fn test_support_is_named_as_test_code_outside_fixtures() {
+        let test_support = [
+            "src/cli/update.test-support.ts",
+            "src/a.test-helpers.ts",
+            "src/a.testing.mjs",
+            "src/test-utils.ts",
+            "src/testUtils.tsx",
+            "src/test-utils/render.tsx",
+            "src/testing/index.ts",
+            "src/__tests__/helpers.ts",
+            "src/__mocks__/db.ts",
+            "test/helpers/env.ts",
+            "packages/core/tests/setup.js",
+            "spec/support/server.js",
+            "test/data/users.json",
+        ];
+        let other_files = [
+            "src/test.ts",
+            "src/commands/testing.ts",
+            "src/latest.ts",
+            "src/contest/a.ts",
+            "testdata/a.ts",
+            "src/a.test.ts",
+            "src/a.test-support.d.ts",
+            "test/fixtures/plugin/index.ts",
+            "src/__fixtures__/a.ts",
+            "docs/test-plan.md",
+            "extensions/telegram/index.ts",
+        ];
+
+        for test_support_file in test_support {
+            assert!(
+                is_test_support_file(&repo_path(test_support_file)),
+                "{test_support_file}"
+            );
+        }
+
+        for other_file in other_files {
+            assert!(
+                !is_test_support_file(&repo_path(other_file)),
+                "{other_file}"
+            );
         }
     }
 

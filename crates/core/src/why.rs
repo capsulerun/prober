@@ -11,6 +11,7 @@ use crate::select::{Hop, Link, Reason, Relaxation, SelectedTest, Widening, selec
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Blocker {
     WideningOff,
+    TestSupport { modules: Vec<RepoPath> },
     Ignored { lines: Vec<usize> },
     Mocked { modules: Vec<RepoPath> },
     Content,
@@ -87,6 +88,14 @@ impl Blocker {
             Blocker::WideningOff => {
                 "it is reached only through an unresolved site, and widening is off ([inference] widening = false)".to_owned()
             }
+            Blocker::TestSupport { modules } => {
+                let modules: Vec<&str> = modules.iter().map(RepoPath::as_str).collect();
+
+                format!(
+                    "it is reached only through unresolved sites of product code, and changes to test support ({}) trigger only sites in test code",
+                    modules.join(", ")
+                )
+            }
             Blocker::Ignored { lines } => {
                 let lines: Vec<String> = lines
                     .iter()
@@ -158,6 +167,7 @@ pub fn explain(
     }
 
     let relaxations = [
+        Relaxation::TestSupport,
         Relaxation::Ignores,
         Relaxation::Mocks,
         Relaxation::Content,
@@ -172,6 +182,9 @@ pub fn explain(
             continue;
         };
         let blocker = match relaxation {
+            Relaxation::TestSupport => Blocker::TestSupport {
+                modules: test_support_changes(graph, &selected_test.reason),
+            },
             Relaxation::Ignores => Blocker::Ignored {
                 lines: ignoring_lines(graph, &selected_test.reason),
             },
@@ -209,6 +222,19 @@ fn blocked(graph: &Graph, blocker: Blocker, reason: &Reason) -> Explanation {
         blocker,
         reason: describe_reason(graph, reason),
     }
+}
+
+fn test_support_changes(graph: &Graph, reason: &Reason) -> Vec<RepoPath> {
+    reason
+        .change
+        .touched_paths()
+        .filter(|path| {
+            graph
+                .file_id(path)
+                .is_some_and(|file| graph.is_test_support(file))
+        })
+        .cloned()
+        .collect()
 }
 
 fn ignoring_lines(graph: &Graph, reason: &Reason) -> Vec<usize> {
@@ -298,6 +324,7 @@ mod tests {
         let mut builder = GraphBuilder::default();
         let edges = [
             ("test/a.test.ts", EdgeKind::Import, "src/a.ts"),
+            ("test/a.test.ts", EdgeKind::Import, "src/a.test-support.ts"),
             ("test/types.test.ts", EdgeKind::TypeOnly, "src/a.ts"),
             ("test/prompts.test.ts", EdgeKind::Reads, "src/sample.ts"),
             ("src/sample.ts", EdgeKind::Import, "src/a.ts"),
@@ -308,6 +335,9 @@ mod tests {
         ];
 
         builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+        builder.add_test_support("typescript", |path| {
+            path.as_str().contains(".test-support.")
+        });
 
         for test in [
             "test/a.test.ts",
@@ -414,6 +444,11 @@ mod tests {
                 "test/button.test.ts",
                 "src/button.css",
                 "test/button.test.ts is not selected: the changed assets reach it, but it runs in a project that renders no assets:\n  src/button.css (modified)\n  -> imported as an asset by src/button.ts\n  -> imported by test/button.test.ts\n",
+            ),
+            (
+                "test/loader.test.ts",
+                "src/a.test-support.ts",
+                "test/loader.test.ts is not selected: it is reached only through unresolved sites of product code, and changes to test support (src/a.test-support.ts) trigger only sites in test code:\n  src/a.test-support.ts (modified)\n  -> widened: unresolved dynamic import at src/loader.ts:7 (import(name))\n  -> imported by test/loader.test.ts\n",
             ),
             (
                 "test/other.test.ts",
