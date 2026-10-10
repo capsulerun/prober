@@ -7,7 +7,7 @@ use crate::cycles::strongly_connected_components;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{ContentChange, Edge, EdgeKind, Graph};
 use crate::scan::tests_depending_on;
-use crate::symbols::{FallbackCause, SymbolId, SymbolTarget, WholeModuleCause};
+use crate::symbols::{FallbackCause, SymbolId, SymbolKind, SymbolTarget, WholeModuleCause};
 
 const MEASURED_SYMBOL_CYCLES: usize = 5;
 
@@ -36,6 +36,8 @@ pub struct ImportCycle {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SymbolSummary {
     pub symbols: usize,
+    pub members: usize,
+    pub calls: usize,
     pub modules: usize,
     pub file_level: Vec<(RepoPath, FallbackCause)>,
     pub whole_module_uses: BTreeMap<WholeModuleCause, usize>,
@@ -60,6 +62,8 @@ pub(crate) fn symbol_summary(graph: &Graph) -> SymbolSummary {
 
     SymbolSummary {
         symbols: graph.symbol_count(),
+        members: graph.symbol_kind_count(SymbolKind::Member),
+        calls: graph.symbol_kind_count(SymbolKind::Call),
         modules: graph.analysed_module_count(),
         file_level: file_level_modules(graph, |_| true),
         whole_module_uses,

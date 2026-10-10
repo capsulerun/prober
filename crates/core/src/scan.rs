@@ -235,6 +235,8 @@ impl ScanReport {
             },
             symbols: JsonSymbols {
                 symbols: self.symbol_summary.symbols,
+                members: self.symbol_summary.members,
+                calls: self.symbol_summary.calls,
                 modules: self.symbol_summary.modules,
                 file_level: json_file_level(&self.symbol_summary.file_level),
                 whole_module_uses: self
@@ -405,9 +407,11 @@ impl ScanReport {
         let summary = &self.symbol_summary;
         let _ = writeln!(
             text,
-            "Symbols: {} in {} modules; {} modules at file level{}; {} uses keep a whole module{}",
+            "Symbols: {} in {} modules, with {} members and {} call parts; {} modules at file level{}; {} uses keep a whole module{}",
             summary.symbols,
             summary.modules,
+            summary.members,
+            summary.calls,
             summary.file_level.len(),
             counted_causes(
                 summary
@@ -1031,6 +1035,8 @@ struct JsonSmokeSet<'a> {
 #[derive(Serialize)]
 struct JsonSymbols<'a> {
     symbols: usize,
+    members: usize,
+    calls: usize,
     modules: usize,
     file_level: Vec<JsonFileLevelModule<'a>>,
     whole_module_uses: BTreeMap<&'static str, usize>,
@@ -1291,7 +1297,7 @@ Suggested smoke set: 2 test files within two links of 4 of these 4 files; run th
   [always_run]
   tests = [\"src/loader.test.ts\", \"src/worker.test.ts\"]
 
-Symbols: 0 in 0 modules; 0 modules at file level; 0 uses keep a whole module
+Symbols: 0 in 0 modules, with 0 members and 0 call parts; 0 modules at file level; 0 uses keep a whole module
 
 Import cycles: 0 with 2 or more modules, 0 modules in them
 
@@ -1381,6 +1387,8 @@ Suggestions: 0
         let format = add_symbol(b, "format", SymbolKind::Function);
         let via_a = add_symbol(b, "viaA", SymbolKind::Function);
         let from_legacy = add_symbol(b, "fromLegacy", SymbolKind::Variable);
+        let run_call = add_symbol(a, "run()", SymbolKind::Call);
+        let save = add_symbol(b, "Store.save", SymbolKind::Member);
         let not_analysed = SymbolTarget::Module {
             file: legacy,
             cause: WholeModuleCause::NotAnalysed,
@@ -1392,6 +1400,8 @@ Suggestions: 0
             (run, SymbolTarget::Symbol(format)),
             (via_a, SymbolTarget::Symbol(run)),
             (from_legacy, not_analysed),
+            (a_init, SymbolTarget::Symbol(run_call)),
+            (save, SymbolTarget::Symbol(format)),
         ];
 
         for (dependent, dependency) in uses {
@@ -1429,11 +1439,11 @@ Suggestions: 0
         assert_eq!(
             sections,
             [
-                "Symbols: 6 in 2 modules; 1 modules at file level (CommonJS exports 1); 2 uses keep a whole module (module analysed at file level 2)",
+                "Symbols: 8 in 2 modules, with 1 members and 1 call parts; 1 modules at file level (CommonJS exports 1); 2 uses keep a whole module (module analysed at file level 2)",
                 "Import cycles: 1 with 2 or more modules, 3 modules in them
   modules  tests  directories
         3      1  src 3
-                  symbol level: 6 symbols, 2 symbols in 3 modules still form a cycle pulling in 1 tests, 4 symbols lead into it (66.7%); 1 modules at file level (CommonJS exports 1)",
+                  symbol level: 8 symbols, 2 symbols in 3 modules still form a cycle pulling in 1 tests, 5 symbols lead into it (62.5%); 1 modules at file level (CommonJS exports 1)",
             ]
         );
     }
@@ -1449,8 +1459,8 @@ Suggestions: 0
                 "modules": ["src/a.ts", "src/b.ts", "src/c.cjs"],
                 "tests": 1,
                 "symbols": {
-                    "symbols": 6,
-                    "cycles": [{ "symbols": 2, "modules": 3, "tests": 1, "leading_in": 4 }],
+                    "symbols": 8,
+                    "cycles": [{ "symbols": 2, "modules": 3, "tests": 1, "leading_in": 5 }],
                     "file_level": [{ "file": "src/c.cjs", "cause": "commonjs" }],
                 },
             }])
@@ -1458,7 +1468,9 @@ Suggestions: 0
         assert_eq!(
             json_scan["symbols"],
             serde_json::json!({
-                "symbols": 6,
+                "symbols": 8,
+                "members": 1,
+                "calls": 1,
                 "modules": 2,
                 "file_level": [{ "file": "src/c.cjs", "cause": "commonjs" }],
                 "whole_module_uses": { "not_analysed": 2 },

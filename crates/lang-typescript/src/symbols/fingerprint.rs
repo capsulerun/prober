@@ -1,4 +1,4 @@
-//! Hashes of source spans built from their tokens: comments, whitespace and the names a symbol is declared under do not count, and a line break counts only where it can end a statement.
+//! Hashes of source spans built from their tokens: comments, whitespace, the names a symbol is declared under and the code of its holes do not count, and a line break counts only where it can end a statement.
 
 use oxc_parser::{Kind, Token};
 use oxc_span::Span;
@@ -25,7 +25,8 @@ impl<'s> Fingerprint<'s> {
         }
     }
 
-    pub(crate) fn hash(&self, spans: &[Span], names: &[Span]) -> u64 {
+    pub(crate) fn hash(&self, spans: &[Span], holes: &[Span], names: &[Span]) -> u64 {
+        let holes = merged(holes);
         let mut hasher = Xxh3::new();
 
         for (index, span) in spans.iter().enumerate() {
@@ -42,6 +43,13 @@ impl<'s> Fingerprint<'s> {
                 .iter()
                 .take_while(|token| token.end() <= span.end)
             {
+                if holes
+                    .iter()
+                    .any(|hole| hole.start <= token.start() && token.end() <= hole.end)
+                {
+                    continue;
+                }
+
                 if token.is_on_new_line()
                     && previous.is_some_and(|previous| line_break_counts(previous, token.kind()))
                 {
@@ -61,6 +69,49 @@ impl<'s> Fingerprint<'s> {
 
         hasher.digest()
     }
+}
+
+pub(crate) fn pieces(spans: &[Span], holes: &[Span]) -> Vec<Span> {
+    let holes = merged(holes);
+    let mut pieces = Vec::new();
+
+    for span in spans {
+        let mut start = span.start;
+
+        for hole in holes
+            .iter()
+            .filter(|hole| span.start <= hole.start && hole.end <= span.end)
+        {
+            if start < hole.start {
+                pieces.push(Span::new(start, hole.start));
+            }
+
+            start = start.max(hole.end);
+        }
+
+        if start < span.end {
+            pieces.push(Span::new(start, span.end));
+        }
+    }
+
+    pieces
+}
+
+fn merged(holes: &[Span]) -> Vec<Span> {
+    let mut sorted = holes.to_vec();
+
+    sorted.sort_by_key(|hole| (hole.start, std::cmp::Reverse(hole.end)));
+
+    let mut merged: Vec<Span> = Vec::new();
+
+    for hole in sorted {
+        match merged.last_mut() {
+            Some(last) if hole.start <= last.end => last.end = last.end.max(hole.end),
+            _ => merged.push(hole),
+        }
+    }
+
+    merged
 }
 
 fn line_break_counts(previous: Kind, next: Kind) -> bool {
@@ -108,7 +159,7 @@ mod tests {
 
         assert!(!parsed.diagnostics.has_errors(), "{source_text}");
 
-        Fingerprint::new(source_text, &parsed.tokens).hash(&[parsed.program.span], &names)
+        Fingerprint::new(source_text, &parsed.tokens).hash(&[parsed.program.span], &[], &names)
     }
 
     fn program_hash(source_text: &str) -> u64 {
@@ -193,6 +244,33 @@ mod tests {
                 "function createChannel(id) { return id + 1; }",
                 Some("createChannel")
             )
+        );
+    }
+
+    #[test]
+    fn code_in_holes_does_not_count_and_the_pieces_around_them_keep_their_lines() {
+        let hash_around = |source_text: &str, hole: &str| {
+            let allocator = Allocator::default();
+            let parsed = Parser::new(&allocator, source_text, SourceType::tsx())
+                .with_config(TokensParserConfig)
+                .parse();
+            let start = source_text.find(hole).unwrap() as u32;
+            let hole = Span::new(start, start + hole.len() as u32);
+
+            Fingerprint::new(source_text, &parsed.tokens).hash(&[parsed.program.span], &[hole], &[])
+        };
+
+        assert_eq!(
+            hash_around("const a = wrap(() => load(1));", "() => load(1)"),
+            hash_around("const a = wrap(() => load(2));", "() => load(2)")
+        );
+        assert_ne!(
+            hash_around("const a = wrap(() => load(1));", "() => load(1)"),
+            hash_around("const a = keep(() => load(1));", "() => load(1)")
+        );
+        assert_eq!(
+            pieces(&[Span::new(0, 30)], &[Span::new(10, 20), Span::new(12, 14)]),
+            [Span::new(0, 10), Span::new(20, 30)]
         );
     }
 }

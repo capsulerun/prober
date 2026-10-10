@@ -274,13 +274,19 @@ fn functions_calling_each_other_and_load_time_calls_keep_the_cycle() {
         [(
             vec!["src/x.ts".to_owned(), "src/y.ts".to_owned()],
             Some(SymbolCycles {
-                symbols: 4,
+                symbols: 6,
                 cycles: vec![
                     SymbolCycle {
                         symbols: 2,
                         modules: 2,
                         tests: 0,
                         leading_in: 4,
+                    },
+                    SymbolCycle {
+                        symbols: 2,
+                        modules: 2,
+                        tests: 0,
+                        leading_in: 2,
                     },
                     SymbolCycle {
                         symbols: 2,
@@ -370,7 +376,7 @@ fn callbacks_handed_to_functions_that_only_keep_them_stay_out_of_module_initiali
         uses_of(&graph, "src/app.ts", MODULE_INIT_NAME),
         [
             "src/lazy.ts#<module>",
-            "src/lazy.ts#createLazyRuntimeModule",
+            "src/lazy.ts#createLazyRuntimeModule()",
             "src/lazy.ts#eager",
             "src/other.ts (dynamic_load)",
         ]
@@ -380,6 +386,136 @@ fn callbacks_handed_to_functions_that_only_keep_them_stay_out_of_module_initiali
         [
             "src/lazy.ts#createLazyRuntimeModule",
             "src/runtime.ts (dynamic_load)",
+        ]
+    );
+}
+
+#[test]
+fn members_resolve_through_imports_instances_bases_and_overrides() {
+    let project = TestProject::new(&[
+        (
+            "src/base.ts",
+            r#"
+                export class Base {
+                    describe() { return this.label(); }
+                    label() { return "base"; }
+                    static create() { return new Base(); }
+                }
+            "#,
+        ),
+        (
+            "src/square.ts",
+            r#"
+                import { Base } from "./base";
+
+                export class Square extends Base {
+                    label() { return "square"; }
+                    area() { return super.label(); }
+                }
+            "#,
+        ),
+        (
+            "src/app.ts",
+            r#"
+                import { Base } from "./base";
+                import { Square } from "./square";
+
+                const square = new Square();
+
+                export const describe = () => square.describe();
+                export const area = () => square.area();
+                export const created = () => Base.create();
+            "#,
+        ),
+    ]);
+    let graph = project.link_symbols();
+
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "describe"),
+        ["src/base.ts#Base.describe"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "area"),
+        ["src/square.ts#Square.area"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "created"),
+        ["src/base.ts#static Base.create"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/base.ts", "Base.describe"),
+        ["src/base.ts#Base.label", "src/square.ts#Square.label"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/square.ts", "Square.area"),
+        ["src/base.ts#Base.label"]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/square.ts", "Square"),
+        [
+            "src/base.ts#Base",
+            "src/square.ts#Square.area",
+            "src/square.ts#Square.label"
+        ]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", MODULE_INIT_NAME),
+        [
+            "src/base.ts#<module>",
+            "src/square.ts#<module>",
+            "src/square.ts#new Square()"
+        ]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/square.ts", "new Square()"),
+        ["src/base.ts#new Base()"]
+    );
+}
+
+#[test]
+fn options_handed_to_factories_and_constructors_that_keep_them_stay_out_of_load() {
+    let project = TestProject::new(&[
+        (
+            "src/runtime.ts",
+            r#"
+                export function createRuntime({ load, label }: { load: () => Promise<unknown>; label: string }) {
+                    const { retries } = { retries: label.length };
+                    return { start: async () => (await load(), retries) };
+                }
+
+                export class Controller {
+                    constructor(readonly options: { run: () => Promise<unknown> }) {}
+                    start() { return this.options.run(); }
+                }
+            "#,
+        ),
+        (
+            "src/app.ts",
+            r#"
+                import { createRuntime, Controller } from "./runtime";
+
+                export const runtime = createRuntime({ load: () => import("./plugin"), label: "app" });
+                export const controller = new Controller({ run: () => import("./worker") });
+            "#,
+        ),
+        ("src/plugin.ts", "export const plugin = 1;"),
+        ("src/worker.ts", "export const worker = 1;"),
+    ]);
+    let graph = project.link_symbols();
+
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", MODULE_INIT_NAME),
+        [
+            "src/runtime.ts#<module>",
+            "src/runtime.ts#createRuntime()",
+            "src/runtime.ts#new Controller()"
+        ]
+    );
+    assert_eq!(
+        uses_of(&graph, "src/app.ts", "runtime"),
+        [
+            "src/plugin.ts (dynamic_load)",
+            "src/runtime.ts#createRuntime"
         ]
     );
 }

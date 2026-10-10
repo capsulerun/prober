@@ -734,6 +734,14 @@ impl Graph {
         self.symbols.len()
     }
 
+    pub fn symbol_kind_count(&self, kind: SymbolKind) -> usize {
+        self.symbols
+            .all()
+            .iter()
+            .filter(|symbol| symbol.kind == kind)
+            .count()
+    }
+
     pub fn analysed_module_count(&self) -> usize {
         self.symbols.analysed_module_count()
     }

@@ -1,4 +1,4 @@
-//! Links the symbols of every analysed module: imported names followed to the symbols exporting them through re-exports, aliases and barrels, module loads, and whole-module uses where a name cannot be followed.
+//! Links the symbols of every analysed module: imported names followed to the symbols exporting them through re-exports, aliases and barrels, members read by name through classes, their bases and subclasses, what calling a function or constructing a class runs, module loads, and whole-module uses where a name cannot be followed.
 
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -6,14 +6,17 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use prober_core::files::{FileId, RepoPath};
 use prober_core::graph::{EdgeKind, GraphBuilder};
 use prober_core::symbols::{
-    ModuleFallback, Symbol, SymbolChange, SymbolChangeKind, SymbolEdge, SymbolId, SymbolTarget,
-    WholeModuleCause,
+    ModuleFallback, Symbol, SymbolChange, SymbolChangeKind, SymbolEdge, SymbolId, SymbolKind,
+    SymbolTarget, WholeModuleCause,
 };
 
 use crate::conventions::is_asset_file;
 use crate::linker::{Dependency, LinkedFile, RAW_IMPORT_QUERY};
 use crate::symbols::changes::{Changed, module_changes};
-use crate::symbols::{ExportTarget, Imported, ModuleSymbols, Use};
+use crate::symbols::{
+    ExportTarget, Extends, Held, ImportBinding, Imported, Keeping, LocalSymbol, ModuleSymbols,
+    Place, Shape, Use,
+};
 
 const DEFAULT_EXPORT: &str = "default";
 
@@ -22,6 +25,10 @@ const DATA_MODULE_EXTENSION: &str = ".json";
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 enum Resolved {
     Symbol {
+        module: usize,
+        symbol: usize,
+    },
+    Runs {
         module: usize,
         symbol: usize,
     },
@@ -46,9 +53,16 @@ impl Reached {
         }
     }
 
+    fn symbol(module: usize, symbol: usize) -> Self {
+        Self::direct(Resolved::Symbol { module, symbol })
+    }
+
     fn passing(mut self, module: usize, modules: &[Module]) -> Self {
         let ends_in_module = match &self.resolved {
             Resolved::Symbol {
+                module: reached, ..
+            }
+            | Resolved::Runs {
                 module: reached, ..
             }
             | Resolved::Namespace(reached) => *reached == module,
@@ -58,6 +72,12 @@ impl Reached {
         if !ends_in_module {
             self.through.insert(0, module);
         }
+
+        self
+    }
+
+    fn behind(mut self, through: &[usize]) -> Self {
+        self.through.splice(0..0, through.iter().copied());
 
         self
     }
@@ -76,28 +96,44 @@ struct Module<'l> {
     dependencies: &'l [Dependency],
 }
 
+type Members = HashMap<(usize, usize, Place), HashMap<String, Vec<usize>>>;
+
 struct Resolver<'l> {
     modules: Vec<Module<'l>>,
     module_indices: HashMap<&'l RepoPath, usize>,
     exports: HashMap<(usize, String), Vec<Reached>>,
     in_progress: HashSet<(usize, String)>,
     kept_parameters: HashMap<(usize, usize), Vec<bool>>,
+    rest_parameters: HashSet<(usize, usize)>,
+    members: Members,
+    assigners: HashMap<(usize, usize), HashMap<String, Vec<usize>>>,
+    subclasses: HashMap<(usize, usize), Vec<(usize, usize)>>,
+    member_uses: HashMap<(usize, usize, String), Vec<Reached>>,
+    members_in_progress: HashSet<(usize, usize, String)>,
 }
 
 struct Targets<'t> {
     symbol_ids: &'t [Vec<SymbolId>],
     module_files: &'t [FileId],
+    runs_ids: HashMap<(usize, usize), SymbolId>,
+    queue: Vec<(usize, usize)>,
 }
 
 impl Targets<'_> {
     fn target(
-        &self,
+        &mut self,
         resolved: Resolved,
+        modules: &[Module],
         graph: &mut GraphBuilder,
     ) -> (SymbolTarget, FileId, Option<RepoPath>) {
         match resolved {
             Resolved::Symbol { module, symbol } => (
                 SymbolTarget::Symbol(self.symbol_ids[module][symbol]),
+                self.module_files[module],
+                None,
+            ),
+            Resolved::Runs { module, symbol } => (
+                SymbolTarget::Symbol(self.runs_node(module, symbol, modules, graph)),
                 self.module_files[module],
                 None,
             ),
@@ -114,6 +150,86 @@ impl Targets<'_> {
 
                 (SymbolTarget::Module { file, cause }, file, Some(path))
             }
+        }
+    }
+
+    fn runs_node(
+        &mut self,
+        module: usize,
+        symbol: usize,
+        modules: &[Module],
+        graph: &mut GraphBuilder,
+    ) -> SymbolId {
+        if let Some(&id) = self.runs_ids.get(&(module, symbol)) {
+            return id;
+        }
+
+        let local = &modules[module].symbols.symbols[symbol];
+        let runs = local
+            .runs
+            .as_ref()
+            .expect("only symbols with runs are reached as runs");
+        let id = graph.add_symbol(Symbol {
+            file: self.module_files[module],
+            name: runs_name(local),
+            kind: SymbolKind::Call,
+            lines: runs.lines.clone(),
+            hash: runs.hash,
+        });
+
+        self.runs_ids.insert((module, symbol), id);
+        self.queue.push((module, symbol));
+
+        id
+    }
+}
+
+#[derive(Default)]
+struct Edges {
+    edges: BTreeMap<SymbolEdge, Vec<FileId>>,
+    covered: HashSet<FileId>,
+}
+
+impl Edges {
+    fn add(
+        &mut self,
+        dependent: SymbolId,
+        (reached, raw): (Reached, bool),
+        targets: &mut Targets,
+        modules: &[Module],
+        graph: &mut GraphBuilder,
+    ) {
+        let through: Vec<FileId> = reached
+            .through
+            .iter()
+            .map(|&module| targets.module_files[module])
+            .collect();
+        let (dependency, file, path) = targets.target(reached.resolved, modules, graph);
+        let is_asset = path.is_some_and(|path| is_asset_file(&path));
+        let kind = if is_asset && !raw {
+            EdgeKind::Asset
+        } else {
+            EdgeKind::Import
+        };
+        let edge = SymbolEdge {
+            dependent,
+            dependency,
+            kind,
+        };
+
+        self.covered.insert(file);
+
+        match self.edges.entry(edge) {
+            Entry::Vacant(entry) => {
+                entry.insert(through);
+            }
+            Entry::Occupied(mut entry) => entry.get_mut().retain(|file| through.contains(file)),
+        }
+    }
+
+    fn flush(self, graph: &mut GraphBuilder) {
+        for (edge, through) in self.edges {
+            graph.add_symbol_edge_through(edge, through);
         }
     }
 }
@@ -172,56 +288,40 @@ pub(crate) fn add_symbols(
                 .collect()
         })
         .collect();
-    let mut resolver = Resolver {
-        module_indices: modules
-            .iter()
-            .enumerate()
-            .map(|(index, module)| (module.path, index))
-            .collect(),
-        modules,
-        exports: HashMap::new(),
-        in_progress: HashSet::new(),
-        kept_parameters: HashMap::new(),
-    };
-
-    let targets = Targets {
+    let mut resolver = Resolver::new(modules);
+    let mut targets = Targets {
         symbol_ids: &symbol_ids,
         module_files: &module_files,
+        runs_ids: HashMap::new(),
+        queue: Vec::new(),
     };
 
     resolver.solve_kept_parameters();
+    resolver.link_classes();
 
     for (module, module_symbol_ids) in symbol_ids.iter().enumerate() {
-        let mut edges: BTreeMap<SymbolEdge, Vec<FileId>> = BTreeMap::new();
-        let mut covered_files = HashSet::new();
+        let mut edges = Edges::default();
 
         for resolved_use in resolver.resolved_uses(module) {
-            let through: Vec<FileId> = resolved_use
-                .reached
-                .through
-                .iter()
-                .map(|&module| module_files[module])
-                .collect();
-            let (dependency, file, path) = targets.target(resolved_use.reached.resolved, graph);
-            let is_asset = path.is_some_and(|path| is_asset_file(&path));
-            let kind = if is_asset && !resolved_use.raw {
-                EdgeKind::Asset
-            } else {
-                EdgeKind::Import
-            };
-            let edge = SymbolEdge {
-                dependent: module_symbol_ids[resolved_use.dependent],
-                dependency,
-                kind,
-            };
+            edges.add(
+                module_symbol_ids[resolved_use.dependent],
+                (resolved_use.reached, resolved_use.raw),
+                &mut targets,
+                &resolver.modules,
+                graph,
+            );
+        }
 
-            covered_files.insert(file);
-
-            match edges.entry(edge) {
-                Entry::Vacant(entry) => {
-                    entry.insert(through);
-                }
-                Entry::Occupied(mut entry) => entry.get_mut().retain(|file| through.contains(file)),
+        for (member, local_symbol) in resolver.modules[module].symbols.symbols.iter().enumerate() {
+            if let Some(membership) = &local_symbol.member {
+                edges.edges.insert(
+                    SymbolEdge {
+                        dependent: module_symbol_ids[membership.owner],
+                        dependency: SymbolTarget::Symbol(module_symbol_ids[member]),
+                        kind: EdgeKind::Import,
+                    },
+                    Vec::new(),
+                );
             }
         }
 
@@ -234,7 +334,7 @@ pub(crate) fn add_symbols(
 
             let file = graph.add_file(dependency.path.clone());
 
-            if covered_files.insert(file) {
+            if edges.covered.insert(file) {
                 let edge = SymbolEdge {
                     dependent: init,
                     dependency: SymbolTarget::Module {
@@ -244,13 +344,22 @@ pub(crate) fn add_symbols(
                     kind: dependency.kind,
                 };
 
-                edges.insert(edge, Vec::new());
+                edges.edges.insert(edge, Vec::new());
             }
         }
 
-        for (edge, through) in edges {
-            graph.add_symbol_edge_through(edge, through);
+        edges.flush(graph);
+    }
+
+    while let Some((module, symbol)) = targets.queue.pop() {
+        let dependent = targets.runs_ids[&(module, symbol)];
+        let mut edges = Edges::default();
+
+        for reached in resolver.runs_uses(module, symbol) {
+            edges.add(dependent, reached, &mut targets, &resolver.modules, graph);
         }
+
+        edges.flush(graph);
     }
 
     for (module, &file) in module_files.iter().enumerate() {
@@ -258,7 +367,7 @@ pub(crate) fn add_symbols(
             continue;
         };
         let symbol_changes = resolver
-            .symbol_changes(module, base)
+            .symbol_changes(module, base, &targets.runs_ids)
             .into_iter()
             .map(|(name, kind, reaches)| SymbolChange {
                 file,
@@ -266,7 +375,7 @@ pub(crate) fn add_symbols(
                 kind,
                 reaches: reaches
                     .into_iter()
-                    .map(|reached| targets.target(reached.resolved, graph).0)
+                    .map(|reached| targets.target(reached, &resolver.modules, graph).0)
                     .collect(),
             })
             .collect();
@@ -275,7 +384,62 @@ pub(crate) fn add_symbols(
     }
 }
 
-impl Resolver<'_> {
+fn runs_name(local: &LocalSymbol) -> String {
+    if local.kind == SymbolKind::Class {
+        format!("new {}()", local.name)
+    } else {
+        format!("{}()", local.name)
+    }
+}
+
+impl<'l> Resolver<'l> {
+    fn new(modules: Vec<Module<'l>>) -> Self {
+        let mut members: Members = HashMap::new();
+        let mut assigners: HashMap<(usize, usize), HashMap<String, Vec<usize>>> = HashMap::new();
+
+        for (module_index, module) in modules.iter().enumerate() {
+            for (symbol, local) in module.symbols.symbols.iter().enumerate() {
+                let Some(membership) = &local.member else {
+                    continue;
+                };
+
+                members
+                    .entry((module_index, membership.owner, membership.place))
+                    .or_default()
+                    .entry(membership.key.clone())
+                    .or_default()
+                    .push(symbol);
+
+                for assigned in &membership.assigns {
+                    assigners
+                        .entry((module_index, membership.owner))
+                        .or_default()
+                        .entry(assigned.clone())
+                        .or_default()
+                        .push(symbol);
+                }
+            }
+        }
+
+        Self {
+            module_indices: modules
+                .iter()
+                .enumerate()
+                .map(|(index, module)| (module.path, index))
+                .collect(),
+            modules,
+            exports: HashMap::new(),
+            in_progress: HashSet::new(),
+            kept_parameters: HashMap::new(),
+            rest_parameters: HashSet::new(),
+            members,
+            assigners,
+            subclasses: HashMap::new(),
+            member_uses: HashMap::new(),
+            members_in_progress: HashSet::new(),
+        }
+    }
+
     fn targets(&self, module: usize, specifier: &str) -> Vec<RepoPath> {
         self.modules[module]
             .targets
@@ -284,21 +448,23 @@ impl Resolver<'_> {
             .unwrap_or_default()
     }
 
+    fn local(&self, module: usize, symbol: usize) -> &'l LocalSymbol {
+        let symbols: &'l ModuleSymbols = self.modules[module].symbols;
+
+        &symbols.symbols[symbol]
+    }
+
+    fn is_class(&self, module: usize, symbol: usize) -> bool {
+        self.local(module, symbol).kind == SymbolKind::Class
+    }
+
     fn resolved_uses(&mut self, module: usize) -> Vec<ResolvedUse> {
-        let symbols = self.modules[module].symbols;
+        let symbols: &'l ModuleSymbols = self.modules[module].symbols;
         let mut resolved_uses = Vec::new();
 
         for (dependent, local_symbol) in symbols.symbols.iter().enumerate() {
             for symbol_use in &local_symbol.uses {
-                let raw = match symbol_use {
-                    Use::Local(_) => false,
-                    Use::Import { binding, .. } => symbols.imports[*binding]
-                        .specifier
-                        .contains(RAW_IMPORT_QUERY),
-                    Use::Module(specifier) | Use::Load(specifier) => {
-                        specifier.contains(RAW_IMPORT_QUERY)
-                    }
-                };
+                let raw = is_raw(symbols, symbol_use);
 
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
                     |reached| ResolvedUse {
@@ -310,17 +476,19 @@ impl Resolver<'_> {
             }
         }
 
-        for argument in &symbols.load_arguments {
-            if self.keeps(module, &argument.callee, argument.index) {
+        for held in &symbols.held {
+            if self.is_kept(module, held) {
                 continue;
             }
 
-            for symbol_use in &argument.uses {
+            for symbol_use in &held.uses {
+                let raw = is_raw(symbols, symbol_use);
+
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
                     |reached| ResolvedUse {
                         dependent: ModuleSymbols::INIT,
                         reached,
-                        raw: false,
+                        raw,
                     },
                 ));
             }
@@ -341,12 +509,45 @@ impl Resolver<'_> {
         resolved_uses
     }
 
+    fn runs_uses(&mut self, module: usize, symbol: usize) -> Vec<(Reached, bool)> {
+        let symbols: &'l ModuleSymbols = self.modules[module].symbols;
+        let Some(runs) = &symbols.symbols[symbol].runs else {
+            return Vec::new();
+        };
+        let held_uses = runs
+            .held
+            .iter()
+            .filter(|held| !self.is_kept(module, held))
+            .flat_map(|held| &held.uses)
+            .collect::<Vec<_>>();
+        let mut reached = Vec::new();
+
+        for symbol_use in runs.uses.iter().chain(held_uses) {
+            let raw = is_raw(symbols, symbol_use);
+
+            reached.extend(
+                self.resolve_use(module, symbol_use)
+                    .into_iter()
+                    .map(|resolved| (resolved, raw)),
+            );
+        }
+
+        reached
+    }
+
+    fn is_kept(&mut self, module: usize, held: &Held) -> bool {
+        held.kept_by
+            .iter()
+            .all(|keeping| self.keeps(module, keeping))
+    }
+
     fn symbol_changes(
         &mut self,
         module: usize,
         base: &ModuleSymbols,
-    ) -> Vec<(String, SymbolChangeKind, Vec<Reached>)> {
-        let head = self.modules[module].symbols;
+        runs_ids: &HashMap<(usize, usize), SymbolId>,
+    ) -> Vec<(String, SymbolChangeKind, Vec<Resolved>)> {
+        let head: &'l ModuleSymbols = self.modules[module].symbols;
         let mut symbol_changes = Vec::new();
 
         for changed in module_changes(base, head) {
@@ -354,26 +555,71 @@ impl Resolver<'_> {
                 Changed::Symbol { index, kind } => symbol_changes.push((
                     head.symbols[index].name.clone(),
                     kind,
-                    vec![Reached::direct(Resolved::Symbol {
+                    vec![Resolved::Symbol {
                         module,
                         symbol: index,
-                    })],
+                    }],
                 )),
+                Changed::Held { index, groups } => {
+                    let runs = groups
+                        .iter()
+                        .any(|&group| !self.is_kept(module, &head.held[group]));
+
+                    if runs {
+                        symbol_changes.push((
+                            head.symbols[index].name.clone(),
+                            SymbolChangeKind::Modified,
+                            vec![Resolved::Symbol {
+                                module,
+                                symbol: index,
+                            }],
+                        ));
+                    }
+                }
+                Changed::Runs { index, groups } => {
+                    let local = &head.symbols[index];
+
+                    if !runs_ids.contains_key(&(module, index)) {
+                        continue;
+                    }
+
+                    let runs = match (&groups, &local.runs) {
+                        (Some(groups), Some(runs)) => groups
+                            .iter()
+                            .any(|&group| !self.is_kept(module, &runs.held[group])),
+                        _ => true,
+                    };
+
+                    if runs {
+                        symbol_changes.push((
+                            runs_name(local),
+                            SymbolChangeKind::Modified,
+                            vec![Resolved::Runs {
+                                module,
+                                symbol: index,
+                            }],
+                        ));
+                    }
+                }
                 Changed::Removed(name) => {
                     symbol_changes.push((name, SymbolChangeKind::Removed, Vec::new()));
                 }
                 Changed::Export(name) => {
-                    let reaches = self.resolve_name(module, &name);
+                    let reaches = self
+                        .resolve_name(module, &name)
+                        .into_iter()
+                        .map(|reached| reached.resolved)
+                        .collect();
 
                     symbol_changes.push((name, SymbolChangeKind::Export, reaches));
                 }
                 Changed::StarExport(specifier) => {
                     for target in self.targets(module, &specifier) {
                         let Some(&target_module) = self.module_indices.get(&target) else {
-                            let reaches = vec![Reached::direct(Resolved::Whole {
+                            let reaches = vec![Resolved::Whole {
                                 file: target,
                                 cause: WholeModuleCause::NotAnalysed,
-                            })];
+                            }];
 
                             symbol_changes.push((
                                 specifier.clone(),
@@ -388,7 +634,11 @@ impl Resolver<'_> {
                         self.exported_names(target_module, &mut HashSet::new(), &mut names);
 
                         for name in names {
-                            let reaches = self.resolve_name(module, &name);
+                            let reaches = self
+                                .resolve_name(module, &name)
+                                .into_iter()
+                                .map(|reached| reached.resolved)
+                                .collect();
 
                             symbol_changes.push((name, SymbolChangeKind::Export, reaches));
                         }
@@ -464,6 +714,14 @@ impl Resolver<'_> {
                     self.kept_parameters
                         .insert((module_index, symbol_index), kept);
                 }
+
+                if symbol
+                    .parameters
+                    .last()
+                    .is_some_and(|parameter| parameter.rest)
+                {
+                    self.rest_parameters.insert((module_index, symbol_index));
+                }
             }
         }
 
@@ -487,11 +745,8 @@ impl Resolver<'_> {
             kept.sort_unstable();
 
             for (module, symbol, parameter) in kept {
-                let symbols = self.modules[module].symbols;
-                let passed = &symbols.symbols[symbol].parameters[parameter].passed;
-                let still_kept = passed
-                    .iter()
-                    .all(|(callee, argument)| self.keeps(module, callee, *argument));
+                let passed = &self.local(module, symbol).parameters[parameter].passed;
+                let still_kept = passed.iter().all(|keeping| self.keeps(module, keeping));
 
                 if !still_kept {
                     self.kept_parameters
@@ -503,20 +758,282 @@ impl Resolver<'_> {
         }
     }
 
-    fn keeps(&mut self, module: usize, callee: &Use, argument: usize) -> bool {
-        match self.resolve_use(module, callee).as_slice() {
+    fn keeps(&mut self, module: usize, keeping: &Keeping) -> bool {
+        match self.resolve_use(module, &keeping.callee).as_slice() {
             [
                 Reached {
                     resolved: Resolved::Symbol { module, symbol },
                     ..
                 },
-            ] => self
-                .kept_parameters
-                .get(&(*module, *symbol))
-                .and_then(|kept| kept.get(argument))
-                .copied()
-                .unwrap_or(false),
+            ] => {
+                if self.local(*module, *symbol).shape == Some(Shape::Assign) {
+                    return keeping.index == 0 || keeping.fresh_target;
+                }
+
+                let rest = self.rest_parameters.contains(&(*module, *symbol));
+
+                self.kept_parameters
+                    .get(&(*module, *symbol))
+                    .and_then(|kept| {
+                        kept.get(keeping.index)
+                            .or_else(|| kept.last().filter(|_| rest))
+                    })
+                    .copied()
+                    .unwrap_or(false)
+            }
             _ => false,
+        }
+    }
+
+    fn link_classes(&mut self) {
+        for module in 0..self.modules.len() {
+            let symbols: &'l ModuleSymbols = self.modules[module].symbols;
+
+            for (class, local) in symbols.symbols.iter().enumerate() {
+                let Some(Shape::Class {
+                    extends: Extends::Binding(base),
+                }) = &local.shape
+                else {
+                    continue;
+                };
+
+                for reached in self.resolve_use(module, base) {
+                    if let Resolved::Symbol {
+                        module: base_module,
+                        symbol: base_class,
+                    } = reached.resolved
+                        && self.is_class(base_module, base_class)
+                    {
+                        self.subclasses
+                            .entry((base_module, base_class))
+                            .or_default()
+                            .push((module, class));
+                    }
+                }
+            }
+        }
+    }
+
+    fn defined(&self, module: usize, owner: usize, key: &str, place: Place) -> Vec<Reached> {
+        let members = self
+            .members
+            .get(&(module, owner, place))
+            .and_then(|by_key| by_key.get(key))
+            .into_iter()
+            .flatten();
+        let assigners = (place == Place::Instance)
+            .then(|| {
+                self.assigners
+                    .get(&(module, owner))
+                    .and_then(|by_key| by_key.get(key))
+            })
+            .flatten()
+            .into_iter()
+            .flatten();
+        let mut defined: Vec<usize> = members.chain(assigners).copied().collect();
+
+        defined.sort_unstable();
+        defined.dedup();
+
+        defined
+            .into_iter()
+            .map(|symbol| Reached::symbol(module, symbol))
+            .collect()
+    }
+
+    fn lookup(
+        &mut self,
+        module: usize,
+        owner: usize,
+        key: &str,
+        place: Place,
+        visited: &mut HashSet<(usize, usize)>,
+    ) -> Vec<Reached> {
+        if !visited.insert((module, owner)) {
+            return Vec::new();
+        }
+
+        let defined = self.defined(module, owner, key, place);
+
+        if !defined.is_empty() {
+            return defined;
+        }
+
+        let inherited = self.in_bases(module, owner, |resolver, base_module, base_class| {
+            resolver.lookup(base_module, base_class, key, place, visited)
+        });
+
+        if inherited.is_empty() {
+            vec![Reached::symbol(module, owner)]
+        } else {
+            inherited
+        }
+    }
+
+    fn in_bases(
+        &mut self,
+        module: usize,
+        class: usize,
+        mut lookup: impl FnMut(&mut Self, usize, usize) -> Vec<Reached>,
+    ) -> Vec<Reached> {
+        let Some(Shape::Class {
+            extends: Extends::Binding(base),
+        }) = &self.local(module, class).shape
+        else {
+            return Vec::new();
+        };
+        let mut reached = Vec::new();
+
+        for base_reached in self.resolve_use(module, base) {
+            match base_reached.resolved {
+                Resolved::Symbol {
+                    module: base_module,
+                    symbol: base_class,
+                } if self.is_class(base_module, base_class) => {
+                    let found = lookup(self, base_module, base_class);
+
+                    reached.extend(
+                        found
+                            .into_iter()
+                            .map(|found| found.behind(&base_reached.through)),
+                    );
+                }
+                _ => reached.push(base_reached),
+            }
+        }
+
+        reached
+    }
+
+    fn member_of(&mut self, module: usize, symbol: usize, member: &str) -> Vec<Reached> {
+        let key = (module, symbol, member.to_owned());
+
+        if let Some(reached) = self.member_uses.get(&key) {
+            return reached.clone();
+        }
+
+        if !self.members_in_progress.insert(key.clone()) {
+            return vec![Reached::symbol(module, symbol)];
+        }
+
+        let reached = self.find_member(module, symbol, member);
+
+        self.members_in_progress.remove(&key);
+        self.member_uses.insert(key, reached.clone());
+
+        reached
+    }
+
+    fn find_member(&mut self, module: usize, symbol: usize, member: &str) -> Vec<Reached> {
+        let local = self.local(module, symbol);
+
+        match &local.shape {
+            Some(Shape::Class { .. } | Shape::Object { .. }) => {
+                self.lookup(module, symbol, member, Place::Own, &mut HashSet::new())
+            }
+            Some(Shape::Instance(class)) => {
+                let mut reached = Vec::new();
+
+                for class_reached in self.resolve_use(module, class) {
+                    match class_reached.resolved {
+                        Resolved::Symbol {
+                            module: class_module,
+                            symbol: class_symbol,
+                        } if self.is_class(class_module, class_symbol) => {
+                            let found = self.lookup(
+                                class_module,
+                                class_symbol,
+                                member,
+                                Place::Instance,
+                                &mut HashSet::new(),
+                            );
+
+                            reached.extend(
+                                found
+                                    .into_iter()
+                                    .map(|found| found.behind(&class_reached.through)),
+                            );
+                        }
+                        _ => reached.push(class_reached),
+                    }
+                }
+
+                for other in local.uses.iter().filter(|other| *other != class) {
+                    reached.extend(self.resolve_use(module, other));
+                }
+
+                reached
+            }
+            Some(Shape::Assign) | None => vec![Reached::symbol(module, symbol)],
+        }
+    }
+
+    fn dispatch(
+        &mut self,
+        module: usize,
+        class: usize,
+        member: &str,
+        place: Place,
+    ) -> Vec<Reached> {
+        let mut reached = self.lookup(module, class, member, place, &mut HashSet::new());
+        let mut stack: Vec<(usize, usize)> = self
+            .subclasses
+            .get(&(module, class))
+            .cloned()
+            .unwrap_or_default();
+        let mut seen = HashSet::new();
+
+        while let Some((subclass_module, subclass)) = stack.pop() {
+            if !seen.insert((subclass_module, subclass)) {
+                continue;
+            }
+
+            reached.extend(self.defined(subclass_module, subclass, member, place));
+            stack.extend(
+                self.subclasses
+                    .get(&(subclass_module, subclass))
+                    .into_iter()
+                    .flatten()
+                    .copied(),
+            );
+        }
+
+        reached
+    }
+
+    fn inherited(
+        &mut self,
+        module: usize,
+        class: usize,
+        member: &str,
+        place: Place,
+    ) -> Vec<Reached> {
+        let inherited = self.in_bases(module, class, |resolver, base_module, base_class| {
+            resolver.lookup(base_module, base_class, member, place, &mut HashSet::new())
+        });
+
+        if inherited.is_empty() {
+            vec![Reached::symbol(module, class)]
+        } else {
+            inherited
+        }
+    }
+
+    fn called(&self, reached: Reached, kind: SymbolKind) -> Reached {
+        match reached.resolved {
+            Resolved::Symbol { module, symbol } => {
+                let local = self.local(module, symbol);
+
+                if local.kind == kind && local.runs.is_some() {
+                    Reached {
+                        resolved: Resolved::Runs { module, symbol },
+                        through: reached.through,
+                    }
+                } else {
+                    reached
+                }
+            }
+            _ => reached,
         }
     }
 
@@ -541,36 +1058,45 @@ impl Resolver<'_> {
 
     fn resolve_use(&mut self, module: usize, symbol_use: &Use) -> Vec<Reached> {
         match symbol_use {
-            Use::Local(symbol) => vec![Reached::direct(Resolved::Symbol {
-                module,
-                symbol: *symbol,
-            })],
+            Use::Local(symbol) => vec![Reached::symbol(module, *symbol)],
+            Use::Member { symbol, member } => self.member_of(module, *symbol, member),
+            Use::This {
+                class,
+                member,
+                place,
+            } => self.dispatch(module, *class, member, *place),
+            Use::Super {
+                class,
+                member,
+                place,
+            } => self.inherited(module, *class, member, *place),
+            Use::Call(called) => self
+                .resolve_use(module, called)
+                .into_iter()
+                .map(|reached| self.called(reached, SymbolKind::Function))
+                .collect(),
+            Use::New(constructed) => self
+                .resolve_use(module, constructed)
+                .into_iter()
+                .map(|reached| self.called(reached, SymbolKind::Class))
+                .collect(),
             Use::Import { binding, member } => {
-                let binding = &self.modules[module].symbols.imports[*binding];
+                let binding = &self.local_imports(module)[*binding];
                 let mut reached = Vec::new();
 
                 for imported in self.resolve_import(module, &binding.specifier, &binding.imported) {
-                    let Resolved::Namespace(namespace) = imported.resolved else {
-                        reached.push(imported);
-
-                        continue;
-                    };
-
-                    match member {
-                        Some(member) => {
+                    match (&imported.resolved, member) {
+                        (Resolved::Namespace(namespace), Some(member)) => {
+                            let namespace = *namespace;
                             let members = self.resolve_name(namespace, member);
 
                             reached.extend(members.into_iter().map(|member| {
-                                let mut member = member.passing(namespace, &self.modules);
-
                                 member
-                                    .through
-                                    .splice(0..0, imported.through.iter().copied());
-
-                                member
+                                    .passing(namespace, &self.modules)
+                                    .behind(&imported.through)
                             }));
                         }
-                        None => {
+                        (Resolved::Namespace(namespace), None) => {
                             let cause = if binding.imported == Imported::Dynamic {
                                 WholeModuleCause::DynamicLoad
                             } else {
@@ -579,12 +1105,28 @@ impl Resolver<'_> {
 
                             reached.push(Reached {
                                 resolved: Resolved::Whole {
-                                    file: self.modules[namespace].path.clone(),
+                                    file: self.modules[*namespace].path.clone(),
                                     cause,
                                 },
                                 through: imported.through,
                             });
                         }
+                        (
+                            Resolved::Symbol {
+                                module: symbol_module,
+                                symbol,
+                            },
+                            Some(member),
+                        ) => {
+                            let found = self.member_of(*symbol_module, *symbol, member);
+
+                            reached.extend(
+                                found
+                                    .into_iter()
+                                    .map(|found| found.behind(&imported.through)),
+                            );
+                        }
+                        _ => reached.push(imported),
                     }
                 }
 
@@ -606,6 +1148,12 @@ impl Resolver<'_> {
                 .map(Reached::direct)
                 .collect(),
         }
+    }
+
+    fn local_imports(&self, module: usize) -> &'l [ImportBinding] {
+        let symbols: &'l ModuleSymbols = self.modules[module].symbols;
+
+        &symbols.imports
     }
 
     fn resolve_import(
@@ -693,7 +1241,7 @@ impl Resolver<'_> {
     }
 
     fn find_export(&mut self, module: usize, name: &str) -> Vec<Reached> {
-        let symbols = self.modules[module].symbols;
+        let symbols: &'l ModuleSymbols = self.modules[module].symbols;
         let mut entries = symbols
             .exports
             .iter()
@@ -706,12 +1254,7 @@ impl Resolver<'_> {
 
             for entry in entries {
                 match entry {
-                    ExportTarget::Local(symbol) => {
-                        resolved.push(Reached::direct(Resolved::Symbol {
-                            module,
-                            symbol: *symbol,
-                        }))
-                    }
+                    ExportTarget::Local(symbol) => resolved.push(Reached::symbol(module, *symbol)),
                     ExportTarget::Import(binding) => {
                         let binding = &symbols.imports[*binding];
 
@@ -773,5 +1316,16 @@ impl Resolver<'_> {
         } else {
             found
         }
+    }
+}
+
+fn is_raw(symbols: &ModuleSymbols, symbol_use: &Use) -> bool {
+    match symbol_use {
+        Use::Import { binding, .. } => symbols.imports[*binding]
+            .specifier
+            .contains(RAW_IMPORT_QUERY),
+        Use::Module(specifier) | Use::Load(specifier) => specifier.contains(RAW_IMPORT_QUERY),
+        Use::Call(called) | Use::New(called) => is_raw(symbols, called),
+        Use::Local(_) | Use::Member { .. } | Use::This { .. } | Use::Super { .. } => false,
     }
 }

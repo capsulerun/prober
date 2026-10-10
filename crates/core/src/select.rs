@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use crate::changes::FileChange;
 use crate::files::FileId;
 use crate::graph::{ContentChange, Edge, EdgeKind, Graph, UnresolvedSite};
-use crate::symbols::{SymbolEdge, SymbolId, SymbolTarget};
+use crate::symbols::{SymbolEdge, SymbolId, SymbolKind, SymbolTarget};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Widening {
@@ -626,10 +626,18 @@ fn tests_reached(
     let graph = traversal.graph;
     let mut nodes_by_test: HashMap<FileId, Vec<Node>> = HashMap::new();
 
-    for &node in discoveries.nodes.keys() {
+    for (&node, discovery) in &discoveries.nodes {
         let file = traversal.file_of(node);
+        let runs_test = match node {
+            Node::Content(_) => false,
+            Node::File(_) => true,
+            Node::Symbol(symbol) => {
+                !traversal.is_analysed(file) || graph.symbol(symbol).kind == SymbolKind::ModuleInit
+            }
+            Node::Module(_) => !traversal.is_analysed(file) || matches!(discovery.via, Via::Origin),
+        };
 
-        if !matches!(node, Node::Content(_)) && graph.is_test(file) && keeps(file) {
+        if runs_test && graph.is_test(file) && keeps(file) {
             nodes_by_test.entry(file).or_default().push(node);
         }
     }
