@@ -756,6 +756,18 @@ fn describe_use(graph: &Graph, edge: &SymbolEdge) -> String {
     let at_load = user.kind == SymbolKind::ModuleInit;
 
     match edge.dependency {
+        SymbolTarget::Symbol(used) if graph.is_dispatch(edge) => {
+            let used = graph.symbol(used);
+
+            if at_load {
+                format!("-> {} read by key at load by {user_file}", used.name)
+            } else {
+                format!(
+                    "-> {} read by key by {} in {user_file}",
+                    used.name, user.name
+                )
+            }
+        }
         SymbolTarget::Symbol(used) => {
             let used = graph.symbol(used);
 

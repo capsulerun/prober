@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet};
 use crate::files::{FileId, FileTable, RepoPath};
 use crate::patterns::Captures;
 use crate::symbols::{
-    FallbackCause, ModuleFallback, Symbol, SymbolChange, SymbolEdge, SymbolId, SymbolKind,
-    SymbolTable, SymbolTableBuilder, SymbolTarget,
+    FallbackCause, Membership, ModuleFallback, Symbol, SymbolChange, SymbolEdge, SymbolId,
+    SymbolKind, SymbolTable, SymbolTableBuilder, SymbolTarget,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -241,6 +241,7 @@ pub struct GraphBuilder {
     rule_links: Vec<RuleLink>,
     rule_ignores: Vec<RuleIgnore>,
     symbols: SymbolTableBuilder,
+    commands: HashMap<FileId, Vec<String>>,
 }
 
 impl GraphBuilder {
@@ -345,6 +346,20 @@ impl GraphBuilder {
 
     pub fn add_module_changes(&mut self, file: FileId, changes: Vec<SymbolChange>) {
         self.symbols.add_module_changes(file, changes);
+    }
+
+    pub fn add_membership(&mut self, member: SymbolId, membership: Membership) {
+        self.symbols.add_membership(member, membership);
+    }
+
+    pub fn mark_dispatch(&mut self, edge: SymbolEdge) {
+        self.symbols.mark_dispatch(edge);
+    }
+
+    pub fn add_commands(&mut self, file: FileId, commands: Vec<String>) {
+        if !commands.is_empty() {
+            self.commands.insert(file, commands);
+        }
     }
 
     pub(crate) fn files(&self) -> impl Iterator<Item = (FileId, &RepoPath)> {
@@ -519,6 +534,7 @@ impl GraphBuilder {
             rule_links_by_dependent,
             rule_ignores: self.rule_ignores,
             symbols: self.symbols.build(),
+            commands: self.commands,
         }
     }
 }
@@ -544,6 +560,7 @@ pub struct Graph {
     rule_links_by_dependent: HashMap<FileId, Vec<usize>>,
     rule_ignores: Vec<RuleIgnore>,
     symbols: SymbolTable,
+    commands: HashMap<FileId, Vec<String>>,
 }
 
 impl Graph {
@@ -821,6 +838,24 @@ impl Graph {
             SymbolTarget::Symbol(symbol) => self.symbol(symbol).file,
             SymbolTarget::Module { file, .. } => file,
         }
+    }
+
+    pub fn memberships(&self) -> impl Iterator<Item = (SymbolId, &Membership)> {
+        self.symbols.memberships()
+    }
+
+    pub fn is_dispatch(&self, edge: &SymbolEdge) -> bool {
+        self.symbols.is_dispatch(edge)
+    }
+
+    pub fn dispatch_edges(&self) -> impl Iterator<Item = &SymbolEdge> {
+        self.symbols.dispatch_edges()
+    }
+
+    pub fn commands(&self) -> impl Iterator<Item = (FileId, &[String])> {
+        self.commands
+            .iter()
+            .map(|(&file, commands)| (file, commands.as_slice()))
     }
 }
 

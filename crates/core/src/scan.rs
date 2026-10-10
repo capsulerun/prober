@@ -1,3 +1,4 @@
+mod anchors;
 mod cycles;
 mod hubs;
 mod suggestions;
@@ -14,6 +15,7 @@ use crate::ratios::format_percentage;
 use crate::rules::{ConfigWarning, RuleEffect, RuleReport};
 use crate::symbols::FallbackCause;
 
+pub use crate::scan::anchors::{AnchorSummary, CommandFile, Registry};
 pub use crate::scan::cycles::{ImportCycle, SymbolCycle, SymbolCycles, SymbolSummary};
 pub use crate::scan::hubs::{HubFile, SmokeSet};
 pub use crate::scan::suggestions::Suggestion;
@@ -70,6 +72,7 @@ pub struct ScanReport {
     pub hub_files: Vec<HubFile>,
     pub smoke_set: SmokeSet,
     pub symbol_summary: SymbolSummary,
+    pub anchors: AnchorSummary,
     pub import_cycles: Vec<ImportCycle>,
     pub suggestions: Vec<Suggestion>,
     pub rule_effects: Vec<RuleEffect>,
@@ -105,6 +108,7 @@ impl ScanReport {
             hub_files,
             smoke_set,
             symbol_summary: cycles::symbol_summary(graph),
+            anchors: anchors::anchor_summary(graph),
             import_cycles: cycles::import_cycles(graph, repo_files),
             suggestions,
             rule_effects: Vec::new(),
@@ -155,6 +159,8 @@ impl ScanReport {
         self.write_hub_files(&mut text);
         text.push('\n');
         self.write_symbols(&mut text);
+        text.push('\n');
+        self.write_anchors(&mut text);
         text.push('\n');
         self.write_import_cycles(&mut text);
         text.push('\n');
@@ -244,6 +250,28 @@ impl ScanReport {
                     .whole_module_uses
                     .iter()
                     .map(|(cause, uses)| (cause.key(), *uses))
+                    .collect(),
+            },
+            anchors: JsonAnchors {
+                registries: self
+                    .anchors
+                    .registries
+                    .iter()
+                    .map(|registry| JsonRegistry {
+                        registry: &registry.registry,
+                        file: registry.file.as_str(),
+                        keys: registry.keys,
+                        readers: registry.readers.iter().map(String::as_str).collect(),
+                    })
+                    .collect(),
+                commands: self
+                    .anchors
+                    .commands
+                    .iter()
+                    .map(|command_file| JsonCommandFile {
+                        file: command_file.file.as_str(),
+                        commands: command_file.commands.iter().map(String::as_str).collect(),
+                    })
                     .collect(),
             },
             cycles: self
@@ -427,6 +455,49 @@ impl ScanReport {
                     .map(|(cause, uses)| (cause.description(), *uses))
             )
         );
+    }
+
+    fn write_anchors(&self, text: &mut String) {
+        let _ = writeln!(
+            text,
+            "String anchors: {} objects read by a runtime key ({} keys), {} commands in {} files; reported, not used to narrow: the keys a test dispatches and the commands it launches can come from helpers, clients and data Prober cannot read",
+            self.anchors.registries.len(),
+            self.anchors.key_count(),
+            self.anchors.command_count(),
+            self.anchors.commands.len()
+        );
+
+        let registry_rows: Vec<(usize, String)> = self
+            .anchors
+            .registries
+            .iter()
+            .map(|registry| {
+                let readers = match registry.readers.as_slice() {
+                    [reader] => reader.clone(),
+                    [first, rest @ ..] => format!("{first} and {} more", rest.len()),
+                    [] => String::new(),
+                };
+
+                (
+                    registry.keys,
+                    format!(
+                        "{} in {}, read by key by {readers}",
+                        registry.registry, registry.file
+                    ),
+                )
+            })
+            .collect();
+
+        write_rows(text, "keys", "object", &registry_rows, "objects");
+
+        let command_rows: Vec<(usize, String)> = self
+            .anchors
+            .commands
+            .iter()
+            .map(|command_file| (command_file.commands.len(), command_file.file.to_string()))
+            .collect();
+
+        write_rows(text, "commands", "file", &command_rows, "files");
     }
 
     fn write_import_cycles(&self, text: &mut String) {
@@ -1005,6 +1076,7 @@ struct JsonScan<'a> {
     hub_files: Vec<JsonHubFile<'a>>,
     smoke_set: JsonSmokeSet<'a>,
     symbols: JsonSymbols<'a>,
+    anchors: JsonAnchors<'a>,
     cycles: Vec<JsonImportCycle<'a>>,
     suggestions: Vec<JsonSuggestion<'a>>,
     config: JsonConfig<'a>,
@@ -1040,6 +1112,26 @@ struct JsonSymbols<'a> {
     modules: usize,
     file_level: Vec<JsonFileLevelModule<'a>>,
     whole_module_uses: BTreeMap<&'static str, usize>,
+}
+
+#[derive(Serialize)]
+struct JsonAnchors<'a> {
+    registries: Vec<JsonRegistry<'a>>,
+    commands: Vec<JsonCommandFile<'a>>,
+}
+
+#[derive(Serialize)]
+struct JsonRegistry<'a> {
+    registry: &'a str,
+    file: &'a str,
+    keys: usize,
+    readers: Vec<&'a str>,
+}
+
+#[derive(Serialize)]
+struct JsonCommandFile<'a> {
+    file: &'a str,
+    commands: Vec<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -1298,6 +1390,8 @@ Suggested smoke set: 2 test files within two links of 4 of these 4 files; run th
   tests = [\"src/loader.test.ts\", \"src/worker.test.ts\"]
 
 Symbols: 0 in 0 modules, with 0 members and 0 call parts; 0 modules at file level; 0 uses keep a whole module
+
+String anchors: 0 objects read by a runtime key (0 keys), 0 commands in 0 files; reported, not used to narrow: the keys a test dispatches and the commands it launches can come from helpers, clients and data Prober cannot read
 
 Import cycles: 0 with 2 or more modules, 0 modules in them
 

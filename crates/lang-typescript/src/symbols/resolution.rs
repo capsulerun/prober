@@ -6,8 +6,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use prober_core::files::{FileId, RepoPath};
 use prober_core::graph::{EdgeKind, GraphBuilder};
 use prober_core::symbols::{
-    ModuleFallback, Symbol, SymbolChange, SymbolChangeKind, SymbolEdge, SymbolId, SymbolKind,
-    SymbolTarget, WholeModuleCause,
+    Membership as CoreMembership, ModuleFallback, Symbol, SymbolChange, SymbolChangeKind,
+    SymbolEdge, SymbolId, SymbolKind, SymbolTarget, WholeModuleCause,
 };
 
 use crate::conventions::is_asset_file;
@@ -83,10 +83,25 @@ impl Reached {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Reading {
+    raw: bool,
+    keyed: bool,
+}
+
+impl Reading {
+    fn of(symbols: &ModuleSymbols, symbol_use: &Use) -> Self {
+        Self {
+            raw: is_raw(symbols, symbol_use),
+            keyed: is_keyed(symbol_use),
+        }
+    }
+}
+
 struct ResolvedUse {
     dependent: usize,
     reached: Reached,
-    raw: bool,
+    reading: Reading,
 }
 
 struct Module<'l> {
@@ -187,6 +202,7 @@ impl Targets<'_> {
 #[derive(Default)]
 struct Edges {
     edges: BTreeMap<SymbolEdge, Vec<FileId>>,
+    dispatch: HashMap<SymbolEdge, bool>,
     covered: HashSet<FileId>,
 }
 
@@ -194,7 +210,7 @@ impl Edges {
     fn add(
         &mut self,
         dependent: SymbolId,
-        (reached, raw): (Reached, bool),
+        (reached, reading): (Reached, Reading),
         targets: &mut Targets,
         modules: &[Module],
         graph: &mut GraphBuilder,
@@ -204,9 +220,10 @@ impl Edges {
             .iter()
             .map(|&module| targets.module_files[module])
             .collect();
+        let dispatch = reading.keyed && is_registry(&reached.resolved, modules);
         let (dependency, file, path) = targets.target(reached.resolved, modules, graph);
         let is_asset = path.is_some_and(|path| is_asset_file(&path));
-        let kind = if is_asset && !raw {
+        let kind = if is_asset && !reading.raw {
             EdgeKind::Asset
         } else {
             EdgeKind::Import
@@ -218,6 +235,10 @@ impl Edges {
         };
 
         self.covered.insert(file);
+        self.dispatch
+            .entry(edge)
+            .and_modify(|all_dispatch| *all_dispatch &= dispatch)
+            .or_insert(dispatch);
 
         match self.edges.entry(edge) {
             Entry::Vacant(entry) => {
@@ -229,8 +250,22 @@ impl Edges {
 
     fn flush(self, graph: &mut GraphBuilder) {
         for (edge, through) in self.edges {
+            if self.dispatch.get(&edge) == Some(&true) {
+                graph.mark_dispatch(edge);
+            }
+
             graph.add_symbol_edge_through(edge, through);
         }
+    }
+}
+
+fn is_registry(resolved: &Resolved, modules: &[Module]) -> bool {
+    match resolved {
+        Resolved::Symbol { module, symbol } => matches!(
+            modules[*module].symbols.symbols[*symbol].shape,
+            Some(Shape::Object { .. })
+        ),
+        Resolved::Runs { .. } | Resolved::Namespace(_) | Resolved::Whole { .. } => false,
     }
 }
 
@@ -266,7 +301,13 @@ pub(crate) fn add_symbols(
 
     let module_files: Vec<FileId> = modules
         .iter()
-        .map(|module| graph.add_file(module.path.clone()))
+        .map(|module| {
+            let file = graph.add_file(module.path.clone());
+
+            graph.add_commands(file, module.symbols.commands.clone());
+
+            file
+        })
         .collect();
     let symbol_ids: Vec<Vec<SymbolId>> = modules
         .iter()
@@ -305,22 +346,39 @@ pub(crate) fn add_symbols(
         for resolved_use in resolver.resolved_uses(module) {
             edges.add(
                 module_symbol_ids[resolved_use.dependent],
-                (resolved_use.reached, resolved_use.raw),
+                (resolved_use.reached, resolved_use.reading),
                 &mut targets,
                 &resolver.modules,
                 graph,
             );
         }
 
-        for (member, local_symbol) in resolver.modules[module].symbols.symbols.iter().enumerate() {
-            if let Some(membership) = &local_symbol.member {
-                edges.edges.insert(
-                    SymbolEdge {
-                        dependent: module_symbol_ids[membership.owner],
-                        dependency: SymbolTarget::Symbol(module_symbol_ids[member]),
-                        kind: EdgeKind::Import,
+        let local_symbols = &resolver.modules[module].symbols.symbols;
+
+        for (member, local_symbol) in local_symbols.iter().enumerate() {
+            let Some(membership) = &local_symbol.member else {
+                continue;
+            };
+
+            edges.edges.insert(
+                SymbolEdge {
+                    dependent: module_symbol_ids[membership.owner],
+                    dependency: SymbolTarget::Symbol(module_symbol_ids[member]),
+                    kind: EdgeKind::Import,
+                },
+                Vec::new(),
+            );
+
+            if matches!(
+                local_symbols[membership.owner].shape,
+                Some(Shape::Object { .. })
+            ) {
+                graph.add_membership(
+                    module_symbol_ids[member],
+                    CoreMembership {
+                        owner: module_symbol_ids[membership.owner],
+                        key: membership.key.clone(),
                     },
-                    Vec::new(),
                 );
             }
         }
@@ -464,13 +522,13 @@ impl<'l> Resolver<'l> {
 
         for (dependent, local_symbol) in symbols.symbols.iter().enumerate() {
             for symbol_use in &local_symbol.uses {
-                let raw = is_raw(symbols, symbol_use);
+                let reading = Reading::of(symbols, symbol_use);
 
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
                     |reached| ResolvedUse {
                         dependent,
                         reached,
-                        raw,
+                        reading,
                     },
                 ));
             }
@@ -482,26 +540,29 @@ impl<'l> Resolver<'l> {
             }
 
             for symbol_use in &held.uses {
-                let raw = is_raw(symbols, symbol_use);
+                let reading = Reading::of(symbols, symbol_use);
 
                 resolved_uses.extend(self.resolve_use(module, symbol_use).into_iter().map(
                     |reached| ResolvedUse {
                         dependent: ModuleSymbols::INIT,
                         reached,
-                        raw,
+                        reading,
                     },
                 ));
             }
         }
 
         for specifier in &symbols.loads {
-            let raw = specifier.contains(RAW_IMPORT_QUERY);
+            let reading = Reading {
+                raw: specifier.contains(RAW_IMPORT_QUERY),
+                keyed: false,
+            };
 
             resolved_uses.extend(self.load(module, specifier).into_iter().map(|resolved| {
                 ResolvedUse {
                     dependent: ModuleSymbols::INIT,
                     reached: Reached::direct(resolved),
-                    raw,
+                    reading,
                 }
             }));
         }
@@ -509,7 +570,7 @@ impl<'l> Resolver<'l> {
         resolved_uses
     }
 
-    fn runs_uses(&mut self, module: usize, symbol: usize) -> Vec<(Reached, bool)> {
+    fn runs_uses(&mut self, module: usize, symbol: usize) -> Vec<(Reached, Reading)> {
         let symbols: &'l ModuleSymbols = self.modules[module].symbols;
         let Some(runs) = &symbols.symbols[symbol].runs else {
             return Vec::new();
@@ -523,12 +584,12 @@ impl<'l> Resolver<'l> {
         let mut reached = Vec::new();
 
         for symbol_use in runs.uses.iter().chain(held_uses) {
-            let raw = is_raw(symbols, symbol_use);
+            let reading = Reading::of(symbols, symbol_use);
 
             reached.extend(
                 self.resolve_use(module, symbol_use)
                     .into_iter()
-                    .map(|resolved| (resolved, raw)),
+                    .map(|resolved| (resolved, reading)),
             );
         }
 
@@ -1084,6 +1145,7 @@ impl<'l> Resolver<'l> {
                 .into_iter()
                 .map(|reached| self.called(reached, SymbolKind::Class))
                 .collect(),
+            Use::Keyed(read) => self.resolve_use(module, read),
             Use::Import { binding, member } => {
                 let binding = &self.local_imports(module)[*binding];
                 let mut reached = Vec::new();
@@ -1329,7 +1391,21 @@ fn is_raw(symbols: &ModuleSymbols, symbol_use: &Use) -> bool {
             .specifier
             .contains(RAW_IMPORT_QUERY),
         Use::Module(specifier) | Use::Load(specifier) => specifier.contains(RAW_IMPORT_QUERY),
-        Use::Call(called) | Use::New(called) => is_raw(symbols, called),
+        Use::Call(called) | Use::New(called) | Use::Keyed(called) => is_raw(symbols, called),
         Use::Local(_) | Use::Member { .. } | Use::This { .. } | Use::Super { .. } => false,
+    }
+}
+
+fn is_keyed(symbol_use: &Use) -> bool {
+    match symbol_use {
+        Use::Keyed(_) => true,
+        Use::Call(called) | Use::New(called) => is_keyed(called),
+        Use::Local(_)
+        | Use::Import { .. }
+        | Use::Module(_)
+        | Use::Load(_)
+        | Use::Member { .. }
+        | Use::This { .. }
+        | Use::Super { .. } => false,
     }
 }

@@ -42,6 +42,7 @@ enum UseKey<'m> {
     Super(&'m str, &'m str, Place),
     Call(Box<UseKey<'m>>),
     New(Box<UseKey<'m>>),
+    Keyed(Box<UseKey<'m>>),
 }
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -424,6 +425,7 @@ fn use_key<'m>(module: &'m ModuleSymbols, symbol_use: &'m Use) -> UseKey<'m> {
         } => UseKey::Super(name(*class), member, *place),
         Use::Call(called) => UseKey::Call(Box::new(use_key(module, called))),
         Use::New(constructed) => UseKey::New(Box::new(use_key(module, constructed))),
+        Use::Keyed(read) => UseKey::Keyed(Box::new(use_key(module, read))),
     }
 }
 

@@ -1279,6 +1279,56 @@ fn scan_reports_import_cycles_and_what_is_left_of_them_at_symbol_level() {
 }
 
 #[test]
+fn scan_reports_objects_read_by_key_and_commands_without_narrowing() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.write(
+        "src/handlers.ts",
+        "export const handlers = { list: () => 1, add: () => 2 };\n",
+    );
+    repository.write(
+        "src/dispatch.ts",
+        "import { handlers } from \"./handlers\";\nexport const dispatch = (method: \"list\" | \"add\") => handlers[method]();\n",
+    );
+    repository.write(
+        "src/cli.ts",
+        "import type { Command } from \"commander\";\nexport function register(program: Command) {\n  program.command(\"agents\").command(\"add\").action(() => 1);\n}\n",
+    );
+    repository.commit_all("anchors");
+
+    let run = repository.prober(&["scan", "--format", "json"]);
+
+    assert_eq!(run.exit_code, 0);
+    assert_eq!(
+        run.json()["anchors"],
+        json!({
+            "registries": [{
+                "registry": "handlers",
+                "file": "src/handlers.ts",
+                "keys": 2,
+                "readers": ["dispatch in src/dispatch.ts"],
+            }],
+            "commands": [{ "file": "src/cli.ts", "commands": ["agents", "agents add"] }],
+        })
+    );
+
+    let text_run = repository.prober(&["scan"]);
+
+    assert!(
+        text_run.stdout.contains(
+            "String anchors: 1 objects read by a runtime key (2 keys), 2 commands in 1 files; reported, not used to narrow: the keys a test dispatches and the commands it launches can come from helpers, clients and data Prober cannot read
+  keys  object
+     2  handlers in src/handlers.ts, read by key by dispatch in src/dispatch.ts
+  commands  file
+         2  src/cli.ts
+"
+        ),
+        "{}",
+        text_run.stdout
+    );
+}
+
+#[test]
 fn scan_outside_a_repository_fails() {
     let directory = TempDir::new().unwrap();
     let run = run_prober(directory.path(), &["scan"], None, &[]);

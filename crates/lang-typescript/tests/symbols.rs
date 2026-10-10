@@ -568,3 +568,90 @@ fn options_handed_to_factories_and_constructors_that_keep_them_stay_out_of_load(
         ]
     );
 }
+
+#[test]
+fn objects_read_by_a_runtime_key_are_reported_with_their_readers_and_commands() {
+    let project = TestProject::new(&[
+        (
+            "src/handlers.ts",
+            r#"
+                export const handlers = { list: () => 1, add: () => 2, ...extra };
+                const extra = { remove: () => 3 };
+            "#,
+        ),
+        (
+            "src/dispatch.ts",
+            r#"
+                import { handlers } from "./handlers";
+                import * as tools from "./tools";
+
+                export const dispatch = (method: string) => handlers[method]();
+                export const run = (name: string) => tools[name]();
+                export const listed = (method: string) => [Object.keys(handlers), handlers[method]];
+            "#,
+        ),
+        ("src/tools.ts", "export const lint = () => 1;"),
+        (
+            "src/cli.ts",
+            r#"
+                import type { Command } from "commander";
+
+                export function register(program: Command) {
+                    const agents = program.command("agents");
+
+                    agents.command("add").action(() => 1);
+                }
+            "#,
+        ),
+    ]);
+    let graph = project.link_symbols();
+    let mut dispatched: Vec<(String, String)> = graph
+        .dispatch_edges()
+        .map(|edge| {
+            let SymbolTarget::Symbol(registry) = edge.dependency else {
+                unreachable!("only objects are read by key");
+            };
+
+            (
+                graph.symbol(edge.dependent).name.clone(),
+                graph.symbol(registry).name.clone(),
+            )
+        })
+        .collect();
+
+    dispatched.sort();
+
+    assert_eq!(dispatched, [("dispatch".to_owned(), "handlers".to_owned())]);
+
+    let anchors = ScanReport::new(&graph, &project.repo_files(), String::new()).anchors;
+
+    assert_eq!(
+        anchors
+            .registries
+            .iter()
+            .map(|registry| (
+                registry.registry.as_str(),
+                registry.file.as_str(),
+                registry.keys,
+                registry.readers.clone()
+            ))
+            .collect::<Vec<_>>(),
+        [(
+            "handlers",
+            "src/handlers.ts",
+            2,
+            vec!["dispatch in src/dispatch.ts".to_owned()]
+        )]
+    );
+    assert_eq!(
+        anchors
+            .commands
+            .iter()
+            .map(|command_file| (command_file.file.as_str(), command_file.commands.clone()))
+            .collect::<Vec<_>>(),
+        [(
+            "src/cli.ts",
+            vec!["agents".to_owned(), "agents add".to_owned()]
+        )]
+    );
+}
