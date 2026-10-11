@@ -41,6 +41,8 @@ Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwri
 
 ### In GitHub Actions
 
+In a job that runs on pull requests:
+
 ```yaml
 - uses: actions/checkout@v7
 - uses: capsulerun/prober@v0
@@ -50,11 +52,9 @@ Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwri
     TESTS: ${{ steps.prober.outputs.typescript-file }}
 ```
 
-Prober writes the selected test files to `typescript-file`: every test when the change can affect them all (a lockfile or a runner config changed, say), none when it affects no test. The `mode` output (`selected`, `all` or `none`) tells which, for workflows that branch on it.
+Prober writes the selected test files to `typescript-file`: every test when the change can affect them all (a lockfile or a runner config changed, say), none when it affects no test. The `mode` output (`selected`, `all` or `none`) tells which, for workflows that branch on it. For pytest, use `python-file` the same way; for Rust, `rust-file` lists the crates to pass to `cargo test -p`.
 
 ### Run it locally
-
-#### Install
 
 ```bash
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/releases/latest/download/prober-installer.sh | sh
@@ -73,24 +73,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/relea
 > [!NOTE]
 > To pin a version, replace `latest/download` with `download/v0.1.0`.
 
-#### Usages
-
-From the repository, against the branch your change targets:
+Then, from the repository, pass the tests your change can affect, against the branch it targets, to your test runner:
 
 ```bash
-prober --base origin/main
-```
-
-Prober prints the selected test files, one per line, and a summary:
-
-```
-prober: selected 12/840 test files (1.4%)
-```
-
-Pass them to your test runner:
-
-```bash
-prober --base origin/main | xargs npx vitest run
+prober --base origin/main | xargs -r npx vitest run
 ```
 
 ## Documentation
