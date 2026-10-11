@@ -18,6 +18,7 @@ prober-lang-rust = { path = "crates/lang-rust" }
 
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dunce = "1"
 gix = { version = "0.88", default-features = false, features = ["sha1", "revision", "blob-diff", "max-performance-safe"] }
 globset = "0.4"
 json-strip-comments = "3"

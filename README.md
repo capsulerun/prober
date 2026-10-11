@@ -2,7 +2,7 @@
 
 <h1>Prober</h1>
 
-Run only the tests your change can affect.
+**Run only the tests your change can affect.**
 
 [![CI](https://github.com/capsulerun/prober/actions/workflows/ci.yml/badge.svg)](https://github.com/capsulerun/prober/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/capsulerun/prober?include_prereleases&sort=semver)](https://github.com/capsulerun/prober/releases)

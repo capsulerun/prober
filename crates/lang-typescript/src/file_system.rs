@@ -133,7 +133,7 @@ impl RepoFileSystem {
         let real_path = is_installed_path
             .then(|| {
                 Some(
-                    fs::canonicalize(path.parent()?)
+                    dunce::canonicalize(path.parent()?)
                         .ok()?
                         .join(path.file_name()?),
                 )
@@ -299,10 +299,10 @@ impl FileSystem for RepoFileSystem {
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         match self.entry(path) {
-            Entry::Link(target) => fs::canonicalize(target),
-            Entry::Disk(path) => fs::canonicalize(path),
+            Entry::Link(target) => dunce::canonicalize(target),
+            Entry::Disk(path) => dunce::canonicalize(path),
             Entry::Overlay(Some(_)) | Entry::LinkDirectory | Entry::BuildOutput => {
-                fs::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
+                dunce::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
             }
             Entry::Overlay(None) => Err(not_found()),
         }

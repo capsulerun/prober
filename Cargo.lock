@@ -2307,6 +2307,7 @@ name = "prober-lang-typescript"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dunce",
  "globset",
  "json-strip-comments",
  "oxc_allocator",
