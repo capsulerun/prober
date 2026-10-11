@@ -107,10 +107,15 @@ impl RepoFileSystem {
             return false;
         };
 
-        path.strip_prefix(&self.repo_root)
-            .ok()
-            .and_then(Path::to_str)
-            .is_some_and(|relative_path| build_mapping.is_output(relative_path))
+        let Ok(relative_path) = path.strip_prefix(&self.repo_root) else {
+            return false;
+        };
+        let components: Option<Vec<&str>> = relative_path
+            .components()
+            .map(|component| component.as_os_str().to_str())
+            .collect();
+
+        components.is_some_and(|components| build_mapping.is_output(&components.join("/")))
     }
 
     fn overlay_content(&self, path: &Path) -> Option<Option<&[u8]>> {

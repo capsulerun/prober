@@ -44,3 +44,7 @@ yaml-rust2 = { version = "0.13", default-features = false }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+[profile.dist]
+inherits = "release"
+lto = "thin"
