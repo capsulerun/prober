@@ -22,6 +22,7 @@ pub enum SymbolKind {
     ModuleInit,
     Member,
     Call,
+    Fixture,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -52,6 +53,7 @@ pub enum WholeModuleCause {
     DynamicLoad,
     MissingExport,
     Unattributed,
+    Imported,
 }
 
 impl WholeModuleCause {
@@ -62,6 +64,7 @@ impl WholeModuleCause {
             WholeModuleCause::DynamicLoad => "dynamic_load",
             WholeModuleCause::MissingExport => "missing_export",
             WholeModuleCause::Unattributed => "unattributed",
+            WholeModuleCause::Imported => "imported",
         }
     }
 
@@ -72,6 +75,7 @@ impl WholeModuleCause {
             WholeModuleCause::DynamicLoad => "loaded with import() or require()",
             WholeModuleCause::MissingExport => "imported name not found",
             WholeModuleCause::Unattributed => "import no symbol uses",
+            WholeModuleCause::Imported => "imported by a module analysed at file level",
         }
     }
 }

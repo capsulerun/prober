@@ -937,6 +937,39 @@ fn why_and_scan_cover_every_language() {
     assert_eq!(scan["stats"]["tests_total"], 5);
 }
 
+#[test]
+fn a_fixture_change_selects_the_tests_using_it_and_why_names_the_fixture() {
+    let conftest = "import pytest\n\n\n@pytest.fixture\ndef account():\n    return {\"plan\": \"free\"}\n\n\n@pytest.fixture\ndef invoice():\n    return []\n";
+    let repository = TestRepository::with_files_on_main(&[
+        ("tests/conftest.py", conftest),
+        ("tests/test_account.py", "def test_account(account): ...\n"),
+        ("tests/test_invoice.py", "def test_invoice(invoice): ...\n"),
+    ]);
+
+    repository.change_and_commit("tests/conftest.py", &conftest.replace("free", "pro"));
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["targets"],
+        json!({ "python": ["tests/test_account.py"] })
+    );
+    assert_eq!(
+        repository
+            .prober(&["why", "tests/test_account.py", "--base", "main"])
+            .stdout,
+        "tests/test_account.py is selected:\n  tests/conftest.py (modified)\n  -> account changed\n  -> fixture account used by tests/test_account.py\n"
+    );
+    assert_eq!(
+        repository
+            .prober(&["why", "tests/test_invoice.py", "--base", "main"])
+            .stdout,
+        "tests/test_invoice.py is not selected: it reaches the changed files, but none of the symbols it uses changed ([inference] symbols = false follows files):\n  tests/conftest.py (modified)\n  -> imported by tests/test_invoice.py\n"
+    );
+}
+
 fn repository_with_rules() -> TestRepository {
     let repository = TestRepository::with_files_on_main(&[
         ("fixtures/golden/expected.txt", "v1"),

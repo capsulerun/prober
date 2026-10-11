@@ -1,10 +1,11 @@
 //! What one module tells about imports, computed imports and file access, as expressions independent of the syntax tree.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use prober_core::files::RepoPath;
 
 use crate::modules::ImportTarget;
+use crate::pytest::items::PytestItems;
 
 pub(crate) type FunctionIndex = usize;
 
@@ -105,6 +106,8 @@ pub(crate) struct ModuleSummary {
     pub escapes: Vec<Expr>,
     pub unresolved_attributes: BTreeSet<String>,
     pub strings: Vec<(u32, String)>,
+    pub pytest: PytestItems,
+    pub setting_lists: BTreeMap<String, Vec<String>>,
 }
 
 impl ModuleSummary {

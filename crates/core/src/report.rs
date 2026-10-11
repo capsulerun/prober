@@ -768,6 +768,18 @@ fn describe_use(graph: &Graph, edge: &SymbolEdge) -> String {
                 )
             }
         }
+        SymbolTarget::Symbol(used) if graph.symbol(used).kind == SymbolKind::Fixture => {
+            let used = graph.symbol(used);
+
+            if at_load {
+                format!("-> fixture {} used by {user_file}", used.name)
+            } else {
+                format!(
+                    "-> fixture {} used by {} in {user_file}",
+                    used.name, user.name
+                )
+            }
+        }
         SymbolTarget::Symbol(used) => {
             let used = graph.symbol(used);
 
@@ -787,6 +799,10 @@ fn describe_use(graph: &Graph, edge: &SymbolEdge) -> String {
                 format!("-> imported as an asset by {} in {user_file}", user.name)
             }
         }
+        SymbolTarget::Module {
+            cause: WholeModuleCause::Imported,
+            ..
+        } if at_load => format!("-> imported by {user_file}"),
         SymbolTarget::Module { file, cause } => {
             let why = match (cause, graph.fallback_of(file)) {
                 (WholeModuleCause::NotAnalysed, Some(fallback)) => {

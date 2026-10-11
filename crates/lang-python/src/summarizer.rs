@@ -12,7 +12,9 @@ use ruff_python_ast::{
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
+use crate::django::setting_lists;
 use crate::modules::{ImportTarget, ModuleIndex};
+use crate::pytest::items::{PytestItems, pytest_items};
 use crate::summary::{
     CallSite, Expr, FunctionIndex, FunctionSummary, ModuleRef, ModuleSummary, Site, SiteKind,
     StaticImport,
@@ -147,6 +149,12 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
             .map(|function| summarizer.function_summary(function))
             .collect(),
         bindings: summarizer.module_bindings(),
+        setting_lists: setting_lists(module),
+        pytest: if !parsed.errors().is_empty() {
+            PytestItems::default()
+        } else {
+            pytest_items(module, source)
+        },
         ..ModuleSummary::default()
     };
     let mut visitor = SummaryVisitor {

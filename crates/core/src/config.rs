@@ -84,10 +84,12 @@ impl Default for InferenceSettings {
 
 pub const PRESETS: &[&str] = &[
     "cypress",
+    "django",
     "jest",
     "mocha",
     "node-test",
     "playwright",
+    "pytest",
     "vite",
     "vitest",
 ];
@@ -434,8 +436,8 @@ mod tests {
                 "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
             ),
             (
-                "presets = [\"vitest\", \"pytest\"]\n",
-                "invalid prober.toml: unknown preset \"pytest\", expected \"auto\" or some of cypress, jest, mocha, node-test, playwright, vite, vitest",
+                "presets = [\"vitest\", \"nose\"]\n",
+                "invalid prober.toml: unknown preset \"nose\", expected \"auto\" or some of cypress, django, jest, mocha, node-test, playwright, pytest, vite, vitest",
             ),
             (
                 "presets = 3\n",
