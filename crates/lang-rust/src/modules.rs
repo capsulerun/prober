@@ -1,5 +1,6 @@
 //! Module trees from each crate target and the files a path reaches through them: child modules, use bindings, globs, extern crates and re-exports, with macros, proc-macro crates and build scripts reaching whole crates.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use prober_core::files::RepoPath;
@@ -67,6 +68,17 @@ pub(crate) struct ModuleGraph<'g> {
     macros: HashMap<String, Vec<(RepoPath, bool)>>,
     crate_files: Vec<BTreeSet<RepoPath>>,
     lib_files: Vec<BTreeSet<RepoPath>>,
+    reexport_cache: RefCell<HashMap<(ModuleId, String), BTreeSet<Dependency>>>,
+    reexport_lookups: RefCell<HashSet<(ModuleId, String)>>,
+    glob_cache: RefCell<HashMap<ModuleId, Vec<GlobResolution>>>,
+}
+
+type GlobResolution = (Option<ModuleId>, BTreeSet<Dependency>);
+
+enum Lookup {
+    Found(BTreeSet<Dependency>),
+    InProgress,
+    NotFound,
 }
 
 impl<'g> ModuleGraph<'g> {
@@ -86,6 +98,9 @@ impl<'g> ModuleGraph<'g> {
             macros: HashMap::new(),
             crate_files: vec![BTreeSet::new(); workspace.crates.len()],
             lib_files: vec![BTreeSet::new(); workspace.crates.len()],
+            reexport_cache: RefCell::new(HashMap::new()),
+            reexport_lookups: RefCell::new(HashSet::new()),
+            glob_cache: RefCell::new(HashMap::new()),
         };
 
         for (file, file_facts) in facts {
@@ -552,8 +567,8 @@ impl<'g> ModuleGraph<'g> {
         let rest = &segments[1..];
 
         match first {
-            "crate" => self.walk(tree.root, rest, depth, &mut resolution),
-            "self" => self.walk(from, rest, depth, &mut resolution),
+            "crate" => self.walk(tree.root, rest, &mut resolution),
+            "self" => self.walk(from, rest, &mut resolution),
             "super" => {
                 let mut current = from;
                 let mut remaining = segments;
@@ -570,12 +585,12 @@ impl<'g> ModuleGraph<'g> {
                     remaining = tail;
                 }
 
-                self.walk(current, remaining, depth, &mut resolution);
+                self.walk(current, remaining, &mut resolution);
             }
             "Self" => {}
             name => {
                 if let Some(&child) = self.modules[from].children.get(name) {
-                    self.walk(child, rest, depth, &mut resolution);
+                    self.walk(child, rest, &mut resolution);
 
                     return resolution;
                 }
@@ -586,7 +601,7 @@ impl<'g> ModuleGraph<'g> {
 
                         match used.module {
                             Some(module) if !rest.is_empty() => {
-                                self.walk(module, rest, depth + 1, &mut resolution);
+                                self.walk(module, rest, &mut resolution);
                             }
                             _ => resolution.dependencies.extend(used.dependencies),
                         }
@@ -601,9 +616,7 @@ impl<'g> ModuleGraph<'g> {
                             let whole = self.workspace.crates[other].proc_macro;
 
                             match self.lib_roots[other] {
-                                Some(root) if !whole => {
-                                    self.walk(root, rest, depth, &mut resolution)
-                                }
+                                Some(root) if !whole => self.walk(root, rest, &mut resolution),
                                 _ => {
                                     resolution.dependencies.insert(Dependency::Crate(other));
                                 }
@@ -623,7 +636,7 @@ impl<'g> ModuleGraph<'g> {
                     if let Some(module) = used.module
                         && let Some(&child) = self.modules[module].children.get(name)
                     {
-                        self.walk(child, rest, depth + 1, &mut resolution);
+                        self.walk(child, rest, &mut resolution);
                     }
                 }
             }
@@ -632,13 +645,7 @@ impl<'g> ModuleGraph<'g> {
         resolution
     }
 
-    fn walk(
-        &self,
-        start: ModuleId,
-        segments: &[String],
-        depth: usize,
-        resolution: &mut Resolution,
-    ) {
+    fn walk(&self, start: ModuleId, segments: &[String], resolution: &mut Resolution) {
         let mut current = start;
 
         for segment in segments {
@@ -663,16 +670,23 @@ impl<'g> ModuleGraph<'g> {
                 continue;
             }
 
-            let reexported = !self.defines(current, segment)
-                && self.reexports(current, segment, depth + 1, resolution, false);
-
-            if !reexported {
+            if self.defines(current, segment) {
                 resolution
                     .dependencies
                     .insert(Dependency::File(self.modules[current].file.clone()));
+            } else {
+                match self.reexported(current, segment) {
+                    Lookup::Found(reexported) => resolution.dependencies.extend(reexported),
+                    Lookup::InProgress => {}
+                    Lookup::NotFound => {
+                        resolution
+                            .dependencies
+                            .insert(Dependency::File(self.modules[current].file.clone()));
 
-                if !self.defines(current, segment) {
-                    self.reexports(current, segment, depth + 1, resolution, true);
+                        for (_, glob_dependencies) in self.glob_resolutions(current) {
+                            resolution.dependencies.extend(glob_dependencies);
+                        }
+                    }
                 }
             }
 
@@ -724,61 +738,78 @@ impl<'g> ModuleGraph<'g> {
         })
     }
 
-    fn reexports(
-        &self,
-        module: ModuleId,
-        item: &str,
-        depth: usize,
-        resolution: &mut Resolution,
-        conservative: bool,
-    ) -> bool {
-        if depth > MAX_DEPTH {
-            return false;
+    fn reexported(&self, module: ModuleId, item: &str) -> Lookup {
+        let key = (module, item.to_owned());
+
+        if let Some(cached) = self.reexport_cache.borrow().get(&key) {
+            return Lookup::Found(cached.clone());
         }
 
+        if !self.reexport_lookups.borrow_mut().insert(key.clone()) {
+            return Lookup::InProgress;
+        }
+
+        let mut dependencies = BTreeSet::new();
         let mut found = false;
 
         for entry in self.scope_uses(module) {
             if entry.binding.as_deref() == Some(item) {
-                let used = self.resolve(&entry.path, module, depth + 1);
-
-                resolution.dependencies.extend(used.dependencies);
+                dependencies.extend(self.resolve(&entry.path, module, 1).dependencies);
                 found = true;
             }
         }
 
-        if found {
-            return true;
+        if !found {
+            for (glob_module, _) in self.glob_resolutions(module) {
+                let Some(glob_module) = glob_module else {
+                    continue;
+                };
+
+                if self.defines(glob_module, item) {
+                    dependencies.insert(Dependency::File(self.modules[glob_module].file.clone()));
+                    found = true;
+                } else if let Lookup::Found(reexported) = self.reexported(glob_module, item) {
+                    dependencies.extend(reexported);
+                    found = true;
+                }
+            }
         }
 
-        let globs: Vec<Resolution> = self
+        self.reexport_lookups.borrow_mut().remove(&key);
+
+        if !found {
+            return Lookup::NotFound;
+        }
+
+        self.reexport_cache
+            .borrow_mut()
+            .insert(key, dependencies.clone());
+
+        Lookup::Found(dependencies)
+    }
+
+    fn glob_resolutions(&self, module: ModuleId) -> Vec<GlobResolution> {
+        if let Some(cached) = self.glob_cache.borrow().get(&module) {
+            return cached.clone();
+        }
+
+        self.glob_cache.borrow_mut().insert(module, Vec::new());
+
+        let resolutions: Vec<GlobResolution> = self
             .scope_uses(module)
             .filter(|entry| entry.glob)
-            .map(|entry| self.resolve(&entry.path, module, depth + 1))
+            .map(|entry| {
+                let resolution = self.resolve(&entry.path, module, 1);
+
+                (resolution.module, resolution.dependencies)
+            })
             .collect();
 
-        for glob in &globs {
-            let Some(glob_module) = glob.module else {
-                continue;
-            };
+        self.glob_cache
+            .borrow_mut()
+            .insert(module, resolutions.clone());
 
-            if self.defines(glob_module, item) {
-                resolution
-                    .dependencies
-                    .insert(Dependency::File(self.modules[glob_module].file.clone()));
-                found = true;
-            } else if self.reexports(glob_module, item, depth + 1, resolution, false) {
-                found = true;
-            }
-        }
-
-        if !found && conservative {
-            for glob in globs {
-                resolution.dependencies.extend(glob.dependencies);
-            }
-        }
-
-        found
+        resolutions
     }
 
     fn scope_uses(&self, module: ModuleId) -> impl Iterator<Item = &UseEntry> {
