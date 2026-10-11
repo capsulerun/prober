@@ -1,10 +1,12 @@
 mod conventions;
+mod django;
 mod evaluator;
 mod families;
 mod linker;
 mod links;
 mod manifests;
 mod modules;
+mod pytest;
 mod summarizer;
 mod summary;
 

@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
 use prober_core::changes::FileChange;
-use prober_core::config::InferenceSettings;
+use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
 use prober_core::frontend::{ChangeSet, Frontend};
 use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
@@ -13,21 +13,32 @@ use prober_core::report::ModeReason;
 use rayon::prelude::*;
 
 use crate::conventions::{
-    ALWAYS_ALL_DEFAULTS, CONFTEST, LANGUAGE, MANIFEST_DEFAULTS, PACKAGE_INIT, is_module_file,
-    is_source_file, is_test_file, is_test_support_file, join_directory, parent_directory,
-    split_path,
+    ALWAYS_ALL_DEFAULTS, CONFTEST, LANGUAGE, MANIFEST_DEFAULTS, PACKAGE_INIT,
+    PYTEST_CONFIG_DEFAULTS, is_module_file, is_source_file, is_test_file, is_test_support_file,
+    join_directory, parent_directory, split_path,
 };
+use crate::django::{installed_app_links, settings_modules};
 use crate::families::naming_families;
 use crate::links::{LinkSettings, Linking};
 use crate::manifests::{DependencyChanges, PACKAGE_NODE_PREFIX};
 use crate::modules::{ImportTarget, ModuleIndex};
+use crate::pytest::configs::{PytestConfigs, is_within};
+use crate::pytest::fixtures::{FixtureScopes, ModuleEdge};
+use crate::pytest::{ConfigChanges, global_plugins, scoped_requests};
 use crate::summarizer::summarize;
 use crate::summary::ModuleSummary;
+
+const PYTEST_PRESET: &str = "pytest";
+
+const DJANGO_PRESET: &str = "django";
 
 pub struct PythonLinker {
     repo_root: PathBuf,
     index: ModuleIndex,
+    configs: PytestConfigs,
     inference: InferenceSettings,
+    pytest: bool,
+    django: bool,
     summaries: OnceLock<HashMap<RepoPath, ModuleSummary>>,
     dependency_changes: DependencyChanges,
 }
@@ -39,11 +50,15 @@ impl PythonLinker {
             .with_context(|| format!("cannot open repository root {}", repo_root.display()))?;
         let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
         let index = ModuleIndex::new(repo_files, &read_head);
+        let configs = PytestConfigs::read(repo_files, &read_head);
 
         Ok(Self {
             repo_root,
             index,
+            configs,
             inference: InferenceSettings::default(),
+            pytest: true,
+            django: true,
             summaries: OnceLock::new(),
             dependency_changes: DependencyChanges::default(),
         })
@@ -51,6 +66,31 @@ impl PythonLinker {
 
     pub fn with_inference(self, inference: InferenceSettings) -> Self {
         Self { inference, ..self }
+    }
+
+    pub fn with_presets(self, presets: &Presets) -> Self {
+        let enabled = |preset: &str| match presets {
+            Presets::Auto => true,
+            Presets::Only(names) => names.iter().any(|name| name == preset),
+        };
+
+        Self {
+            pytest: enabled(PYTEST_PRESET),
+            django: enabled(DJANGO_PRESET),
+            ..self
+        }
+    }
+
+    fn is_test(&self, path: &RepoPath) -> bool {
+        if self.pytest {
+            self.configs.is_test(path)
+        } else {
+            is_test_file(path)
+        }
+    }
+
+    fn read_head(&self, path: &RepoPath) -> Option<String> {
+        fs::read_to_string(self.repo_root.join(path.as_str())).ok()
     }
 
     fn summaries(&self, repo_files: &[RepoPath]) -> Result<&HashMap<RepoPath, ModuleSummary>> {
@@ -73,7 +113,7 @@ impl PythonLinker {
         Ok(self.summaries.get_or_init(|| summaries))
     }
 
-    fn link(&self, change_set: &ChangeSet, graph: &mut GraphBuilder) -> Result<()> {
+    fn link(&self, change_set: &ChangeSet, graph: &mut GraphBuilder) -> Result<Vec<ModeReason>> {
         let repo_files = change_set.repo_files;
         let summaries = self.summaries(repo_files)?;
         let mut modules: Vec<&RepoPath> = summaries.keys().collect();
@@ -85,14 +125,15 @@ impl PythonLinker {
             graph.add_test_support(LANGUAGE, is_test_support_file);
         }
 
-        add_removed_tests(repo_files, change_set.changes, graph);
+        self.add_removed_tests(repo_files, change_set.changes, graph);
 
         let tests: BTreeSet<RepoPath> = modules
             .iter()
-            .filter(|path| is_test_file(path))
+            .filter(|path| self.is_test(path))
             .map(|path| (*path).clone())
             .collect();
         let outside_packages = modules_outside_packages(&modules, &self.index);
+        let mut module_edges: HashMap<RepoPath, Vec<ModuleEdge>> = HashMap::new();
 
         for &module in &modules {
             let file = if tests.contains(module) {
@@ -129,6 +170,14 @@ impl PythonLinker {
                     .into_iter()
                     .filter(|dependency| dependency != module)
                 {
+                    module_edges
+                        .entry(module.clone())
+                        .or_default()
+                        .push(ModuleEdge {
+                            dependency: dependency.clone(),
+                            kind,
+                        });
+
                     let dependency = graph.add_file(dependency);
 
                     graph.add_edge(Edge {
@@ -140,13 +189,44 @@ impl PythonLinker {
             }
         }
 
-        self.add_test_runner_files(repo_files, &tests, graph);
+        self.add_test_runner_files(repo_files, &tests, &mut module_edges, graph);
+
+        let read_head = |path: &RepoPath| self.read_head(path);
+        let settings = if self.django {
+            settings_modules(&self.configs, &self.index, repo_files, &read_head)
+        } else {
+            Vec::new()
+        };
+
+        for setting in &settings {
+            for test in tests
+                .iter()
+                .filter(|test| is_within(test.as_str(), &setting.directory))
+            {
+                let test_file = graph.add_file(test.clone());
+                let settings_file = graph.add_file(setting.module.clone());
+
+                graph.add_edge(Edge {
+                    dependent: test_file,
+                    dependency: settings_file,
+                    kind: EdgeKind::Import,
+                });
+                module_edges
+                    .entry(test.clone())
+                    .or_default()
+                    .push(ModuleEdge {
+                        dependency: setting.module.clone(),
+                        kind: EdgeKind::Import,
+                    });
+            }
+        }
 
         let links = Linking {
             repo_root: &self.repo_root,
             repo_files,
             index: &self.index,
             summaries,
+            tests: &tests,
             settings: LinkSettings {
                 dynamic_imports: self.inference.dynamic_imports,
                 plugin_folders: self.inference.plugin_folders,
@@ -155,7 +235,9 @@ impl PythonLinker {
         }
         .links()?;
 
-        for link in links.links {
+        let app_links = installed_app_links(&settings, summaries, &self.index);
+
+        for link in links.links.into_iter().chain(app_links) {
             let reader = graph.add_file(link.reader);
             let file = graph.add_file(link.file);
             let edge = Edge {
@@ -215,13 +297,37 @@ impl PythonLinker {
             );
         }
 
-        Ok(())
+        if !self.pytest {
+            return Ok(Vec::new());
+        }
+
+        if self.inference.symbols {
+            FixtureScopes {
+                summaries,
+                index: &self.index,
+                tests: &tests,
+                global_plugins: global_plugins(&self.configs, &self.index, repo_files, &read_head),
+                scoped_requests: scoped_requests(&self.configs),
+                module_edges: &module_edges,
+            }
+            .add_to(graph, change_set.changes, change_set.base)?;
+        }
+
+        ConfigChanges {
+            configs: &self.configs,
+            tests: &tests,
+            changes: change_set.changes,
+            base: change_set.base,
+            read_head: &read_head,
+        }
+        .add_to(graph)
     }
 
     fn add_test_runner_files(
         &self,
         repo_files: &[RepoPath],
         tests: &BTreeSet<RepoPath>,
+        module_edges: &mut HashMap<RepoPath, Vec<ModuleEdge>>,
         graph: &mut GraphBuilder,
     ) {
         let conftests: HashSet<&str> = repo_files
@@ -245,6 +351,16 @@ impl PythonLinker {
                 }
 
                 in_package = in_package && self.index.contains(&init);
+
+                if in_package && let Ok(init) = RepoPath::new(init.clone()) {
+                    module_edges
+                        .entry(test.clone())
+                        .or_default()
+                        .push(ModuleEdge {
+                            dependency: init,
+                            kind: EdgeKind::Import,
+                        });
+                }
 
                 if in_package {
                     runner_files.push(init);
@@ -284,10 +400,16 @@ impl Frontend for PythonLinker {
         } else {
             MANIFEST_DEFAULTS
         };
+        let config_patterns = if self.pytest {
+            &[][..]
+        } else {
+            PYTEST_CONFIG_DEFAULTS
+        };
 
         ALWAYS_ALL_DEFAULTS
             .iter()
             .chain(manifest_patterns)
+            .chain(config_patterns)
             .copied()
             .collect()
     }
@@ -295,7 +417,7 @@ impl Frontend for PythonLinker {
     fn test_files(&self, repo_files: &[RepoPath]) -> Vec<RepoPath> {
         repo_files
             .iter()
-            .filter(|path| is_test_file(path))
+            .filter(|path| is_source_file(path) && self.is_test(path))
             .cloned()
             .collect()
     }
@@ -317,8 +439,13 @@ impl Frontend for PythonLinker {
         let repo_root = &self.repo_root;
         let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
 
-        self.dependency_changes =
-            DependencyChanges::between(&read_head, change_set.changes, change_set.base, &imported)?;
+        self.dependency_changes = DependencyChanges::between(
+            &read_head,
+            change_set.changes,
+            change_set.base,
+            &imported,
+            self.pytest,
+        )?;
 
         Ok(self.dependency_changes.global_reasons().to_vec())
     }
@@ -328,9 +455,7 @@ impl Frontend for PythonLinker {
         change_set: &ChangeSet,
         graph: &mut GraphBuilder,
     ) -> Result<Vec<ModeReason>> {
-        self.link(change_set, graph)?;
-
-        Ok(Vec::new())
+        self.link(change_set, graph)
     }
 }
 
@@ -369,14 +494,21 @@ fn modules_outside_packages<'m>(
     outside
 }
 
-fn add_removed_tests(repo_files: &[RepoPath], changes: &[FileChange], graph: &mut GraphBuilder) {
-    let present: HashSet<&RepoPath> = repo_files.iter().collect();
+impl PythonLinker {
+    fn add_removed_tests(
+        &self,
+        repo_files: &[RepoPath],
+        changes: &[FileChange],
+        graph: &mut GraphBuilder,
+    ) {
+        let present: HashSet<&RepoPath> = repo_files.iter().collect();
 
-    for removed_test in changes
-        .iter()
-        .flat_map(FileChange::touched_paths)
-        .filter(|path| !present.contains(path) && is_test_file(path))
-    {
-        graph.add_removed_test(removed_test.clone());
+        for removed_test in changes
+            .iter()
+            .flat_map(FileChange::touched_paths)
+            .filter(|path| !present.contains(path) && is_source_file(path) && self.is_test(path))
+        {
+            graph.add_removed_test(removed_test.clone());
+        }
     }
 }

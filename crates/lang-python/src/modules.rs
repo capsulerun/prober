@@ -145,6 +145,19 @@ impl ModuleIndex {
         self.files.contains(path)
     }
 
+    pub fn files_under(&self, directory: &str) -> impl Iterator<Item = &str> {
+        let prefix = format!("{directory}/");
+        let mut files: Vec<&str> = self
+            .files
+            .iter()
+            .map(String::as_str)
+            .filter(|file| file.starts_with(&prefix))
+            .collect();
+
+        files.sort_unstable();
+        files.into_iter()
+    }
+
     pub fn is_directory(&self, path: &str) -> bool {
         path.is_empty() || self.directories.contains(path)
     }

@@ -281,7 +281,8 @@ impl Workspace {
 
         if self.holds(prober_lang_python::is_source_file) {
             let linker = PythonLinker::new(&self.repo_root, &self.repo_files)?
-                .with_inference(config.inference);
+                .with_inference(config.inference)
+                .with_presets(&config.presets);
 
             frontends.push(Box::new(linker));
         }

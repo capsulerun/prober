@@ -293,3 +293,19 @@ fn a_helper_called_through_an_unresolved_attribute_keeps_its_own_glob() {
         [("tests/common.py", EdgeKind::Reads)]
     );
 }
+
+#[test]
+fn a_test_module_named_in_a_string_is_not_loaded_by_the_code_naming_it() {
+    let project = TestProject::new(&[
+        ("tests/__init__.py", ""),
+        ("tests/conftest.py", "from tests.ignored import IGNORED\n"),
+        ("tests/ignored.py", "IGNORED = [\"tests.test_flaky\"]\n"),
+        ("tests/test_flaky.py", "def test_flaky(): ...\n"),
+        ("tests/test_other.py", "def test_other(): ...\n"),
+    ]);
+
+    assert_eq!(
+        project.selected_by("tests/test_flaky.py"),
+        ["tests/test_flaky.py"]
+    );
+}

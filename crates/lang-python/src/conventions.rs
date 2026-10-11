@@ -7,12 +7,11 @@ pub const LANGUAGE: &str = "python";
 pub const ALWAYS_ALL_DEFAULTS: &[&str] = &[
     "**/.python-version",
     "**/setup.py",
-    "**/setup.cfg",
-    "**/pytest.ini",
-    "**/tox.ini",
     "**/sitecustomize.py",
     "**/usercustomize.py",
 ];
+
+pub const PYTEST_CONFIG_DEFAULTS: &[&str] = &["**/setup.cfg", "**/pytest.ini", "**/tox.ini"];
 
 pub const MANIFEST_DEFAULTS: &[&str] = &[
     "**/pyproject.toml",

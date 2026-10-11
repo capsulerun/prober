@@ -118,8 +118,11 @@ impl TestProject {
         }
 
         let mut builder = GraphBuilder::default();
+        let root_scope_reasons = linker.add_links(&change_set, &mut builder).unwrap();
 
-        linker.add_links(&change_set, &mut builder).unwrap();
+        if !root_scope_reasons.is_empty() {
+            return Outcome::All(root_scope_reasons.iter().map(ModeReason::message).collect());
+        }
 
         let graph = builder.build();
         let selected_tests = select_tests(&graph, changes, Widening::Scoped);

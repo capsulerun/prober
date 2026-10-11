@@ -89,6 +89,7 @@ pub(crate) struct Linking<'l> {
     pub repo_files: &'l [RepoPath],
     pub index: &'l ModuleIndex,
     pub summaries: &'l HashMap<RepoPath, ModuleSummary>,
+    pub tests: &'l BTreeSet<RepoPath>,
     pub settings: LinkSettings,
 }
 
@@ -101,6 +102,7 @@ impl Linking<'_> {
         let file_set: HashSet<&str> = self.repo_files.iter().map(RepoPath::as_str).collect();
         let directories = directories(self.repo_files);
         let resolution = Resolution {
+            tests: self.tests,
             file_set: &file_set,
             directories: &directories,
             sorted_files: &sorted_files,
@@ -163,7 +165,13 @@ impl Linking<'_> {
 
             for (line, text) in &summary.strings {
                 if self.settings.dynamic_imports {
-                    resolution.dotted_string(module, *line, text, &mut links);
+                    let kind = if summary.pytest.plugins.contains(text) {
+                        EdgeKind::Import
+                    } else {
+                        EdgeKind::Dynamic
+                    };
+
+                    resolution.dotted_string(module, *line, text, kind, &mut links);
                 }
 
                 if self.settings.files {
@@ -211,7 +219,7 @@ impl Linking<'_> {
                 };
                 let line = text[..offset].matches('\n').count() as u32 + 1;
 
-                for file in files {
+                for file in files.into_iter().filter(|file| !self.tests.contains(file)) {
                     listed.push(Link {
                         reader: data_file.clone(),
                         file,
@@ -271,6 +279,7 @@ struct Reading<'r> {
 }
 
 struct Resolution<'r> {
+    tests: &'r BTreeSet<RepoPath>,
     file_set: &'r HashSet<&'r str>,
     directories: &'r HashSet<String>,
     sorted_files: &'r [&'r RepoPath],
@@ -494,7 +503,14 @@ impl Resolution<'_> {
             .copied()
     }
 
-    fn dotted_string(&self, module: &RepoPath, line: u32, text: &str, links: &mut Links) {
+    fn dotted_string(
+        &self,
+        module: &RepoPath,
+        line: u32,
+        text: &str,
+        kind: EdgeKind,
+        links: &mut Links,
+    ) {
         let segments: Vec<&str> = text.split('.').collect();
         let is_dotted = segments.len() >= 2
             && segments.iter().all(|segment| is_identifier(segment))
@@ -505,11 +521,14 @@ impl Resolution<'_> {
         }
 
         if let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) {
-            for file in files.into_iter().filter(|file| file != module) {
+            for file in files
+                .into_iter()
+                .filter(|file| file != module && !self.tests.contains(file))
+            {
                 links.links.push(Link {
                     reader: module.clone(),
                     file,
-                    kind: EdgeKind::Dynamic,
+                    kind,
                     inference: Inference {
                         line,
                         kind: MODULE_PATH,

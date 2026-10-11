@@ -9,6 +9,7 @@ use prober_core::report::ModeReason;
 use toml::Value;
 
 use crate::conventions::split_path;
+use crate::pytest::configs::sections_without_pytest;
 
 pub(crate) const PACKAGE_NODE_PREFIX: &str = "site-packages/";
 
@@ -19,6 +20,25 @@ const PIPFILE: &str = "Pipfile";
 const PIPFILE_LOCK: &str = "Pipfile.lock";
 
 const TOML_LOCKFILES: [&str; 3] = ["uv.lock", "poetry.lock", "pdm.lock"];
+
+const TOX_INI: &str = "tox.ini";
+
+const SETUP_CFG: &str = "setup.cfg";
+
+const SECTIONS_WITHOUT_EFFECT: &[&str] = &[
+    "bdist_wheel",
+    "bumpversion",
+    "codespell",
+    "coverage",
+    "flake8",
+    "isort",
+    "metadata",
+    "mypy",
+    "pycodestyle",
+    "pydocstyle",
+    "pylint",
+    "tool:isort",
+];
 
 const PROJECT_FIELDS_WITHOUT_EFFECT: [&str; 12] = [
     "name",
@@ -135,12 +155,13 @@ impl DependencyChanges {
         changes: &[FileChange],
         base: &dyn BaseRevision,
         imported: &HashSet<String>,
+        pytest: bool,
     ) -> Result<Self> {
         let mut dependency_changes = DependencyChanges::default();
         let mut distributions = Vec::new();
 
         for change in changes {
-            let Some(kind) = manifest_kind(&change.path) else {
+            let Some(kind) = manifest_kind(&change.path, pytest) else {
                 continue;
             };
             let base_path = match &change.kind {
@@ -158,6 +179,7 @@ impl DependencyChanges {
                     .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
             };
             let diffed = diff_manifest(
+                &change.path,
                 kind,
                 head_text.as_deref().unwrap_or_default(),
                 base_text.as_deref().unwrap_or_default(),
@@ -261,18 +283,20 @@ impl DependencyChanges {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ManifestKind {
-    Project,
+    Project { pytest: bool },
+    Ini,
     Pipfile,
     PipfileLock,
     TomlLockfile,
     Requirements,
 }
 
-fn manifest_kind(path: &RepoPath) -> Option<ManifestKind> {
+fn manifest_kind(path: &RepoPath, pytest: bool) -> Option<ManifestKind> {
     let (directory, name) = split_path(path.as_str());
 
     match name {
-        PROJECT_MANIFEST => Some(ManifestKind::Project),
+        PROJECT_MANIFEST => Some(ManifestKind::Project { pytest }),
+        TOX_INI | SETUP_CFG if pytest => Some(ManifestKind::Ini),
         PIPFILE => Some(ManifestKind::Pipfile),
         PIPFILE_LOCK => Some(ManifestKind::PipfileLock),
         name if TOML_LOCKFILES.contains(&name) => Some(ManifestKind::TomlLockfile),
@@ -296,15 +320,37 @@ struct ManifestDiff {
     distributions: BTreeMap<String, (String, BTreeSet<String>)>,
 }
 
-fn diff_manifest(kind: ManifestKind, head: &str, base: &str) -> Result<ManifestDiff> {
+fn diff_manifest(
+    path: &RepoPath,
+    kind: ManifestKind,
+    head: &str,
+    base: &str,
+) -> Result<ManifestDiff> {
     let mut diff = ManifestDiff::default();
 
     match kind {
-        ManifestKind::Project => {
+        ManifestKind::Project { pytest } => {
             let head = parse_toml(head)?;
             let base = parse_toml(base)?;
 
-            diff_project(&head, &base, &mut diff);
+            diff_project(&head, &base, pytest, &mut diff);
+        }
+        ManifestKind::Ini => {
+            let head = sections_without_pytest(path, head);
+            let base = sections_without_pytest(path, base);
+            let sections: BTreeSet<&String> = head.keys().chain(base.keys()).collect();
+
+            for section in sections {
+                let without_effect = SECTIONS_WITHOUT_EFFECT.iter().any(|prefix| {
+                    section == prefix
+                        || section.starts_with(&format!("{prefix}:"))
+                        || section.starts_with(&format!("{prefix}-"))
+                });
+
+                if head.get(section) != base.get(section) && !without_effect {
+                    diff.global_fields.push(format!("[{section}]"));
+                }
+            }
         }
         ManifestKind::Pipfile => {
             let head = parse_toml(head)?;
@@ -365,7 +411,7 @@ fn diff_manifest(kind: ManifestKind, head: &str, base: &str) -> Result<ManifestD
     Ok(diff)
 }
 
-fn diff_project(head: &Value, base: &Value, diff: &mut ManifestDiff) {
+fn diff_project(head: &Value, base: &Value, pytest: bool, diff: &mut ManifestDiff) {
     for key in changed_keys(head, base) {
         match key.as_str() {
             "project" => {
@@ -396,7 +442,7 @@ fn diff_project(head: &Value, base: &Value, diff: &mut ManifestDiff) {
                 let base_tool = base.get("tool");
 
                 for tool in changed_keys_of(head_tool, base_tool) {
-                    if TOOLS_WITHOUT_EFFECT.contains(&tool.as_str()) {
+                    if TOOLS_WITHOUT_EFFECT.contains(&tool.as_str()) || pytest && tool == "pytest" {
                         continue;
                     }
 
@@ -777,6 +823,7 @@ mod tests {
             &[modified(path)],
             &Base(vec![(path, base)]),
             &imported,
+            false,
         )
         .unwrap()
     }
