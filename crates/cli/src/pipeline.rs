@@ -10,6 +10,7 @@ use clap::ValueEnum;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{AlwaysAll, Config, Presets, config_hash};
 use prober_core::files::RepoPath;
+use prober_core::frontend::{ChangeSet, Frontend};
 use prober_core::graph::{Graph, GraphBuilder};
 use prober_core::report::{
     AlwaysRunTest, CONFIG_FILE_NAME, ModeReason, Report, SELECTION_VARIABLE,
@@ -18,13 +19,24 @@ use prober_core::rules::ConfigWarning;
 use prober_core::scan::ScanReport;
 use prober_core::select::{Widening, select_tests};
 use prober_core::unhandled::unhandled_changes;
-use prober_lang_typescript::{
-    ALWAYS_ALL_DEFAULTS, LANGUAGE, LinkChanges, MANIFEST_DEFAULTS, ManifestChanges,
-    TypeScriptLinker, is_test_file,
-};
+use prober_lang_python::PythonLinker;
+use prober_lang_typescript::TypeScriptLinker;
 use prober_vcs::GitRepository;
 
 const FORCED_SELECTION: &str = "all";
+
+type TestFileNames = (&'static str, fn(&RepoPath) -> bool);
+
+const TEST_FILE_NAMES: [TestFileNames; 2] = [
+    (
+        prober_lang_typescript::LANGUAGE,
+        prober_lang_typescript::is_test_file,
+    ),
+    (
+        prober_lang_python::LANGUAGE,
+        prober_lang_python::is_test_file,
+    ),
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OnError {
@@ -103,10 +115,13 @@ pub fn scan(directory: &Path) -> Result<ScanReport> {
     let workspace = Workspace::open(directory, "HEAD")?;
     let config_text = workspace.read_config()?;
     let config = Config::parse(&config_text)?;
-    let linker = workspace.linker(&config)?;
+    let frontends = workspace.frontends(&config)?;
+    let change_set = ChangeSet::unchanged(&workspace.repo_files);
     let mut builder = GraphBuilder::default();
 
-    linker.link(&workspace.repo_files, &mut builder)?;
+    for frontend in &frontends {
+        frontend.add_links(&change_set, &mut builder)?;
+    }
 
     let rule_report = config.rules.apply(&mut builder, &workspace.repo_files, &[]);
     let graph = builder.build();
@@ -169,24 +184,29 @@ impl Workspace {
         let resolved_revisions = self
             .repository
             .resolve_revisions(&revisions.base, &revisions.head)?;
-        let linker = self.linker(&config)?;
-        let mut global_reasons =
-            always_all_reasons(&config, &changes, &linker.global_config_patterns())?;
+        let mut frontends = self.frontends(&config)?;
         let merge_base = MergeBase {
             repository: &self.repository,
             commit: &resolved_revisions.merge_base,
         };
-        let manifest_changes = if config.inference.manifests {
-            ManifestChanges::between(&self.repo_root, &self.repo_files, &changes, &merge_base)?
-        } else {
-            ManifestChanges::default()
+        let change_set = ChangeSet {
+            repo_files: &self.repo_files,
+            changes: &changes,
+            base: &merge_base,
         };
+        let built_in_patterns: Vec<&str> = frontends
+            .iter()
+            .flat_map(|frontend| frontend.always_all_patterns())
+            .collect();
+        let mut global_reasons = always_all_reasons(&config, &changes, &built_in_patterns)?;
 
-        global_reasons.extend_from_slice(manifest_changes.global_reasons());
+        for frontend in &mut frontends {
+            global_reasons.extend(frontend.diff_manifests(&change_set)?);
+        }
 
         if !global_reasons.is_empty() {
             let report = self
-                .run_all(Some(&linker), global_reasons, config_hash)
+                .run_all(Some(&frontends), global_reasons, config_hash)
                 .with_revisions(resolved_revisions)
                 .with_unhandled(unhandled_changes(None, &changes), changes.len());
 
@@ -197,14 +217,13 @@ impl Workspace {
             });
         }
 
-        let link_changes = LinkChanges {
-            changes: &changes,
-            manifests: &manifest_changes,
-            base: &merge_base,
-        };
         let mut builder = GraphBuilder::default();
-        let root_scope_reasons =
-            linker.link_changes(&self.repo_files, &link_changes, &mut builder)?;
+        let mut root_scope_reasons = Vec::new();
+
+        for frontend in &frontends {
+            root_scope_reasons.extend(frontend.add_links(&change_set, &mut builder)?);
+        }
+
         let rule_report = config.rules.apply(&mut builder, &self.repo_files, &changes);
 
         warnings.extend(rule_report.warnings);
@@ -253,7 +272,28 @@ impl Workspace {
             .changes_between(&revisions.base, &revisions.head)
     }
 
-    fn linker(&self, config: &Config) -> Result<TypeScriptLinker> {
+    fn frontends(&self, config: &Config) -> Result<Vec<Box<dyn Frontend>>> {
+        let mut frontends: Vec<Box<dyn Frontend>> = Vec::new();
+
+        if self.holds(prober_lang_typescript::is_source_file) {
+            frontends.push(Box::new(self.typescript_linker(config)?));
+        }
+
+        if self.holds(prober_lang_python::is_source_file) {
+            let linker = PythonLinker::new(&self.repo_root, &self.repo_files)?
+                .with_inference(config.inference);
+
+            frontends.push(Box::new(linker));
+        }
+
+        Ok(frontends)
+    }
+
+    fn holds(&self, is_source_file: fn(&RepoPath) -> bool) -> bool {
+        self.repo_files.iter().any(is_source_file)
+    }
+
+    fn typescript_linker(&self, config: &Config) -> Result<TypeScriptLinker> {
         let mut linker = TypeScriptLinker::new(&self.repo_root, &self.repo_files)?
             .with_inference(config.inference);
 
@@ -270,27 +310,35 @@ impl Workspace {
 
     fn run_all(
         &self,
-        linker: Option<&TypeScriptLinker>,
+        frontends: Option<&[Box<dyn Frontend>]>,
         reasons: Vec<ModeReason>,
         config_hash: String,
     ) -> Report {
-        let default_linker = linker
+        let default_frontends = frontends
             .is_none()
-            .then(|| TypeScriptLinker::new(&self.repo_root, &self.repo_files).ok())
+            .then(|| {
+                let config = Config::parse("").ok()?;
+
+                self.frontends(&config).ok()
+            })
             .flatten();
-        let test_files = match linker.or(default_linker.as_ref()) {
-            Some(linker) => linker.test_files(&self.repo_files),
-            None => self
-                .repo_files
-                .iter()
-                .filter(|path| is_test_file(path))
-                .cloned()
-                .collect(),
-        };
         let mut builder = GraphBuilder::default();
 
-        for test_file in test_files {
-            builder.add_test_file(test_file, LANGUAGE);
+        match frontends.or(default_frontends.as_deref()) {
+            Some(frontends) => {
+                for frontend in frontends {
+                    for test_file in frontend.test_files(&self.repo_files) {
+                        builder.add_test_file(test_file, frontend.language());
+                    }
+                }
+            }
+            None => {
+                for (language, is_test_file) in TEST_FILE_NAMES {
+                    for test_file in self.repo_files.iter().filter(|path| is_test_file(path)) {
+                        builder.add_test_file(test_file.clone(), language);
+                    }
+                }
+            }
         }
 
         Report::all(&builder.build(), reasons, config_hash)
@@ -311,17 +359,10 @@ impl BaseRevision for MergeBase<'_> {
 fn always_all_reasons(
     config: &Config,
     changes: &[FileChange],
-    runner_config_patterns: &[&str],
+    built_in_patterns: &[&str],
 ) -> Result<Vec<ModeReason>> {
-    let manifest_patterns = if config.inference.manifests {
-        &[][..]
-    } else {
-        MANIFEST_DEFAULTS
-    };
-    let built_in_patterns = ALWAYS_ALL_DEFAULTS
+    let built_in_patterns = built_in_patterns
         .iter()
-        .chain(manifest_patterns)
-        .chain(runner_config_patterns)
         .map(|&pattern| pattern.to_owned())
         .collect();
     let built_in_always_all = AlwaysAll::new(built_in_patterns)?;
