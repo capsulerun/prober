@@ -14,23 +14,43 @@ Run only the tests your change can affect.
 
 Most pipelines run the whole test suite on every change, even when it touches a few files, so CI time and cost grow with every change rather than with what it changes. Prober reads the code of both revisions and builds the graph of what depends on what: imports, modules loaded by name, files read from disk, fixtures, manifests, lockfiles and test runner configs. It outputs the tests a change can affect, each with the reason it was selected.
 
-It never runs your tests and keeps no state: the same change always gives the same selection. When it cannot be sure, it selects more, never less, and says why.
+It never runs your tests and keeps no state: the same change always gives the same selection. When it cannot be sure, it selects more, never less, and says why. You can [check it against a full run](#check-it-before-relying-on-it) before relying on it, and [correct it](#configuration-optional) with one line of `prober.toml` when it gets a link wrong.
+
+For example, after a change to `src/pricing/discount.ts`:
+
+```console
+$ prober --base origin/main
+prober: selected 2/3 test files (66.7%)
+test/discount.test.ts
+test/cart.test.ts
+
+$ prober why --base origin/main test/cart.test.ts
+test/cart.test.ts is selected:
+  src/pricing/discount.ts (modified)
+  -> applyDiscount changed
+  -> applyDiscount used by checkout in src/cart.ts
+  -> checkout used at load by test/cart.test.ts
+
+$ prober why --base origin/main test/slug.test.ts
+test/slug.test.ts is not selected: no path links it to the changed file
+```
 
 Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
 
 ## Getting started
 
-### GitHub Actions
+### In GitHub Actions
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: capsulerun/prober@v1
+- uses: capsulerun/prober@v0
   id: prober
-- if: steps.prober.outputs.mode != 'none'
-  run: |
-    if [ "${{ steps.prober.outputs.mode }}" = "all" ]; then npx vitest run
-    else xargs -a "${{ steps.prober.outputs.typescript-file }}" npx vitest run; fi
+- run: xargs -r -a "$TESTS" npx vitest run
+  env:
+    TESTS: ${{ steps.prober.outputs.typescript-file }}
 ```
+
+Prober writes the selected test files to `typescript-file`: every test when the change can affect them all (a lockfile or a runner config changed, say), none when it affects no test. The `mode` output (`selected`, `all` or `none`) tells which, for workflows that branch on it.
 
 ### Run it locally
 
@@ -42,7 +62,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/relea
 
 > <details>
 > 
-> <summary>On Windows</summary>
+> <summary>Windows install</summary>
 > 
 > ```powershell
 > powershell -ExecutionPolicy Bypass -c "irm https://github.com/capsulerun/prober/releases/latest/download/prober-installer.ps1 | iex"
@@ -50,9 +70,10 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/relea
 > 
 > </details>
 
-To pin a version, replace `latest/download` with `download/v0.1.0`.
+> [!NOTE]
+> To pin a version, replace `latest/download` with `download/v0.1.0`.
 
-#### Usage
+#### Usages
 
 From the repository, against the branch your change targets:
 
@@ -74,7 +95,7 @@ prober --base origin/main | xargs npx vitest run
 
 ## Documentation
 
-### Selections
+### Output and options
 
 A selection has one of three modes: `selected` (the listed tests), `none` (the change reaches no test) and `all` (every test, with the reason). For Rust, the targets are crates, run with `cargo test -p <crate>`.
 
@@ -120,29 +141,37 @@ prober shadow --selection selection.json --report junit.xml
 Prober needs no configuration. An optional `prober.toml` at the root of the repository covers what the code cannot tell, and corrects inference where it selects too much. A mistake in it fails the run with the line at fault; `prober scan` lists each rule with what it matched.
 
 ```toml
+# Detected from the repository; list presets only to force or restrict them
 presets = "auto"
 
+# Changes Prober cannot reason about: run every test
 [always_all]
 files = ["ci/**", "scripts/release/**"]
 
+# A smoke set added to every selection
 [always_run]
 tests = ["test/smoke/config.test.ts"]
 
+# A test reads fixtures through a path the code does not show
 [[link]]
 from = "fixtures/golden/**"
 to = "test/golden.e2e.test.ts"
 
+# Plugins are loaded by name: each folder reaches its own test and the registry's
 [[link]]
 from = "plugins/{id}/**"
 to = ["test/plugins/{id}.test.ts", "test/registry.test.ts"]
 
+# An inferred link that selects too much
 [[ignore]]
 from = "src/shared/logger.ts"
 to = "test/**/*.e2e.test.ts"
 
+# A dynamic import Prober cannot resolve, now covered by the links above
 [[ignore]]
 site = "src/loader.ts:42"
 
+# Every inference is on by default; switch one off if it misbehaves
 [inference]
 widening = true
 ```
