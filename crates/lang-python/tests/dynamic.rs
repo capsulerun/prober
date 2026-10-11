@@ -137,6 +137,51 @@ fn a_computed_import_without_a_literal_package_widens_to_its_dependents() {
 }
 
 #[test]
+fn a_computed_import_whose_callers_explode_widens_instead_of_evaluating_them_all() {
+    let project = TestProject::new(&[
+        ("app/__init__.py", ""),
+        (
+            "app/expressions.py",
+            "import importlib\n\n\ndef resolve(node):\n    if node.kind == \"plus\":\n        return resolve(node.lhs) + resolve(node.rhs)\n    if node.kind == \"minus\":\n        return resolve(node.lhs) + \"-\" + resolve(node.rhs)\n    if node.kind == \"times\":\n        return resolve(node.lhs) + \"*\" + resolve(node.rhs)\n    if node.kind == \"handler\":\n        return importlib.import_module(\"app.handlers.\" + resolve(node.lhs) + resolve(node.rhs))\n    return node.name\n",
+        ),
+        ("app/handlers/__init__.py", ""),
+        ("app/handlers/sum.py", ""),
+        ("tests/test_expressions.py", "import app.expressions\n"),
+    ]);
+
+    assert_eq!(
+        project.outcome_of(&[], &[modified("app/handlers/sum.py")]),
+        selected(&[(
+            "tests/test_expressions.py",
+            &[
+                "app/handlers/sum.py (modified)",
+                "-> widened: unresolved dynamic import at app/expressions.py:12 (importlib.import_module(\"app.handlers.\" + resolve(node.lhs) + resolve(node.rhs)))",
+                "-> imported by tests/test_expressions.py",
+            ],
+        )])
+    );
+}
+
+#[test]
+fn division_by_a_number_is_not_a_path() {
+    let project = TestProject::new(&[
+        (
+            "tests/test_ratio.py",
+            "from pathlib import Path\n\nDATA = Path(__file__).parent / \"data\"\n\n\ndef test_ratio():\n    half = DATA / 2\n    (DATA / \"table.csv\").read_text()\n",
+        ),
+        ("tests/data/table.csv", ""),
+        ("tests/data/2", ""),
+    ]);
+    let graph = project.link();
+
+    assert_eq!(
+        dependents(&graph, "tests/data/table.csv"),
+        [("tests/test_ratio.py", EdgeKind::Reads)]
+    );
+    assert!(dependents(&graph, "tests/data/2").is_empty());
+}
+
+#[test]
 fn dotted_module_strings_link_the_module_they_name() {
     let project = TestProject::new(&[
         ("app/__init__.py", ""),
