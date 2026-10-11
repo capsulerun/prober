@@ -1236,7 +1236,9 @@ fn is_path_expression<'a>(
     scope: ScopeId,
 ) -> bool {
     match expr {
-        AstExpr::BinOp(binary) if binary.op == Operator::Div => true,
+        AstExpr::BinOp(binary) if binary.op == Operator::Div => ![&binary.left, &binary.right]
+            .iter()
+            .any(|operand| matches!(operand.as_ref(), AstExpr::NumberLiteral(_))),
         AstExpr::Call(call) => match call.func.as_ref() {
             AstExpr::Attribute(attribute) if PATH_METHODS.contains(&attribute.attr.as_str()) => {
                 true

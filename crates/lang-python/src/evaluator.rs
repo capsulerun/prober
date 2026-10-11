@@ -22,6 +22,8 @@ const MAX_EXPANSIONS: usize = 50_000;
 
 const MAX_EVALUATION_STEPS: usize = 20_000;
 
+const MAX_SITE_STEPS: usize = 1_000_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FunctionRef<'s> {
     pub module: &'s RepoPath,
@@ -93,6 +95,7 @@ pub(crate) struct Evaluator<'s> {
     callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>>,
     escaping: HashSet<FunctionRef<'s>>,
     steps: Cell<usize>,
+    site_steps: Cell<usize>,
 }
 
 impl<'s> Evaluator<'s> {
@@ -103,6 +106,7 @@ impl<'s> Evaluator<'s> {
             callers: HashMap::new(),
             escaping: HashSet::new(),
             steps: Cell::new(0),
+            site_steps: Cell::new(0),
         };
         let mut callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>> = HashMap::new();
         let mut escaping = HashSet::new();
@@ -148,7 +152,15 @@ impl<'s> Evaluator<'s> {
         let mut results = Vec::new();
         let mut expansions = 0;
 
+        self.site_steps.set(0);
         self.expand(module, site, Vec::new(), &mut results, &mut expansions);
+
+        if self.site_steps.get() > MAX_SITE_STEPS {
+            return vec![SiteValue {
+                reader: module,
+                value: Value::Unknown(Hole::Runtime),
+            }];
+        }
 
         results
     }
@@ -189,6 +201,14 @@ impl<'s> Evaluator<'s> {
         self.steps.set(0);
 
         let value = self.evaluate(&site.value, &frame);
+
+        self.site_steps
+            .set(self.site_steps.get() + self.steps.get());
+
+        if self.site_steps.get() > MAX_SITE_STEPS {
+            return;
+        }
+
         let open = outermost.filter(|function| value.depends_on(function));
         let Some(function) = open else {
             results.push(SiteValue { reader, value });
