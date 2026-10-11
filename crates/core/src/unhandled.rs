@@ -6,8 +6,7 @@ use crate::graph::Graph;
 
 const OTHER_LANGUAGE_EXTENSIONS: &[&str] = &[
     "c", "cc", "clj", "cpp", "cs", "cxx", "dart", "erl", "ex", "exs", "fs", "go", "groovy", "h",
-    "hpp", "hs", "java", "kt", "kts", "lua", "m", "mm", "php", "pl", "rb", "rs", "scala", "swift",
-    "zig",
+    "hpp", "hs", "java", "kt", "kts", "lua", "m", "mm", "php", "pl", "rb", "scala", "swift", "zig",
 ];
 
 pub fn unhandled_changes(graph: Option<&Graph>, changes: &[FileChange]) -> Vec<RepoPath> {

@@ -33,7 +33,12 @@ pub fn run(arguments: &WhyArguments) -> ExitCode {
     let selection = env::current_dir()
         .map_err(anyhow::Error::from)
         .and_then(|current_directory| pipeline::run(&current_directory, &revisions, OnError::Fail));
-    let test = RepoPath::new(arguments.test.trim_start_matches("./"));
+    let test = arguments.test.trim_start_matches("./");
+    let test = selection
+        .as_ref()
+        .ok()
+        .and_then(|selection| named_target(selection, test))
+        .map_or_else(|| RepoPath::new(test), Ok);
 
     match (selection, test) {
         (Ok(selection), Ok(test)) => print_explanation(&selection, &test),
@@ -48,6 +53,26 @@ pub fn run(arguments: &WhyArguments) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn named_target(selection: &Selection, name: &str) -> Option<RepoPath> {
+    let in_report = selection
+        .report
+        .targets
+        .iter()
+        .find(|target| {
+            target
+                .name
+                .as_ref()
+                .is_some_and(|target_name| target_name.name == name)
+        })
+        .map(|target| target.path.clone());
+
+    in_report.or_else(|| {
+        let graph = &selection.analysis.as_ref()?.graph;
+
+        Some(graph.path(graph.target_named(name)?).clone())
+    })
 }
 
 fn print_explanation(selection: &Selection, test: &RepoPath) -> ExitCode {

@@ -38,6 +38,10 @@ pub trait Frontend: Send + Sync {
 
     fn test_files(&self, repo_files: &[RepoPath]) -> Vec<RepoPath>;
 
+    fn target_name(&self, _test: &RepoPath) -> Option<(&'static str, String)> {
+        None
+    }
+
     fn diff_manifests(&mut self, change_set: &ChangeSet) -> Result<Vec<ModeReason>>;
 
     fn add_links(

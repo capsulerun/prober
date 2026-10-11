@@ -71,13 +71,29 @@ struct SelectionJson {
     mode_reasons: Option<Vec<ModeReasonRecord>>,
 
     #[serde(default)]
-    targets: BTreeMap<String, Vec<String>>,
+    targets: BTreeMap<String, Vec<TargetRecord>>,
 
     #[serde(default)]
     reasons: BTreeMap<String, Vec<String>>,
 
     #[serde(default)]
     distances: BTreeMap<String, usize>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum TargetRecord {
+    Path(String),
+    Named(BTreeMap<String, String>),
+}
+
+impl TargetRecord {
+    fn into_key(self) -> String {
+        match self {
+            TargetRecord::Path(path) => path,
+            TargetRecord::Named(named) => named.into_values().next().unwrap_or_default(),
+        }
+    }
 }
 
 impl RecordedSelection {
@@ -96,6 +112,7 @@ impl RecordedSelection {
             .targets
             .into_values()
             .flatten()
+            .map(TargetRecord::into_key)
             .map(RepoPath::new)
             .collect::<Result<BTreeSet<_>>>()?;
         let widened_test_files = selection

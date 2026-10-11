@@ -234,6 +234,7 @@ pub struct TestFile {
 pub struct GraphBuilder {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
+    target_names: HashMap<FileId, TargetName>,
     removed_tests: HashSet<FileId>,
     edges: Vec<Edge>,
     inferences: HashMap<(FileId, FileId, EdgeKind), Inference>,
@@ -264,6 +265,10 @@ impl GraphBuilder {
         self.test_languages.insert(test_file, language);
 
         test_file
+    }
+
+    pub fn name_target(&mut self, file: FileId, unit: &'static str, name: String) {
+        self.target_names.insert(file, TargetName { unit, name });
     }
 
     pub fn add_removed_test(&mut self, path: RepoPath) {
@@ -546,6 +551,7 @@ impl GraphBuilder {
         let mut graph = Graph {
             files: self.files,
             test_languages: self.test_languages,
+            target_names: self.target_names,
             removed_tests: self.removed_tests,
             dependents_by_file,
             dependencies_by_file,
@@ -574,10 +580,17 @@ impl GraphBuilder {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TargetName {
+    pub unit: &'static str,
+    pub name: String,
+}
+
 #[derive(Debug)]
 pub struct Graph {
     files: FileTable,
     test_languages: HashMap<FileId, &'static str>,
+    target_names: HashMap<FileId, TargetName>,
     removed_tests: HashSet<FileId>,
     dependents_by_file: Vec<Vec<Edge>>,
     dependencies_by_file: Vec<Vec<Edge>>,
@@ -615,6 +628,17 @@ impl Graph {
 
     pub fn test_language(&self, file: FileId) -> Option<&'static str> {
         self.test_languages.get(&file).copied()
+    }
+
+    pub fn target_name(&self, file: FileId) -> Option<&TargetName> {
+        self.target_names.get(&file)
+    }
+
+    pub fn target_named(&self, name: &str) -> Option<FileId> {
+        self.target_names
+            .iter()
+            .find(|(_, target_name)| target_name.name == name)
+            .map(|(&file, _)| file)
     }
 
     pub fn test_files_by_path(&self) -> Vec<TestFile> {

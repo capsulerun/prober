@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::changes::{FileChange, ResolvedRevisions};
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
-use crate::graph::{Edge, EdgeKind, Graph, TestFile};
+use crate::graph::{Edge, EdgeKind, Graph, TargetName, TestFile};
 use crate::patterns::describe_captures;
 use crate::ratios::{format_percentage, rounded_ratio};
 use crate::select::{Hop, Link, Reason, SelectedTest};
@@ -181,7 +181,17 @@ pub struct AlwaysRunTest {
 pub struct Target {
     pub path: RepoPath,
     pub language: &'static str,
+    pub name: Option<TargetName>,
     pub impact: Option<Impact>,
+}
+
+impl Target {
+    pub fn key(&self) -> &str {
+        match &self.name {
+            Some(name) => &name.name,
+            None => self.path.as_str(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -230,6 +240,7 @@ impl Report {
             .map(|selected_test| Target {
                 path: graph.path(selected_test.file).clone(),
                 language: selected_test_language(graph, selected_test.file),
+                name: graph.target_name(selected_test.file).cloned(),
                 impact: Some(Impact {
                     distance: Some(selected_test.distance()),
                     reason: describe_reason(graph, &selected_test.reason),
@@ -256,6 +267,7 @@ impl Report {
             .map(|test_file| Target {
                 path: graph.path(test_file.file).clone(),
                 language: test_file.language,
+                name: graph.target_name(test_file.file).cloned(),
                 impact: None,
             })
             .collect();
@@ -289,6 +301,7 @@ impl Report {
             self.targets.push(Target {
                 path: always_run_test.path,
                 language: always_run_test.language,
+                name: None,
                 impact: Some(Impact {
                     distance: None,
                     reason: vec![always_run_test.reason],
@@ -333,14 +346,21 @@ impl Report {
     }
 
     pub fn to_json(&self) -> String {
-        let mut targets: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        let mut targets: BTreeMap<&str, Vec<JsonTarget>> = BTreeMap::new();
         let mut reasons = BTreeMap::new();
         let mut distances = BTreeMap::new();
 
         for target in &self.targets {
-            let path = target.path.as_str();
+            let path = target.key();
+            let json_target = match &target.name {
+                Some(name) => JsonTarget::Named(BTreeMap::from([(name.unit, name.name.as_str())])),
+                None => JsonTarget::Path(path),
+            };
 
-            targets.entry(target.language).or_default().push(path);
+            targets
+                .entry(target.language)
+                .or_default()
+                .push(json_target);
 
             if let Some(impact) = &target.impact {
                 reasons.insert(path, impact.reason.as_slice());
@@ -383,7 +403,7 @@ impl Report {
         let mut list = String::new();
 
         for target in &self.targets {
-            list.push_str(target.path.as_str());
+            list.push_str(target.key());
             list.push(separator);
         }
 
@@ -470,12 +490,19 @@ struct JsonReport<'a> {
     revisions: Option<&'a ResolvedRevisions>,
     mode: &'static str,
     mode_reasons: Option<Vec<JsonModeReason<'a>>>,
-    targets: BTreeMap<&'static str, Vec<&'a str>>,
+    targets: BTreeMap<&'static str, Vec<JsonTarget<'a>>>,
     reasons: BTreeMap<&'a str, &'a [String]>,
     distances: BTreeMap<&'a str, usize>,
     widened: Vec<JsonWidenedSite<'a>>,
     unhandled: Vec<&'a str>,
     stats: JsonStats<'a>,
+}
+
+#[derive(Serialize)]
+#[serde(untagged)]
+enum JsonTarget<'a> {
+    Path(&'a str),
+    Named(BTreeMap<&'static str, &'a str>),
 }
 
 #[derive(Serialize)]
