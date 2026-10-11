@@ -20,6 +20,7 @@ use prober_core::scan::ScanReport;
 use prober_core::select::{Widening, select_tests};
 use prober_core::unhandled::unhandled_changes;
 use prober_lang_python::PythonLinker;
+use prober_lang_rust::RustLinker;
 use prober_lang_typescript::TypeScriptLinker;
 use prober_vcs::GitRepository;
 
@@ -287,6 +288,14 @@ impl Workspace {
             frontends.push(Box::new(linker));
         }
 
+        if self.holds(prober_lang_rust::is_source_file) {
+            let linker = RustLinker::new(&self.repo_root, &self.repo_files)?
+                .with_inference(config.inference)
+                .with_presets(&config.presets);
+
+            frontends.push(Box::new(linker));
+        }
+
         Ok(frontends)
     }
 
@@ -329,7 +338,12 @@ impl Workspace {
             Some(frontends) => {
                 for frontend in frontends {
                     for test_file in frontend.test_files(&self.repo_files) {
-                        builder.add_test_file(test_file, frontend.language());
+                        let name = frontend.target_name(&test_file);
+                        let file = builder.add_test_file(test_file, frontend.language());
+
+                        if let Some((unit, name)) = name {
+                            builder.name_target(file, unit, name);
+                        }
                     }
                 }
             }

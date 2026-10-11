@@ -83,6 +83,7 @@ impl Default for InferenceSettings {
 }
 
 pub const PRESETS: &[&str] = &[
+    "cargo",
     "cypress",
     "django",
     "jest",
@@ -437,7 +438,7 @@ mod tests {
             ),
             (
                 "presets = [\"vitest\", \"nose\"]\n",
-                "invalid prober.toml: unknown preset \"nose\", expected \"auto\" or some of cypress, django, jest, mocha, node-test, playwright, pytest, vite, vitest",
+                "invalid prober.toml: unknown preset \"nose\", expected \"auto\" or some of cargo, cypress, django, jest, mocha, node-test, playwright, pytest, vite, vitest",
             ),
             (
                 "presets = 3\n",

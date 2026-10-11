@@ -970,6 +970,70 @@ fn a_fixture_change_selects_the_tests_using_it_and_why_names_the_fixture() {
     );
 }
 
+#[test]
+fn rust_crates_are_targets_listed_by_name_and_explained_by_why() {
+    let repository = TestRepository::with_files_on_main(&[
+        ("Cargo.toml", "[workspace]\nmembers = [\"crates/*\"]\n"),
+        (
+            "crates/parse/Cargo.toml",
+            "[package]\nname = \"parse\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "crates/parse/src/lib.rs",
+            "pub mod tokens;\npub mod tree;\n",
+        ),
+        ("crates/parse/src/tokens.rs", "pub fn lex() {}\n"),
+        ("crates/parse/src/tree.rs", "pub fn build() {}\n"),
+        (
+            "crates/check/Cargo.toml",
+            "[package]\nname = \"check\"\nversion = \"0.1.0\"\n\n[dependencies]\nparse = { path = \"../parse\" }\n",
+        ),
+        (
+            "crates/check/src/lib.rs",
+            "pub fn run() { parse::tree::build(); }\n",
+        ),
+    ]);
+
+    repository.change_and_commit(
+        "crates/parse/src/tree.rs",
+        "pub fn build() { let _ = 1; }\n",
+    );
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["targets"],
+        json!({ "rust": [{ "crate": "parse" }, { "crate": "check" }] })
+    );
+    assert_eq!(
+        report["reasons"]["check"],
+        json!([
+            "crates/parse/src/tree.rs (modified)",
+            "-> imported by crates/check/src/lib.rs",
+            "-> built into crates/check/Cargo.toml"
+        ])
+    );
+    assert_eq!(
+        repository.prober(&["--base", "main"]).stdout,
+        "parse\ncheck\n"
+    );
+    assert_eq!(
+        repository
+            .prober(&["why", "check", "--base", "main"])
+            .stdout,
+        "crates/check/Cargo.toml is selected:\n  crates/parse/src/tree.rs (modified)\n  -> imported by crates/check/src/lib.rs\n  -> built into crates/check/Cargo.toml\n"
+    );
+
+    repository.change_and_commit(
+        "crates/parse/src/tokens.rs",
+        "pub fn lex() { let _ = 2; }\n",
+    );
+
+    assert_eq!(repository.prober(&["--base", "HEAD^"]).stdout, "parse\n");
+}
+
 fn repository_with_rules() -> TestRepository {
     let repository = TestRepository::with_files_on_main(&[
         ("fixtures/golden/expected.txt", "v1"),
