@@ -2,6 +2,7 @@ pub mod changes;
 pub mod config;
 mod cycles;
 pub mod files;
+pub mod frontend;
 pub mod graph;
 pub mod junit;
 pub mod outcomes;

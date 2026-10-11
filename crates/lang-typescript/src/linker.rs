@@ -10,6 +10,7 @@ use oxc_span::SourceType;
 use prober_core::changes::{BaseRevision, ChangeKind, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
+use prober_core::frontend::{ChangeSet, Frontend};
 use prober_core::graph::{Edge, EdgeKind, GraphBuilder, RootScope, UnresolvedSite};
 use prober_core::report::ModeReason;
 use prober_core::symbols::FallbackCause;
@@ -17,7 +18,8 @@ use rayon::prelude::*;
 
 use crate::build_mapping::BuildMapping;
 use crate::conventions::{
-    LANGUAGE, is_asset_file, is_module_file, is_source_file, is_test_file, is_test_support_file,
+    ALWAYS_ALL_DEFAULTS, LANGUAGE, MANIFEST_DEFAULTS, is_asset_file, is_module_file,
+    is_source_file, is_test_file, is_test_support_file,
 };
 use crate::dynamic::evaluator::{Evaluator, LoadScope};
 use crate::dynamic::spawn::Programs;
@@ -54,6 +56,7 @@ pub struct TypeScriptLinker {
     inference: InferenceSettings,
     presets: RunnerPresets,
     symbol_analysis: bool,
+    manifest_changes: ManifestChanges,
 }
 
 pub struct LinkChanges<'c> {
@@ -121,6 +124,7 @@ impl TypeScriptLinker {
             inference: InferenceSettings::default(),
             presets: RunnerPresets::default(),
             symbol_analysis: false,
+            manifest_changes: ManifestChanges::default(),
         };
 
         Ok(linker.with_presets(&Presets::Auto, repo_files))
@@ -671,6 +675,60 @@ impl TypeScriptLinker {
             path_literals: parsed_imports.path_literals,
             symbols,
         })
+    }
+}
+
+impl Frontend for TypeScriptLinker {
+    fn language(&self) -> &'static str {
+        LANGUAGE
+    }
+
+    fn always_all_patterns(&self) -> Vec<&'static str> {
+        let manifest_patterns = if self.inference.manifests {
+            &[][..]
+        } else {
+            MANIFEST_DEFAULTS
+        };
+
+        ALWAYS_ALL_DEFAULTS
+            .iter()
+            .chain(manifest_patterns)
+            .copied()
+            .chain(self.global_config_patterns())
+            .collect()
+    }
+
+    fn test_files(&self, repo_files: &[RepoPath]) -> Vec<RepoPath> {
+        TypeScriptLinker::test_files(self, repo_files)
+    }
+
+    fn diff_manifests(&mut self, change_set: &ChangeSet) -> Result<Vec<ModeReason>> {
+        if !self.inference.manifests {
+            return Ok(Vec::new());
+        }
+
+        self.manifest_changes = ManifestChanges::between(
+            &self.repo_root,
+            change_set.repo_files,
+            change_set.changes,
+            change_set.base,
+        )?;
+
+        Ok(self.manifest_changes.global_reasons().to_vec())
+    }
+
+    fn add_links(
+        &self,
+        change_set: &ChangeSet,
+        graph: &mut GraphBuilder,
+    ) -> Result<Vec<ModeReason>> {
+        let link_changes = LinkChanges {
+            changes: change_set.changes,
+            manifests: &self.manifest_changes,
+            base: change_set.base,
+        };
+
+        self.link_changes(change_set.repo_files, &link_changes, graph)
     }
 }
 

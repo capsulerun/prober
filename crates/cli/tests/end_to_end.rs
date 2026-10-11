@@ -867,6 +867,76 @@ fn changes_in_languages_without_a_frontend_are_listed_as_unhandled() {
     assert_eq!(report["unhandled"], json!(["apps/ios/ChatView.swift"]));
 }
 
+fn polyglot_repository() -> TestRepository {
+    TestRepository::with_files_on_main(&[
+        ("contracts/order.json", r#"{ "id": 1 }"#),
+        (
+            "src/order.test.ts",
+            "import order from \"../contracts/order.json\";\n\ntest(\"order\", () => expect(order.id).toBe(1));\n",
+        ),
+        ("service/__init__.py", ""),
+        ("service/orders.py", "from service import pricing\n"),
+        ("service/pricing.py", "RATE = 1\n"),
+        (
+            "tests/test_orders.py",
+            "import json\nfrom pathlib import Path\n\nfrom service.orders import pricing\n\nCONTRACT = Path(__file__).parent.parent / \"contracts\" / \"order.json\"\n",
+        ),
+        ("tests/test_health.py", "import os\n"),
+    ])
+}
+
+#[test]
+fn one_change_selects_the_tests_of_every_language_reaching_it() {
+    let repository = polyglot_repository();
+
+    repository.change_and_commit("contracts/order.json", r#"{ "id": 2 }"#);
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(report["mode"], "selected");
+    assert_eq!(
+        report["targets"],
+        json!({
+            "python": ["tests/test_orders.py"],
+            "typescript": ["src/order.test.ts"],
+        })
+    );
+    assert_eq!(
+        report["stats"]["by_language"],
+        json!({
+            "python": { "total": 2, "selected": 1, "ratio": 0.5 },
+            "typescript": { "total": 3, "selected": 1, "ratio": 0.3333 },
+        })
+    );
+    assert_eq!(report["unhandled"], json!([]));
+}
+
+#[test]
+fn why_and_scan_cover_every_language() {
+    let repository = polyglot_repository();
+
+    repository.change_and_commit("service/pricing.py", "RATE = 2\n");
+
+    assert_eq!(
+        repository
+            .prober(&["why", "tests/test_orders.py", "--base", "main"])
+            .stdout,
+        "tests/test_orders.py is selected:\n  service/pricing.py (modified)\n  -> imported by service/orders.py\n  -> imported by tests/test_orders.py\n"
+    );
+    assert_eq!(
+        repository
+            .prober(&["why", "src/a.test.ts", "--base", "main"])
+            .stdout,
+        "src/a.test.ts is not selected: no path links it to the changed file\n"
+    );
+
+    let scan = repository.prober(&["scan", "--format", "json"]).json();
+
+    assert_eq!(scan["stats"]["tests_total"], 5);
+}
+
 fn repository_with_rules() -> TestRepository {
     let repository = TestRepository::with_files_on_main(&[
         ("fixtures/golden/expected.txt", "v1"),

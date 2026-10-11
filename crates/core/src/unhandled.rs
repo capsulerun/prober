@@ -6,8 +6,8 @@ use crate::graph::Graph;
 
 const OTHER_LANGUAGE_EXTENSIONS: &[&str] = &[
     "c", "cc", "clj", "cpp", "cs", "cxx", "dart", "erl", "ex", "exs", "fs", "go", "groovy", "h",
-    "hpp", "hs", "java", "kt", "kts", "lua", "m", "mm", "php", "pl", "py", "rb", "rs", "scala",
-    "swift", "zig",
+    "hpp", "hs", "java", "kt", "kts", "lua", "m", "mm", "php", "pl", "rb", "rs", "scala", "swift",
+    "zig",
 ];
 
 pub fn unhandled_changes(graph: Option<&Graph>, changes: &[FileChange]) -> Vec<RepoPath> {
@@ -67,7 +67,7 @@ mod tests {
             RepoPath::new("test/contract.test.ts").unwrap(),
             "typescript",
         );
-        let contract = builder.add_file(RepoPath::new("tools/contract.py").unwrap());
+        let contract = builder.add_file(RepoPath::new("tools/contract.rb").unwrap());
 
         builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
         builder.add_edge(Edge {
@@ -79,7 +79,7 @@ mod tests {
         let graph = builder.build();
         let changes = [
             modified("apps/ios/ChatView.swift"),
-            modified("tools/contract.py"),
+            modified("tools/contract.rb"),
             modified("docs/guide.md"),
             modified("src/a.ts"),
         ];
