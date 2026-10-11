@@ -94,8 +94,7 @@ pub(crate) struct LinkedFile {
 
 impl TypeScriptLinker {
     pub fn new(repo_root: &Path, repo_files: &[RepoPath]) -> Result<Self> {
-        let repo_root = repo_root
-            .canonicalize()
+        let repo_root = dunce::canonicalize(repo_root)
             .with_context(|| format!("cannot open repository root {}", repo_root.display()))?;
         let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
         let manifest_paths = repo_files.iter().filter(|path| is_workspace_manifest(path));

@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+dunce.workspace = true
 globset.workspace = true
 json-strip-comments.workspace = true
 oxc_allocator.workspace = true

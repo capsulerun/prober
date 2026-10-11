@@ -35,8 +35,15 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
   tests:
-    runs-on: ubuntu-latest
-    name: Tests
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: Tests (${{ matrix.os }})
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v7
         with:
