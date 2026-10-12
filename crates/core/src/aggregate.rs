@@ -220,11 +220,12 @@ impl Recommendation {
                 impacted_test_files,
                 impacted_seconds,
             } => format!(
-                "`{label}`: `{} = {value}` keeps every one of the {} it rests on, and would drop {dropped_test_files} of {impacted_test_files} impacted test files ({} of {})",
+                "`{label}`: `{} = {value}` keeps every one of the {} it rests on, and would drop {dropped_test_files} of {impacted_test_files} impacted test files{}",
                 self.value_key(),
                 count_of(*failures, "failure", "failures"),
-                format_duration(*dropped_seconds),
-                format_duration(*impacted_seconds)
+                part_of_duration(*dropped_seconds, *impacted_seconds)
+                    .map(|duration| format!(" ({duration})"))
+                    .unwrap_or_default()
             ),
             Verdict::NoSaving { value, failures } => format!(
                 "`{label}`: `{} = {value}` keeps every one of the {}, but would drop no test file: keep it off",
@@ -495,15 +496,16 @@ impl Aggregate {
 
     fn selection_summary(&self) -> String {
         format!(
-            "{} of {} reported test files selected ({}), {} of {} skipped",
+            "{} of {} reported test files selected ({}){}",
             self.reported_test_files - self.skipped_test_files,
             self.reported_test_files,
             format_percentage(
                 (self.reported_test_files - self.skipped_test_files) as f64,
                 self.reported_test_files as f64
             ),
-            format_duration(self.skipped_seconds),
-            format_duration(self.reported_seconds)
+            part_of_duration(self.skipped_seconds, self.reported_seconds)
+                .map(|duration| format!(", {duration} skipped"))
+                .unwrap_or_default()
         )
     }
 
@@ -771,6 +773,18 @@ fn rounded(seconds: f64) -> f64 {
     (seconds * 1_000.0).round() / 1_000.0
 }
 
+fn part_of_duration(part: f64, whole: f64) -> Option<String> {
+    if whole == 0.0 {
+        return None;
+    }
+
+    Some(format!(
+        "{} of {}",
+        format_duration(part),
+        format_duration(whole)
+    ))
+}
+
 fn format_duration(seconds: f64) -> String {
     if seconds < 60.0 {
         format!("{seconds:.1} s")
@@ -1030,6 +1044,19 @@ Failed test files: 3, 1 missed.
                 .unwrap_err()
                 .to_string()
                 .starts_with("invalid shadow JSON: missing field `selection_mode`")
+        );
+    }
+
+    #[test]
+    fn runs_without_durations_leave_durations_out() {
+        let without_durations = shadow_json("a", "selected", json!([]), json!([]))
+            .replace("\"reported_seconds\":100.0", "\"reported_seconds\":0.0")
+            .replace("\"seconds\":60.0", "\"seconds\":0.0");
+        let aggregate = aggregate_with(&runs(&[without_durations]), "");
+
+        assert_eq!(
+            aggregate.summary_line(),
+            "prober shadow: 1 run, no miss — 4 of 10 reported test files selected (40.0%)"
         );
     }
 }
