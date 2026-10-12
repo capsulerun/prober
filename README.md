@@ -3,10 +3,12 @@
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
   <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
-  <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="50%"  />
+  <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="30%"  />
 </picture>
 
-**Run only the tests your change can affect.**
+<div align="center">
+  <h3>Run only the tests your change can affect</h3>
+</div>
 
 [![CI](https://github.com/capsulerun/prober/actions/workflows/ci.yml/badge.svg)](https://github.com/capsulerun/prober/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/capsulerun/prober?include_prereleases&sort=semver)](https://github.com/capsulerun/prober/releases)
