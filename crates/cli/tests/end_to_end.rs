@@ -1335,7 +1335,7 @@ fn invalid_config_runs_every_test_with_an_error_reason() {
         report["mode_reasons"],
         json!([{
             "kind": "error",
-            "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
+            "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`, `aggressive`, `defer`, `protected`",
         }])
     );
     assert_eq!(report["stats"]["tests_selected"], 2);
@@ -1353,7 +1353,7 @@ fn on_error_fail_exits_with_the_error() {
     assert_eq!(run.stdout, "");
     assert_eq!(
         run.stderr,
-        "prober: invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`\n"
+        "prober: invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`, `aggressive`, `defer`, `protected`\n"
     );
 }
 
@@ -1428,6 +1428,69 @@ fn output_dir_holds_the_json_the_summary_and_one_list_per_language() {
         "{}",
         read("summary.md")
     );
+}
+
+#[test]
+fn aggressive_options_drop_far_tests_and_say_so_everywhere() {
+    let repository = TestRepository::with_files_on_main(&[(
+        "prober.toml",
+        "[aggressive]\nmax_distance = 1\n\n[protected]\ntests = [\"src/gone.test.ts\"]\n",
+    )]);
+    let output_dir = TempDir::new().unwrap();
+
+    repository.change_and_commit("src/a.ts", "export const a = 2;");
+
+    let run = repository.prober(&[
+        "--base",
+        "main",
+        "--output-dir",
+        output_dir.path().to_str().unwrap(),
+    ]);
+    let selection: Value = serde_json::from_str(
+        &fs::read_to_string(output_dir.path().join("selection.json")).unwrap(),
+    )
+    .unwrap();
+    let summary = fs::read_to_string(output_dir.path().join("summary.md")).unwrap();
+    let why = repository.prober(&["why", "src/b.test.ts", "--base", "main"]);
+
+    assert_eq!(run.stdout, "src/a.test.ts\n");
+    assert_eq!(
+        run.stderr,
+        "prober: warning: prober.toml:4: [protected] test \"src/gone.test.ts\" matches no test file\nprober: selected 1/2 test files (50.0%), 1 dropped by aggressive options\n"
+    );
+    assert_eq!(
+        selection["dropped"],
+        json!([{
+            "test": "src/b.test.ts",
+            "option": "max_distance",
+            "distance": 2,
+            "hub_fanout": 2,
+        }])
+    );
+    assert_eq!(selection["hub_fanouts"], json!({ "src/a.test.ts": 0 }));
+    assert!(
+        summary.contains("- `src/b.test.ts`: [aggressive] max_distance = 1 (prober.toml:2)\n"),
+        "{summary}"
+    );
+    assert_eq!(
+        why.stdout,
+        "src/b.test.ts is not selected: dropped by [aggressive] max_distance = 1 (prober.toml:2), at distance 2:\n  src/a.ts (modified)\n  -> a changed\n  -> a used by b in src/b.ts\n  -> b used at load by src/b.test.ts\n"
+    );
+}
+
+#[test]
+fn protected_tests_are_kept_at_any_distance() {
+    let repository = TestRepository::with_files_on_main(&[(
+        "prober.toml",
+        "[aggressive]\nmax_distance = 1\n\n[protected]\ntests = [\"src/b.test.ts\"]\n",
+    )]);
+
+    repository.change_and_commit("src/a.ts", "export const a = 2;");
+
+    let run = repository.prober(&["--base", "main"]);
+
+    assert_eq!(run.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(run.stderr, "prober: selected 2/2 test files (100.0%)\n");
 }
 
 #[test]

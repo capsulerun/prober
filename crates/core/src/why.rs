@@ -2,6 +2,7 @@
 
 use std::collections::BTreeSet;
 
+use crate::aggressive::Aggressive;
 use crate::changes::FileChange;
 use crate::files::{FileId, RepoPath};
 use crate::graph::{Edge, Graph};
@@ -29,6 +30,11 @@ pub enum Explanation {
     AlwaysRun {
         reason: String,
     },
+    Dropped {
+        cause: String,
+        distance: usize,
+        reason: Vec<String>,
+    },
     Blocked {
         blocker: Blocker,
         reason: Vec<String>,
@@ -51,6 +57,14 @@ impl Explanation {
             Explanation::NotATest => (format!("{test} is not a test file"), &[][..]),
             Explanation::Selected { reason } => (format!("{test} is selected:"), reason.as_slice()),
             Explanation::AlwaysRun { reason } => (format!("{test} is selected: {reason}"), &[][..]),
+            Explanation::Dropped {
+                cause,
+                distance,
+                reason,
+            } => (
+                format!("{test} is not selected: dropped by {cause}, at distance {distance}:"),
+                reason.as_slice(),
+            ),
             Explanation::Blocked { blocker, reason } => (
                 format!("{test} is not selected: {}:", blocker.description()),
                 reason.as_slice(),
@@ -136,22 +150,39 @@ pub fn explain(
     test: &RepoPath,
     widening: Widening,
     always_run: &[AlwaysRunTest],
+    aggressive: &Aggressive,
 ) -> Explanation {
     let Some(test_file) = graph.file_id(test).filter(|&file| graph.is_test(file)) else {
         return Explanation::NotATest;
     };
     let selected = select_relaxed(graph, changes, widening, None);
 
+    let always_run_test = always_run
+        .iter()
+        .find(|always_run_test| always_run_test.path == *test);
+
     if let Some(selected_test) = find(&selected, test_file) {
-        return Explanation::Selected {
+        let Some(cause) = aggressive.drop_cause(graph, selected_test) else {
+            return Explanation::Selected {
+                reason: describe_reason(graph, &selected_test.reason),
+            };
+        };
+
+        if let Some(always_run_test) = always_run_test {
+            return Explanation::AlwaysRun {
+                reason: always_run_test.reason.clone(),
+            };
+        }
+
+        return Explanation::Dropped {
+            cause: cause.description(),
+            distance: selected_test.distance(),
             reason: describe_reason(graph, &selected_test.reason),
         };
     }
 
     if !selected.is_empty()
-        && let Some(always_run_test) = always_run
-            .iter()
-            .find(|always_run_test| always_run_test.path == *test)
+        && let Some(always_run_test) = always_run_test
     {
         return Explanation::AlwaysRun {
             reason: always_run_test.reason.clone(),
@@ -405,8 +436,15 @@ mod tests {
     fn explained(test: &str, widening: Widening, change: &str) -> String {
         let graph = project("[[ignore]]\nfrom = \"src/**\"\nto = \"test/ignored.test.ts\"\n");
 
-        explain(&graph, &[modified(change)], &repo_path(test), widening, &[])
-            .to_text(&repo_path(test))
+        explain(
+            &graph,
+            &[modified(change)],
+            &repo_path(test),
+            widening,
+            &[],
+            &Aggressive::default(),
+        )
+        .to_text(&repo_path(test))
     }
 
     #[test]
@@ -486,7 +524,8 @@ mod tests {
                 &changes,
                 &repo_path("test/other.test.ts"),
                 Widening::Scoped,
-                &always_run
+                &always_run,
+                &Aggressive::default()
             ),
             Explanation::AlwaysRun {
                 reason: "always run by prober.toml:2 (\"test/other.test.ts\")".to_owned()
@@ -498,7 +537,8 @@ mod tests {
                 &changes,
                 &repo_path("src/a.ts"),
                 Widening::Scoped,
-                &[]
+                &[],
+                &Aggressive::default()
             ),
             Explanation::NotATest
         );

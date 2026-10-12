@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::ValueEnum;
+use prober_core::aggressive::Aggressive;
 use prober_core::changes::{BaseRevision, FileChange};
 use prober_core::config::{AlwaysAll, Config, Presets, config_hash};
 use prober_core::files::RepoPath;
@@ -67,6 +68,7 @@ pub struct GraphAnalysis {
     pub changes: Vec<FileChange>,
     pub widening: Widening,
     pub always_run: Vec<AlwaysRunTest>,
+    pub aggressive: Aggressive,
 }
 
 impl Selection {
@@ -236,6 +238,9 @@ impl Workspace {
         warnings.extend(rule_report.warnings);
 
         let graph = builder.build();
+
+        warnings.extend(config.aggressive.warnings(&graph));
+
         let unhandled = unhandled_changes(Some(&graph), &changes);
         let widening = if config.inference.widening {
             Widening::Scoped
@@ -245,8 +250,10 @@ impl Workspace {
         let always_run = config.rules.always_run_tests(&graph);
         let report = if root_scope_reasons.is_empty() {
             let selected_tests = select_tests(&graph, &changes, widening);
+            let (kept_tests, dropped_tests) = config.aggressive.split(&graph, selected_tests);
 
-            Report::from_selection(&graph, &changes, &selected_tests, config_hash)
+            Report::from_selection(&graph, &changes, &kept_tests, config_hash)
+                .with_dropped(&graph, &dropped_tests)
                 .with_always_run(always_run.clone())
         } else {
             Report::all(&graph, root_scope_reasons, config_hash)
@@ -263,6 +270,7 @@ impl Workspace {
                 changes,
                 widening,
                 always_run,
+                aggressive: config.aggressive,
             }),
         })
     }

@@ -32,9 +32,18 @@ pub(crate) struct LinkTable {
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum Targets {
+pub(crate) enum Targets {
     One(String),
     Many(Vec<String>),
+}
+
+impl Targets {
+    pub(crate) fn as_slice(&self) -> &[String] {
+        match self {
+            Targets::One(target) => std::slice::from_ref(target),
+            Targets::Many(targets) => targets.as_slice(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,10 +513,7 @@ pub(crate) fn is_broad(matched: usize, candidates: usize) -> bool {
 
 fn link_rule(line: usize, link_table: &LinkTable) -> Result<LinkRule> {
     let from = PathPattern::new(&link_table.from).map_err(rule_error(Some(line), "[[link]]"))?;
-    let targets = match &link_table.to {
-        Targets::One(target) => std::slice::from_ref(target),
-        Targets::Many(targets) => targets.as_slice(),
-    };
+    let targets = link_table.to.as_slice();
 
     if targets.is_empty() {
         bail!("invalid {CONFIG_FILE_NAME} at line {line}: [[link]] to lists no target");
@@ -569,7 +575,10 @@ fn ignore_rule(line: usize, ignore_table: &IgnoreTable) -> Result<IgnoreRule> {
     Ok(IgnoreRule { line, target })
 }
 
-fn rule_error(line: Option<usize>, rule: &'static str) -> impl Fn(anyhow::Error) -> anyhow::Error {
+pub(crate) fn rule_error(
+    line: Option<usize>,
+    rule: &'static str,
+) -> impl Fn(anyhow::Error) -> anyhow::Error {
     move |pattern_error| match line {
         Some(line) => {
             anyhow::anyhow!("invalid {CONFIG_FILE_NAME} at line {line}: {rule} {pattern_error}")
@@ -578,7 +587,7 @@ fn rule_error(line: Option<usize>, rule: &'static str) -> impl Fn(anyhow::Error)
     }
 }
 
-fn table_line<T>(config_text: &str, table: &Spanned<T>, header: &str) -> usize {
+pub(crate) fn table_line<T>(config_text: &str, table: &Spanned<T>, header: &str) -> usize {
     let span = table.span();
     let end = span.end.min(config_text.len());
 
@@ -591,7 +600,7 @@ fn table_line<T>(config_text: &str, table: &Spanned<T>, header: &str) -> usize {
         )
 }
 
-fn line_of(text: &str, byte_offset: usize) -> usize {
+pub(crate) fn line_of(text: &str, byte_offset: usize) -> usize {
     text.get(..byte_offset)
         .unwrap_or(text)
         .matches('\n')

@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 use serde::Serialize;
 
+use crate::aggressive::DroppedTest;
 use crate::changes::{FileChange, ResolvedRevisions};
 use crate::config::AlwaysAllMatch;
 use crate::files::{FileId, RepoPath};
@@ -83,6 +84,9 @@ pub enum ModeReason {
     OnlyUnhandled {
         changed_file_count: usize,
     },
+    Dropped {
+        test_count: usize,
+    },
     Error {
         message: String,
     },
@@ -98,6 +102,7 @@ impl ModeReason {
             ModeReason::Forced => "forced",
             ModeReason::NoImpact { .. } => "no_impact",
             ModeReason::OnlyUnhandled { .. } => "only_unhandled",
+            ModeReason::Dropped { .. } => "dropped",
             ModeReason::Error { .. } => "error",
         }
     }
@@ -151,6 +156,12 @@ impl ModeReason {
             ModeReason::OnlyUnhandled { changed_file_count } => format!(
                 "{changed_file_count} changed files are in languages Prober does not analyse"
             ),
+            ModeReason::Dropped { test_count: 1 } => {
+                "the 1 test file the changes reach is dropped by aggressive options".to_owned()
+            }
+            ModeReason::Dropped { test_count } => format!(
+                "the {test_count} test files the changes reach are dropped by aggressive options"
+            ),
             ModeReason::Error { message } => message.clone(),
         }
     }
@@ -169,6 +180,7 @@ impl From<AlwaysAllMatch<'_>> for ModeReason {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Impact {
     pub distance: Option<usize>,
+    pub hub_fanout: Option<usize>,
     pub reason: Vec<String>,
 }
 
@@ -197,6 +209,13 @@ impl Target {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedTarget {
+    pub target: Target,
+    pub option: &'static str,
+    pub description: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WidenedSite {
     pub site: String,
     pub cause: &'static str,
@@ -215,6 +234,7 @@ pub struct Report {
     pub mode: Mode,
     pub targets: Vec<Target>,
     pub widened: Vec<WidenedSite>,
+    pub dropped: Vec<DroppedTarget>,
     pub unhandled: Vec<RepoPath>,
     pub always_run_count: usize,
     pub test_count_by_language: BTreeMap<&'static str, usize>,
@@ -239,15 +259,7 @@ impl Report {
         };
         let targets = selected_tests
             .iter()
-            .map(|selected_test| Target {
-                path: graph.path(selected_test.file).clone(),
-                language: selected_test_language(graph, selected_test.file),
-                name: graph.target_name(selected_test.file).cloned(),
-                impact: Some(Impact {
-                    distance: Some(selected_test.distance()),
-                    reason: describe_reason(graph, &selected_test.reason),
-                }),
-            })
+            .map(|selected_test| selected_target(graph, selected_test))
             .collect();
 
         Self {
@@ -255,6 +267,7 @@ impl Report {
             mode,
             targets,
             widened: widened_sites(graph, selected_tests),
+            dropped: Vec::new(),
             unhandled: Vec::new(),
             always_run_count: 0,
             test_count_by_language: count_by_language(&graph.test_files_by_path()),
@@ -279,6 +292,7 @@ impl Report {
             mode: Mode::All { reasons },
             targets,
             widened: Vec::new(),
+            dropped: Vec::new(),
             unhandled: Vec::new(),
             always_run_count: 0,
             test_count_by_language: count_by_language(&test_files),
@@ -286,8 +300,33 @@ impl Report {
         }
     }
 
+    pub fn with_dropped(mut self, graph: &Graph, dropped_tests: &[DroppedTest]) -> Self {
+        if dropped_tests.is_empty() {
+            return self;
+        }
+
+        if let Mode::None { reasons } = &mut self.mode {
+            *reasons = vec![ModeReason::Dropped {
+                test_count: dropped_tests.len(),
+            }];
+        }
+
+        self.dropped = dropped_tests
+            .iter()
+            .map(|dropped_test| DroppedTarget {
+                target: selected_target(graph, &dropped_test.selected_test),
+                option: dropped_test.cause.option(),
+                description: dropped_test.cause.description(),
+            })
+            .collect();
+
+        self
+    }
+
     pub fn with_always_run(mut self, always_run_tests: Vec<AlwaysRunTest>) -> Self {
-        if self.mode != Mode::Selected {
+        let all_dropped = matches!(self.mode.reasons(), Some([ModeReason::Dropped { .. }]));
+
+        if self.mode != Mode::Selected && !all_dropped {
             return self;
         }
 
@@ -300,16 +339,20 @@ impl Report {
                 continue;
             }
 
+            self.dropped
+                .retain(|dropped| dropped.target.path != always_run_test.path);
             self.targets.push(Target {
                 path: always_run_test.path,
                 language: always_run_test.language,
                 name: None,
                 impact: Some(Impact {
                     distance: None,
+                    hub_fanout: None,
                     reason: vec![always_run_test.reason],
                 }),
             });
             self.always_run_count += 1;
+            self.mode = Mode::Selected;
         }
 
         self
@@ -351,6 +394,7 @@ impl Report {
         let mut targets: BTreeMap<&str, Vec<JsonTarget>> = BTreeMap::new();
         let mut reasons = BTreeMap::new();
         let mut distances = BTreeMap::new();
+        let mut hub_fanouts = BTreeMap::new();
 
         for target in &self.targets {
             let path = target.key();
@@ -370,6 +414,10 @@ impl Report {
                 if let Some(distance) = impact.distance {
                     distances.insert(path, distance);
                 }
+
+                if let Some(hub_fanout) = impact.hub_fanout {
+                    hub_fanouts.insert(path, hub_fanout);
+                }
             }
         }
 
@@ -385,7 +433,9 @@ impl Report {
             targets,
             reasons,
             distances,
+            hub_fanouts,
             widened: self.widened.iter().map(JsonWidenedSite::new).collect(),
+            dropped: self.dropped.iter().map(JsonDroppedTarget::new).collect(),
             unhandled: self.unhandled.iter().map(RepoPath::as_str).collect(),
             stats: self.json_stats(),
         };
@@ -506,6 +556,21 @@ impl Report {
             }
         }
 
+        if !self.dropped.is_empty() {
+            markdown.push_str(&format!(
+                "\nDropped by aggressive options: {}\n\n",
+                test_file_count(self.dropped.len())
+            ));
+
+            for dropped in self.dropped.iter().take(LISTED_SUMMARY_ITEMS) {
+                markdown.push_str(&format!(
+                    "- `{}`: {}\n",
+                    dropped.target.key(),
+                    dropped.description
+                ));
+            }
+        }
+
         if self.always_run_count > 0 {
             markdown.push_str(&format!(
                 "\nAlways run: {}\n",
@@ -531,6 +596,13 @@ impl Report {
                     summary_line.push_str(&format!(
                         ", {} added by widening",
                         self.tests_added_by_widening()
+                    ));
+                }
+
+                if !self.dropped.is_empty() {
+                    summary_line.push_str(&format!(
+                        ", {} dropped by aggressive options",
+                        self.dropped.len()
                     ));
                 }
 
@@ -584,6 +656,7 @@ impl Report {
             selected_ratio: rounded_ratio(self.targets.len() as f64, self.test_count() as f64),
             tests_added_by_widening: self.tests_added_by_widening(),
             tests_always_run: self.always_run_count,
+            tests_dropped: self.dropped.len(),
             by_language,
             config_hash: &self.config_hash,
         }
@@ -599,7 +672,9 @@ struct JsonReport<'a> {
     targets: BTreeMap<&'static str, Vec<JsonTarget<'a>>>,
     reasons: BTreeMap<&'a str, &'a [String]>,
     distances: BTreeMap<&'a str, usize>,
+    hub_fanouts: BTreeMap<&'a str, usize>,
     widened: Vec<JsonWidenedSite<'a>>,
+    dropped: Vec<JsonDroppedTarget<'a>>,
     unhandled: Vec<&'a str>,
     stats: JsonStats<'a>,
 }
@@ -626,6 +701,27 @@ impl<'a> JsonWidenedSite<'a> {
             kind: UNRESOLVED_DYNAMIC_IMPORT,
             cause: widened_site.cause,
             added: widened_site.added,
+        }
+    }
+}
+
+#[derive(Serialize)]
+struct JsonDroppedTarget<'a> {
+    test: &'a str,
+    option: &'static str,
+    distance: Option<usize>,
+    hub_fanout: Option<usize>,
+}
+
+impl<'a> JsonDroppedTarget<'a> {
+    fn new(dropped: &'a DroppedTarget) -> Self {
+        let impact = dropped.target.impact.as_ref();
+
+        Self {
+            test: dropped.target.key(),
+            option: dropped.option,
+            distance: impact.and_then(|impact| impact.distance),
+            hub_fanout: impact.and_then(|impact| impact.hub_fanout),
         }
     }
 }
@@ -687,6 +783,7 @@ impl<'a> JsonModeReason<'a> {
             ModeReason::Forced
             | ModeReason::NoImpact { .. }
             | ModeReason::OnlyUnhandled { .. }
+            | ModeReason::Dropped { .. }
             | ModeReason::Error { .. } => json_mode_reason,
         }
     }
@@ -699,6 +796,7 @@ struct JsonStats<'a> {
     selected_ratio: f64,
     tests_added_by_widening: usize,
     tests_always_run: usize,
+    tests_dropped: usize,
     by_language: BTreeMap<&'static str, JsonLanguageStats>,
     config_hash: &'a str,
 }
@@ -708,6 +806,19 @@ struct JsonLanguageStats {
     total: usize,
     selected: usize,
     ratio: f64,
+}
+
+fn selected_target(graph: &Graph, selected_test: &SelectedTest) -> Target {
+    Target {
+        path: graph.path(selected_test.file).clone(),
+        language: selected_test_language(graph, selected_test.file),
+        name: graph.target_name(selected_test.file).cloned(),
+        impact: Some(Impact {
+            distance: Some(selected_test.distance()),
+            hub_fanout: Some(selected_test.hub_crossing().fanout),
+            reason: describe_reason(graph, &selected_test.reason),
+        }),
+    }
 }
 
 fn selected_test_language(graph: &Graph, selected_test: FileId) -> &'static str {
@@ -1141,7 +1252,12 @@ mod tests {
     "src/a.test.ts": 1,
     "src/b.test.ts": 2
   },
+  "hub_fanouts": {
+    "src/a.test.ts": 0,
+    "src/b.test.ts": 2
+  },
   "widened": [],
+  "dropped": [],
   "unhandled": [],
   "stats": {
     "tests_total": 3,
@@ -1149,6 +1265,7 @@ mod tests {
     "selected_ratio": 0.6667,
     "tests_added_by_widening": 0,
     "tests_always_run": 0,
+    "tests_dropped": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -1639,7 +1756,9 @@ mod tests {
   },
   "reasons": {},
   "distances": {},
+  "hub_fanouts": {},
   "widened": [],
+  "dropped": [],
   "unhandled": [],
   "stats": {
     "tests_total": 3,
@@ -1647,6 +1766,7 @@ mod tests {
     "selected_ratio": 1.0,
     "tests_added_by_widening": 0,
     "tests_always_run": 0,
+    "tests_dropped": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -1686,7 +1806,9 @@ mod tests {
   "targets": {},
   "reasons": {},
   "distances": {},
+  "hub_fanouts": {},
   "widened": [],
+  "dropped": [],
   "unhandled": [],
   "stats": {
     "tests_total": 3,
@@ -1694,6 +1816,7 @@ mod tests {
     "selected_ratio": 0.0,
     "tests_added_by_widening": 0,
     "tests_always_run": 0,
+    "tests_dropped": 0,
     "by_language": {
       "python": {
         "total": 1,
@@ -1857,12 +1980,95 @@ Changes reaching the most test files:
             json_report["mode_reasons"],
             serde_json::json!([{
                 "kind": "error",
-                "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
+                "message": "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`, `aggressive`, `defer`, `protected`",
             }])
         );
         assert_eq!(
             report.summary_line(),
-            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`"
+            "prober: all 3 test files — invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`, `aggressive`, `defer`, `protected`"
+        );
+    }
+
+    fn report_with_options(config_text: &str, always_run: Vec<AlwaysRunTest>) -> Report {
+        let graph = polyglot_graph();
+        let config = Config::parse(config_text).unwrap();
+        let changes = [modified("src/a.ts")];
+        let selected_tests = select_tests(&graph, &changes, Widening::Scoped);
+        let (kept_tests, dropped_tests) = config.aggressive.split(&graph, selected_tests);
+
+        Report::from_selection(&graph, &changes, &kept_tests, CONFIG_HASH.to_owned())
+            .with_dropped(&graph, &dropped_tests)
+            .with_always_run(always_run)
+    }
+
+    #[test]
+    fn dropped_tests_leave_the_targets_and_are_listed_with_their_option() {
+        let report = report_with_options("[aggressive]\nmax_distance = 1\n", Vec::new());
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(report.to_list(ListSeparator::Newline), "src/a.test.ts\n");
+        assert_eq!(
+            json_report["dropped"],
+            serde_json::json!([{
+                "test": "src/b.test.ts",
+                "option": "max_distance",
+                "distance": 2,
+                "hub_fanout": 2,
+            }])
+        );
+        assert_eq!(
+            json_report["hub_fanouts"],
+            serde_json::json!({ "src/a.test.ts": 0 })
+        );
+        assert_eq!(json_report["stats"]["tests_dropped"], 1);
+        assert_eq!(
+            report.summary_line(),
+            "prober: selected 1/3 test files (33.3%), 1 dropped by aggressive options"
+        );
+        assert!(
+            report.to_markdown().ends_with(
+                "\nDropped by aggressive options: 1 test file\n\n- `src/b.test.ts`: [aggressive] max_distance = 1 (prober.toml:2)\n"
+            ),
+            "{}",
+            report.to_markdown()
+        );
+    }
+
+    #[test]
+    fn every_impacted_test_dropped_runs_none_unless_tests_always_run() {
+        let report = report_with_options("[aggressive]\nmax_distance = 0\n", Vec::new());
+        let always_run = AlwaysRunTest {
+            path: repo_path("src/b.test.ts"),
+            language: "typescript",
+            reason: "always run by prober.toml:5 (\"src/b.test.ts\")".to_owned(),
+        };
+        let with_always_run = report_with_options(
+            "[aggressive]\nmax_distance = 0\n\n[always_run]\ntests = [\"src/b.test.ts\"]\n",
+            vec![always_run],
+        );
+
+        assert_eq!(
+            report.mode,
+            Mode::None {
+                reasons: vec![ModeReason::Dropped { test_count: 2 }]
+            }
+        );
+        assert_eq!(
+            report.summary_line(),
+            "prober: none of 3 test files — the 2 test files the changes reach are dropped by aggressive options"
+        );
+        assert_eq!(with_always_run.mode, Mode::Selected);
+        assert_eq!(
+            with_always_run.to_list(ListSeparator::Newline),
+            "src/b.test.ts\n"
+        );
+        assert_eq!(
+            with_always_run
+                .dropped
+                .iter()
+                .map(|dropped| dropped.target.path.as_str())
+                .collect::<Vec<_>>(),
+            ["src/a.test.ts"]
         );
     }
 }

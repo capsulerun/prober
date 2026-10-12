@@ -93,6 +93,7 @@ fn print_explanation(selection: &Selection, test: &RepoPath) -> ExitCode {
                 test,
                 analysis.widening,
                 &analysis.always_run,
+                &analysis.aggressive,
             );
 
             if explanation == Explanation::NotATest {
