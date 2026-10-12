@@ -60,7 +60,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/relea
 > [!IMPORTANT]
 > To pin a version, replace `latest/download` with `download/v0.1.0`.
 
-Then, from the repository, pass the tests your change can affect, against the branch it targets, to your test runner:
+Then, from the repository, pass the tests your change can affect against the branch it targets, to your test runner:
 
 ```bash
 prober --base origin/main | xargs -r npx vitest run
@@ -70,7 +70,12 @@ prober --base origin/main | xargs -r npx vitest run
 
 ### Output and options
 
-A selection has one of three modes: `selected` (the listed tests), `none` (the change reaches no test) and `all` (every test, with the reason). For Rust, the targets are crates, run with `cargo test -p <crate>`.
+A selection has one of three modes:
+- `none`: the change reaches no test
+- `selected` : the listed tests
+- `all`: every test, with the reason
+
+For Rust, the targets are crates, run with `cargo test -p <crate>`. 
 
 `--format json` gives the targets of each language apart, with the reasons and statistics, and `-0` separates the list with NUL characters:
 
@@ -251,7 +256,7 @@ Dropped tests are listed under `dropped` in the JSON and in the summary, and `pr
 
 ## Contributing
 
-Prober is written in Rust. The toolchain is pinned in `rust-toolchain.toml`, so `rustup` picks it up.
+The toolchain is pinned in `rust-toolchain.toml`, so `rustup` picks it up.
 
 ```bash
 cargo build
