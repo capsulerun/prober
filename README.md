@@ -70,14 +70,12 @@ prober --base origin/main | xargs -r npx vitest run
 
 ### Output and options
 
-A selection has one of three modes:
-- `none`: the change reaches no test
-- `selected` : the listed tests
-- `all`: every test, with the reason
+Every run ends in one of three modes:
+- `selected`: only the listed tests run
+- `none`: the change reaches no test, so nothing runs
+- `all`: every test runs, and the output says why
 
-For Rust, the targets are crates, run with `cargo test -p <crate>`. 
-
-`--format json` gives the targets of each language apart, with the reasons and statistics, and `-0` separates the list with NUL characters:
+By default, Prober prints one test file per line, ready for `xargs`. For Rust, each line is a crate, to run with `cargo test -p <crate>`. When a repository mixes languages, `--format json` keeps the targets of each language apart, with the reasons each test was selected and some statistics. `-0` separates the list with NUL characters instead of newlines.
 
 ```bash
 prober --base origin/main --format json > selection.json
@@ -86,15 +84,49 @@ jq -r '.targets.rust // [] | .[].crate | "-p " + .' selection.json | xargs cargo
 prober --base origin/main -0 | xargs -0 npx vitest run
 ```
 
-If the run fails, every test is selected; `--on-error fail` exits with an error instead. `PROBER_SELECTION=all` forces every test, for a release branch or an incident.
+For CI systems that pass files between steps, `--output-dir <directory>` also writes the selection (`selection.json`), a Markdown summary (`summary.md`) and one list per language (`typescript.txt`, `python.txt`, `rust.txt`).
 
-The history of the base branch is needed to find the merge base. Outside the GitHub Action, check out with enough history (`fetch-depth: 0` with `actions/checkout`).
+Prober needs the history of the base branch to find where the change started. Outside the GitHub Action, check out with enough history (`fetch-depth: 0` with `actions/checkout`). If the selection fails anyway, every test runs; `--on-error fail` exits with an error instead. To run every test on purpose, for a release branch or during an incident, set `PROBER_SELECTION=all`.
 
-`--output-dir <directory>` also writes the selection as `selection.json`, a Markdown summary as `summary.md`, and the targets of each language as `typescript.txt`, `python.txt` and `rust.txt`, for CI systems that pass files between steps.
+### Understand a selection
+
+`why` explains why a test file (or crate) is selected, hop by hop from the change, or why it is not:
+
+```bash
+prober why --base origin/main tests/test_parser.py
+```
+
+`scan` shows what Prober understands of the whole repository: the links it inferred, the dynamic imports it could not resolve and how many tests each one reaches, the files no test reaches, and the hubs most tests depend on. Run it once on a new repository to see where a line of configuration would help:
+
+```bash
+prober scan
+```
+
+### Check it before relying on it
+
+Before skipping tests for real, compare the selection with a full run. `shadow` reads both and reports the failures the selection would have caught, those it would have missed, and the time it would have saved:
+
+```bash
+prober --base origin/main --format json > selection.json
+npx vitest run --reporter=junit --outputFile=junit.xml
+prober shadow --selection selection.json --report junit.xml
+```
+
+In GitHub Actions, select first, run the whole suite, then hand the report to the Action, which adds the comparison to the job summary:
+
+```yaml
+- uses: capsulerun/prober@v0
+- run: npx vitest run --reporter=junit --outputFile=junit.xml
+- uses: capsulerun/prober@v0
+  with:
+    shadow-report: junit.xml
+```
+
+Once many runs are compared, `prober shadow --aggregate <files>` reads their results together and recommends values for the [aggressive options](#aggressive-defer-and-protected).
 
 ### GitHub Action
 
-`capsulerun/prober@v0` installs the binary of its own version, verifies its checksum and build provenance attestation, fetches the history it needs from a shallow checkout, selects, and writes a job summary.
+`capsulerun/prober@v0` installs the Prober binary of its own version and verifies its checksum and build provenance attestation. It then fetches only the history it needs, even from a shallow checkout, selects the tests and writes a job summary.
 
 | Input | Default | |
 |---|---|---|
@@ -114,43 +146,9 @@ The history of the base branch is needed to find the merge base. Outside the Git
 | `json-file` | The selection with the reasons of each test |
 | `shadow-file` | With `shadow-report`, the comparison as JSON |
 
-To compare with a full run before relying on it:
-
-```yaml
-- uses: capsulerun/prober@v0
-- run: npx vitest run --reporter=junit --outputFile=junit.xml
-- uses: capsulerun/prober@v0
-  with:
-    shadow-report: junit.xml
-```
-
-### Understand a selection
-
-```bash
-prober why --base origin/main tests/test_parser.py
-```
-
-`why` explains why a test file (or crate) is selected for a change, hop by hop, or why it is not.
-
-```bash
-prober scan
-```
-
-`scan` reports what is inferred from the repository: the links it found, the dynamic imports it could not resolve and how many tests each one reaches, the files no test reaches, and the hubs most tests depend on. Run it once on a new repository to see where a line of configuration would help.
-
-### Check it before relying on it
-
-```bash
-prober --base origin/main --format json > selection.json
-npx vitest run --reporter=junit --outputFile=junit.xml
-prober shadow --selection selection.json --report junit.xml
-```
-
-`shadow` compares a selection with the results of a full run: the failures it would have caught, those it would have missed, and what it would have saved. `prober shadow --aggregate <files>` reads many of these results together and recommends values for the aggressive options.
-
 ### Configuration (optional)
 
-No configuration is needed. An optional `prober.toml` at the root of the repository covers what the code cannot tell, and corrects inference where it selects too much. A mistake in it fails the run with the line at fault; `prober scan` lists each rule with what it matched.
+Most repositories need no configuration. When the code alone cannot tell which tests a change affects, or when inference selects too much, add a `prober.toml` at the root of the repository. A mistake in it fails the run and names the line at fault, and `prober scan` lists each rule with what it matched.
 
 ```toml
 # Detected from the repository; list presets only to force or restrict them
@@ -206,29 +204,29 @@ Paths are relative to the root of the repository. In patterns, `*` matches withi
 
 #### `presets`
 
-The test runners and frameworks whose conventions apply: test file names, setup files, config files and how their changes are diffed. `"auto"` (the default) detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `vite`, `vitest`.
+The test runners and frameworks whose conventions apply: test file names, setup files, config files and how their changes are compared. `"auto"`, the default, detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `vite`, `vitest`.
 
 #### `[always_all]`
 
-`files`: patterns of files whose change runs every test. Use it for what cannot be reasoned about from the code, such as CI scripts or custom tooling. Each language already has a few (a toolchain file, `.cargo/config.toml`), while manifests, lockfiles and runner configs are diffed field by field instead.
+`files`: patterns of files whose change runs every test, for what cannot be reasoned about from the code, such as CI scripts or custom tooling. Each language already has a few built in (a toolchain file, `.cargo/config.toml`). Manifests, lockfiles and runner configs need none: their changes are compared field by field.
 
 #### `[always_run]`
 
-`tests`: patterns of tests added to every selection that is not empty, such as a small smoke set. It only adds tests.
+`tests`: patterns of tests added to every selection that is not empty, such as a small smoke set. It only ever adds tests.
 
 #### `[[link]]`
 
-A dependency the code does not show: a change to a file matching `from` selects the tests that depend on the files matching `to`, or the tests matching `to` themselves. `to` is one pattern or a list. A `{name}` captured in `from` narrows `to` to the same value, so `plugins/{id}/**` links each plugin folder to its own test only.
+A dependency the code does not show. When a file matching `from` changes, the tests that depend on the files matching `to` are selected, or the tests matching `to` themselves. `to` is one pattern or a list. A `{name}` captured in `from` narrows `to` to the same value, so `plugins/{id}/**` links each plugin folder to its own test only.
 
 #### `[[ignore]]`
 
-Removes what inference got wrong. Two forms:
+Removes what inference got wrong, in one of two forms:
 - `from` and `to`: drops the links where files matching `to` depend on files matching `from`. A warning says when this also drops imports written in the code.
-- `site`: sets aside the dynamic imports and file reads of a file (`"src/loader.ts"`) or of one of its lines (`"src/loader.ts:42"`) that could not be resolved, so they no longer widen the selection. Pair it with a `[[link]]` that says what the site loads.
+- `site`: sets aside the dynamic imports and file reads that could not be resolved in a file (`"src/loader.ts"`) or on one of its lines (`"src/loader.ts:42"`), so they no longer widen the selection. Pair it with a `[[link]]` that says what the site loads.
 
 #### `[inference]`
 
-Each inference can be switched off, to measure what it adds or when it misbehaves on a repository. All are on by default.
+Every inference is on by default. Switch one off to measure what it adds, or when it misbehaves on a repository.
 
 | Field | What it infers |
 |---|---|
@@ -245,12 +243,12 @@ Each inference can be switched off, to measure what it adds or when it misbehave
 
 #### `[aggressive]`, `[[defer]]` and `[protected]`
 
-Off by default, they drop some of the tests a change can reach, for more savings. Use them with a periodic full run on the main branch, and values from `prober shadow --aggregate`.
+Off by default, these options drop some of the tests a change can reach, for more savings. Use them with a periodic full run on the main branch, which catches what they let through, and with values from `prober shadow --aggregate`.
 
 - `max_distance` in `[aggressive]`: drops the tests more than this many files away from every change. A test importing a changed file is at distance 1.
-- `hub_fanout_limit` in `[aggressive]`: past a file that more than this many files depend on, keeps only its direct dependents. A test is dropped when every path to it goes beyond the direct dependents of such a hub.
-- `[[defer]]`: `tests` (one pattern or a list) run only within `max_distance` of a change, for slow suites such as integration or browser tests. Several `[[defer]]` tables can set different distances.
-- `[protected]`: `tests` patterns that these options never drop, such as tests that caught real regressions. Tests that mock a module whose exports changed are protected too.
+- `hub_fanout_limit` in `[aggressive]`: past a file that more than this many files depend on, keeps only its direct dependents. A test is dropped only when every path to it goes past such a hub.
+- `[[defer]]`: the `tests` it names (one pattern or a list) run only within its `max_distance` of a change, for slow suites such as integration or browser tests. Several `[[defer]]` tables can set different distances.
+- `[protected]`: `tests` that these options never drop, such as tests that caught real regressions. Tests that mock a module whose exports changed are protected too.
 
 Dropped tests are listed under `dropped` in the JSON and in the summary, and `prober why` names the option that dropped them.
 
