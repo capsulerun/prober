@@ -23,6 +23,8 @@ pub const SELECTION_VARIABLE: &str = "PROBER_SELECTION";
 
 pub const CONFIG_FILE_NAME: &str = "prober.toml";
 
+const LISTED_SUMMARY_ITEMS: usize = 5;
+
 pub(crate) const WIDENED_HOP_PREFIX: &str = "-> widened: ";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -408,6 +410,110 @@ impl Report {
         }
 
         list
+    }
+
+    pub fn to_language_list(&self, language: &str) -> String {
+        let mut list = String::new();
+
+        for target in self
+            .targets
+            .iter()
+            .filter(|target| target.language == language)
+        {
+            list.push_str(target.key());
+            list.push('\n');
+        }
+
+        list
+    }
+
+    pub fn to_markdown(&self) -> String {
+        let test_count = self.test_count();
+        let heading = match &self.mode {
+            Mode::Selected => format!(
+                "selected {}/{test_count} test files ({})",
+                self.targets.len(),
+                format_percentage(self.targets.len() as f64, test_count as f64)
+            ),
+            Mode::All { .. } => format!("all {test_count} test files"),
+            Mode::None { .. } => format!("none of {test_count} test files"),
+        };
+        let mut markdown = format!("### Prober: {heading}\n");
+
+        if let Some(reasons) = self.mode.reasons() {
+            markdown.push('\n');
+
+            for reason in reasons {
+                markdown.push_str(&format!("- {}\n", reason.message()));
+            }
+        }
+
+        let mut selected_count_by_language: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for target in &self.targets {
+            *selected_count_by_language
+                .entry(target.language)
+                .or_default() += 1;
+        }
+
+        if self.test_count_by_language.len() > 1 {
+            markdown.push_str("\n| Language | Selected | Test files |\n| --- | --- | --- |\n");
+
+            for (language, total) in &self.test_count_by_language {
+                let selected = selected_count_by_language
+                    .get(language)
+                    .copied()
+                    .unwrap_or_default();
+
+                markdown.push_str(&format!("| {language} | {selected} | {total} |\n"));
+            }
+        }
+
+        let mut test_count_by_change: BTreeMap<&str, usize> = BTreeMap::new();
+
+        for change in self
+            .targets
+            .iter()
+            .filter_map(|target| target.impact.as_ref()?.reason.first())
+        {
+            *test_count_by_change.entry(change.as_str()).or_default() += 1;
+        }
+
+        if !test_count_by_change.is_empty() {
+            let mut changes: Vec<(&str, usize)> = test_count_by_change.into_iter().collect();
+
+            changes.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(right.0)));
+            markdown.push_str("\nChanges reaching the most test files:\n\n");
+
+            for (change, count) in changes.iter().take(LISTED_SUMMARY_ITEMS) {
+                markdown.push_str(&format!("- `{change}`: {}\n", test_file_count(*count)));
+            }
+        }
+
+        if !self.widened.is_empty() {
+            markdown.push_str(&format!(
+                "\nAdded by widening, through sites that could not be resolved: {}\n\n",
+                test_file_count(self.tests_added_by_widening())
+            ));
+
+            for widened_site in self.widened.iter().take(LISTED_SUMMARY_ITEMS) {
+                markdown.push_str(&format!(
+                    "- `{}` ({}): {}\n",
+                    widened_site.site,
+                    widened_site.cause,
+                    test_file_count(widened_site.added)
+                ));
+            }
+        }
+
+        if self.always_run_count > 0 {
+            markdown.push_str(&format!(
+                "\nAlways run: {}\n",
+                test_file_count(self.always_run_count)
+            ));
+        }
+
+        markdown
     }
 
     pub fn summary_line(&self) -> String {
@@ -893,6 +999,14 @@ fn widened_sites(graph: &Graph, selected_tests: &[SelectedTest]) -> Vec<WidenedS
     widened_sites.sort_by_key(|widened_site| Reverse(widened_site.added));
 
     widened_sites
+}
+
+fn test_file_count(count: usize) -> String {
+    if count == 1 {
+        return "1 test file".to_owned();
+    }
+
+    format!("{count} test files")
 }
 
 fn join_messages(mode_reasons: &[ModeReason]) -> String {
@@ -1674,6 +1788,57 @@ mod tests {
         assert_eq!(
             none_report.summary_line(),
             "prober: none of 3 test files — 1 changed file reaches no test file"
+        );
+    }
+
+    #[test]
+    fn language_lists_hold_the_targets_of_one_language_in_every_mode() {
+        let graph = polyglot_graph();
+        let selected_report = report_for_changes(&graph, &[modified("src/a.ts")]);
+        let all_report = report_running_all(&graph);
+        let none_report = report_for_changes(&graph, &[modified("README.md")]);
+
+        assert_eq!(
+            selected_report.to_language_list("typescript"),
+            "src/a.test.ts\nsrc/b.test.ts\n"
+        );
+        assert_eq!(selected_report.to_language_list("python"), "");
+        assert_eq!(all_report.to_language_list("python"), "tests/test_api.py\n");
+        assert_eq!(none_report.to_language_list("typescript"), "");
+    }
+
+    #[test]
+    fn markdown_summary_gives_the_mode_the_languages_and_the_main_changes_or_reasons() {
+        let graph = polyglot_graph();
+        let selected_report = report_for_changes(&graph, &[modified("src/a.ts")]);
+        let all_report = report_running_all(&graph);
+
+        assert_eq!(
+            selected_report.to_markdown(),
+            "### Prober: selected 2/3 test files (66.7%)
+
+| Language | Selected | Test files |
+| --- | --- | --- |
+| python | 0 | 1 |
+| typescript | 2 | 2 |
+
+Changes reaching the most test files:
+
+- `src/a.ts (modified)`: 2 test files
+"
+        );
+        assert_eq!(
+            all_report.to_markdown(),
+            "### Prober: all 3 test files
+
+- ci/deploy.sh (modified) matches always_all \"ci/**\"
+- ci/lint.sh (modified) matches always_all \"ci/**\"
+
+| Language | Selected | Test files |
+| --- | --- | --- |
+| python | 1 | 1 |
+| typescript | 2 | 2 |
+"
         );
     }
 

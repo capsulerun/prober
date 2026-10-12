@@ -1,0 +1,26 @@
+name: Action tag
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  move:
+    if: ${{ !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Move the major version tag
+        run: |
+          major=${TAG%%.*}
+          git tag --force "$major" "$TAG^{commit}"
+          git push --force origin "refs/tags/$major"
+          echo "$major now points to $TAG"

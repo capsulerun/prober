@@ -1,0 +1,192 @@
+name: Action
+
+on:
+  pull_request:
+    paths:
+      - action.yml
+      - action/**
+      - crates/cli/**
+      - crates/core/src/report.rs
+      - .github/workflows/action.yml
+  push:
+    branches: [main]
+    paths:
+      - action.yml
+      - action/**
+      - .github/workflows/action.yml
+
+permissions:
+  contents: read
+
+jobs:
+  select:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: Select (${{ matrix.os }})
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Base and history
+        run: bash action/test-base.sh
+
+      - name: Demo repositories, cloned one commit deep
+        run: |
+          origin="$RUNNER_TEMP/demo-origin"
+          url="file://$origin"
+          if command -v cygpath > /dev/null; then
+            origin=$(cygpath -u "$RUNNER_TEMP")/demo-origin
+            url="file:///$(cygpath -m "$RUNNER_TEMP")/demo-origin"
+          fi
+          commit() { git -c user.name=test -c user.email=test@example.com commit --quiet "$@"; }
+          git init --quiet --initial-branch=main "$origin"
+          cd "$origin"
+          mkdir -p src test ci
+          echo '{ "name": "demo", "devDependencies": { "vitest": "^3.2.0" } }' > package.json
+          printf '[always_all]\nfiles = ["ci/**"]\n' > prober.toml
+          echo 'export const total = (price: number) => price;' > src/cart.ts
+          echo 'export const slug = (text: string) => text;' > src/slug.ts
+          echo 'import { total } from "../src/cart"; test("cart", () => total(1));' > test/cart.test.ts
+          echo 'import { slug } from "../src/slug"; test("slug", () => slug("a"));' > test/slug.test.ts
+          echo 'echo check' > ci/check.sh
+          echo '# Demo' > README.md
+          git add .
+          commit --message "demo"
+          for number in $(seq 1 20); do echo "$number" >> README.md; commit --all --message "history $number"; done
+          for branch in selected none all; do git branch "$branch"; done
+          git switch --quiet selected && echo 'export const total = (price: number) => price * 2;' > src/cart.ts && commit --all --message "change the cart"
+          git switch --quiet none && echo "notes" >> README.md && commit --all --message "change the readme"
+          git switch --quiet all && echo 'echo lint' >> ci/check.sh && commit --all --message "change the CI script"
+          git switch --quiet main
+          cd "$GITHUB_WORKSPACE"
+          for branch in selected none all; do git clone --quiet --depth 1 --branch "$branch" "$url" "demo-$branch"; done
+
+      - name: Selected
+        id: selected
+        uses: ./
+        with:
+          working-directory: demo-selected
+          base: main
+
+      - name: Check the selection
+        env:
+          MODE: ${{ steps.selected.outputs.mode }}
+          TESTS: ${{ steps.selected.outputs.typescript-file }}
+          JSON: ${{ steps.selected.outputs.json-file }}
+        run: |
+          [ "$MODE" = selected ]
+          [ "$(cat "$TESTS")" = "test/cart.test.ts" ]
+          [ "$(jq -r '.targets.typescript[0]' "$JSON")" = "test/cart.test.ts" ]
+
+      - name: Shadow
+        working-directory: demo-selected
+        run: |
+          printf '%s\n' '<testsuites><testsuite name="demo">' \
+            '<testcase name="cart" file="test/cart.test.ts"><failure message="broken"/></testcase>' \
+            '<testcase name="slug" file="test/slug.test.ts"/>' \
+            '</testsuite></testsuites>' > junit.xml
+
+      - name: Compare with the full run
+        uses: ./
+        with:
+          working-directory: demo-selected
+          shadow-report: junit.xml
+
+      - name: None
+        id: none
+        uses: ./
+        with:
+          working-directory: demo-none
+          base: main
+
+      - name: All
+        id: all
+        uses: ./
+        with:
+          working-directory: demo-all
+          base: main
+
+      - name: Forced by the kill switch
+        id: forced
+        uses: ./
+        env:
+          PROBER_SELECTION: all
+        with:
+          working-directory: demo-selected
+          base: main
+
+      - name: Check the modes
+        env:
+          NONE_MODE: ${{ steps.none.outputs.mode }}
+          NONE_TESTS: ${{ steps.none.outputs.typescript-file }}
+          ALL_MODE: ${{ steps.all.outputs.mode }}
+          ALL_REASONS: ${{ steps.all.outputs.mode-reasons }}
+          ALL_TESTS: ${{ steps.all.outputs.typescript-file }}
+          FORCED_MODE: ${{ steps.forced.outputs.mode }}
+        run: |
+          [ "$NONE_MODE" = none ]
+          [ ! -s "$NONE_TESTS" ]
+          [ "$ALL_MODE" = all ]
+          echo "$ALL_REASONS" | jq -e '.[0] | contains("ci/check.sh")'
+          [ "$(wc -l < "$ALL_TESTS")" -eq 2 ]
+          [ "$FORCED_MODE" = all ]
+
+  install:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: Install (${{ matrix.os }})
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: 0.1.0-rc.1
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install a release
+        env:
+          INPUT_VERSION: ${{ env.VERSION }}
+          VERIFY_ATTESTATION: "true"
+          GITHUB_ACTION_PATH: ${{ github.workspace }}
+        run: bash action/install.sh
+
+      - name: Check the installed version
+        run: |
+          prober --version
+          [ "$(prober --version)" = "prober $VERSION" ]
+
+      - name: Refuse a tampered checksum
+        env:
+          INPUT_VERSION: ${{ env.VERSION }}
+          VERIFY_ATTESTATION: "true"
+          GITHUB_ACTION_PATH: ${{ github.workspace }}
+        run: |
+          fake="$RUNNER_TEMP/fake-release"
+          url="file://$fake"
+          if command -v cygpath > /dev/null; then
+            fake=$(cygpath -u "$RUNNER_TEMP")/fake-release
+            url="file:///$(cygpath -m "$RUNNER_TEMP")/fake-release"
+          fi
+          gh release download "v$VERSION" --repo capsulerun/prober --pattern 'prober-*' --dir "$fake/v$VERSION"
+          for checksum in "$fake/v$VERSION"/*.sha256; do
+            sed -i.bak 's/^[0-9a-f]*/0000000000000000000000000000000000000000000000000000000000000000/' "$checksum"
+          done
+          if PROBER_RELEASE_URL="$url" RUNNER_TOOL_CACHE="$RUNNER_TEMP/empty-cache" bash action/install.sh > output.txt 2>&1; then
+            cat output.txt
+            exit 1
+          fi
+          cat output.txt
+          grep -q "does not match its checksum" output.txt

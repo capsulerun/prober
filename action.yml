@@ -1,0 +1,102 @@
+name: Prober
+description: Selects the tests a change can affect, and hands them to the next steps through files.
+author: capsulerun
+branding:
+  icon: filter
+  color: blue
+
+inputs:
+  base:
+    description: Revision to compare with. Default, the pull request's base for pull requests and merge queues, the previous commit for pushes, else the default branch.
+    required: false
+  version:
+    description: Prober version to install, e.g. 0.1.0. Default, the version of this Action's tag.
+    required: false
+  working-directory:
+    description: Directory of the repository to select in.
+    required: false
+    default: .
+  on-error:
+    description: When the selection fails, run every test (all) or fail the step (fail).
+    required: false
+    default: all
+  args:
+    description: Extra arguments passed to prober.
+    required: false
+  shadow-report:
+    description: JUnit reports of a full test run, one per line. Compares them with the selection made earlier in the job (prober shadow) instead of selecting.
+    required: false
+  verify-attestation:
+    description: Verify the build provenance attestation of the downloaded binary with gh (true), or its checksum only (false).
+    required: false
+    default: "true"
+  token:
+    description: Token used to verify the attestation.
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  mode:
+    description: selected, all or none.
+    value: ${{ steps.select.outputs.mode }}
+  mode-reasons:
+    description: Why every test or no test runs, as a JSON array of messages.
+    value: ${{ steps.select.outputs.mode-reasons }}
+  json-file:
+    description: The selection as JSON, with the reasons of each test.
+    value: ${{ steps.select.outputs.json-file }}
+  typescript-file:
+    description: The TypeScript and JavaScript test files to run, one per line.
+    value: ${{ steps.select.outputs.typescript-file }}
+  python-file:
+    description: The Python test files to run, one per line.
+    value: ${{ steps.select.outputs.python-file }}
+  rust-file:
+    description: The Rust crates to test, one per line.
+    value: ${{ steps.select.outputs.rust-file }}
+
+runs:
+  using: composite
+  steps:
+    - name: Install Prober
+      shell: bash
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+        VERIFY_ATTESTATION: ${{ inputs.verify-attestation }}
+        GH_TOKEN: ${{ inputs.token }}
+      run: bash "$GITHUB_ACTION_PATH/action/install.sh"
+
+    - name: Find the base
+      id: base
+      if: inputs.shadow-report == ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        INPUT_BASE: ${{ inputs.base }}
+        EVENT_NAME: ${{ github.event_name }}
+        PULL_REQUEST_BASE: ${{ github.event.pull_request.base.sha }}
+        MERGE_GROUP_BASE: ${{ github.event.merge_group.base_sha }}
+        PUSH_BEFORE: ${{ github.event.before }}
+        DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        REF_NAME: ${{ github.ref_name }}
+      run: bash "$GITHUB_ACTION_PATH/action/base.sh"
+
+    - name: Select tests
+      id: select
+      if: inputs.shadow-report == ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        BASE: ${{ steps.base.outputs.base }}
+        FORCE_ALL: ${{ steps.base.outputs.force-all }}
+        ON_ERROR: ${{ inputs.on-error }}
+        EXTRA_ARGS: ${{ inputs.args }}
+      run: bash "$GITHUB_ACTION_PATH/action/select.sh"
+
+    - name: Compare with the full run
+      if: inputs.shadow-report != ''
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        SHADOW_REPORT: ${{ inputs.shadow-report }}
+      run: bash "$GITHUB_ACTION_PATH/action/shadow.sh"

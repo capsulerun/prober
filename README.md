@@ -31,7 +31,7 @@ Prober outputs the tests a change can affect, each with the reason it was select
 - uses: actions/checkout@v7
 - uses: capsulerun/prober@v0
   id: prober
-- run: xargs -r -a "$TESTS" npx vitest run
+- run: xargs -r npx vitest run < "$TESTS"
   env:
     TESTS: ${{ steps.prober.outputs.typescript-file }}
 ```
@@ -81,6 +81,39 @@ prober --base origin/main -0 | xargs -0 npx vitest run
 If the run fails, every test is selected; `--on-error fail` exits with an error instead. `PROBER_SELECTION=all` forces every test, for a release branch or an incident.
 
 The history of the base branch is needed to find the merge base. Outside the GitHub Action, check out with enough history (`fetch-depth: 0` with `actions/checkout`).
+
+`--output-dir <directory>` also writes the selection as `selection.json`, a Markdown summary as `summary.md`, and the targets of each language as `typescript.txt`, `python.txt` and `rust.txt`, for CI systems that pass files between steps.
+
+### GitHub Action
+
+`capsulerun/prober@v0` installs the binary of its own version, verifies its checksum and build provenance attestation, fetches the history it needs from a shallow checkout, selects, and writes a job summary.
+
+| Input | Default | |
+|---|---|---|
+| `base` | the pull request's base, the previous commit for a push | Revision to compare with |
+| `working-directory` | `.` | Directory of the repository |
+| `on-error` | `all` | `all` runs every test when the selection fails, `fail` fails the step |
+| `args` | | Extra arguments for `prober` |
+| `version` | the Action's version | Prober version to install |
+| `verify-attestation` | `true` | `false` checks the checksum only, for runners without `gh` |
+| `shadow-report` | | JUnit reports of a full run, one per line: compares them with the selection made earlier in the job |
+
+| Output | |
+|---|---|
+| `mode` | `selected`, `all` or `none` |
+| `mode-reasons` | Why every test or no test runs, as a JSON array |
+| `typescript-file`, `python-file`, `rust-file` | The tests (or crates) to run, one per line |
+| `json-file` | The selection with the reasons of each test |
+
+To compare with a full run before relying on it, select first, run the whole suite, then compare:
+
+```yaml
+- uses: capsulerun/prober@v0
+- run: npx vitest run --reporter=junit --outputFile=junit.xml
+- uses: capsulerun/prober@v0
+  with:
+    shadow-report: junit.xml
+```
 
 ### Understand a selection
 

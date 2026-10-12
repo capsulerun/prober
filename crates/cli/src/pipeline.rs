@@ -26,6 +26,12 @@ use prober_vcs::GitRepository;
 
 const FORCED_SELECTION: &str = "all";
 
+pub const LANGUAGES: [&str; 3] = [
+    prober_lang_typescript::LANGUAGE,
+    prober_lang_python::LANGUAGE,
+    prober_lang_rust::LANGUAGE,
+];
+
 type TestFileNames = (&'static str, fn(&RepoPath) -> bool);
 
 const TEST_FILE_NAMES: [TestFileNames; 2] = [

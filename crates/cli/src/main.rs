@@ -4,14 +4,16 @@ mod shadow;
 mod why;
 
 use std::env;
+use std::fs;
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::error::ErrorKind;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use prober_core::report::ListSeparator;
 
-use crate::pipeline::{OnError, Revisions, Selection};
+use crate::pipeline::{LANGUAGES, OnError, Revisions, Selection};
 use crate::scan::ScanArguments;
 use crate::shadow::ShadowArguments;
 use crate::why::WhyArguments;
@@ -83,6 +85,13 @@ struct SelectionArguments {
         help = "On error, run every test (all) or exit with an error (fail)"
     )]
     on_error: OnError,
+
+    #[arg(
+        long,
+        value_name = "DIRECTORY",
+        help = "Also write selection.json, summary.md and one list of targets per language (typescript.txt, python.txt, rust.txt) to this directory"
+    )]
+    output_dir: Option<PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -142,7 +151,35 @@ fn print_selection(selection: &Selection, arguments: &SelectionArguments) -> Exi
 
     eprintln!("{}", report.summary_line());
 
+    if let Some(output_dir) = &arguments.output_dir
+        && let Err(error) = write_output_files(selection, output_dir)
+    {
+        eprintln!(
+            "prober: cannot write the output files to {}: {error:#}",
+            output_dir.display()
+        );
+
+        return ExitCode::FAILURE;
+    }
+
     write_to_stdout(&output)
+}
+
+fn write_output_files(selection: &Selection, output_dir: &Path) -> anyhow::Result<()> {
+    let report = &selection.report;
+
+    fs::create_dir_all(output_dir)?;
+    fs::write(output_dir.join("selection.json"), report.to_json())?;
+    fs::write(output_dir.join("summary.md"), report.to_markdown())?;
+
+    for language in LANGUAGES {
+        fs::write(
+            output_dir.join(format!("{language}.txt")),
+            report.to_language_list(language),
+        )?;
+    }
+
+    Ok(())
 }
 
 fn print_warnings(selection: &Selection) {
