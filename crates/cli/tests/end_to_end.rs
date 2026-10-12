@@ -1805,6 +1805,79 @@ fn shadow_errors_name_the_file_at_fault() {
 }
 
 #[test]
+fn shadow_aggregate_reads_the_shadow_files_of_a_directory() {
+    let repository = TestRepository::with_project_on_main();
+
+    repository.change_and_commit("src/b.ts", "export const b = 2;");
+
+    let shadow_inputs = repository.shadow_inputs(FULL_RUN_REPORT);
+    let shadow_run = repository.prober(&shadow_inputs.arguments());
+    let artifacts = TempDir::new().unwrap();
+    let artifact = artifacts.path().join("run-1");
+
+    fs::create_dir_all(&artifact).unwrap();
+    fs::write(artifact.join("shadow.json"), &shadow_run.stdout).unwrap();
+    fs::write(artifacts.path().join("notes.txt"), "not a shadow file").unwrap();
+
+    let directory = artifacts.path().to_str().unwrap();
+    let text = repository.prober(&["shadow", "--aggregate", directory]);
+    let json = repository.prober(&["shadow", "--aggregate", directory, "--format", "json"]);
+
+    assert_eq!(text.exit_code, 0, "{}", text.stderr);
+    assert_eq!(
+        text.stderr,
+        "prober shadow: 1 run, 1 miss — 1 of 2 reported test files selected (50.0%), 2.0 s of 3.0 s skipped\n"
+    );
+    assert!(
+        text.stdout
+            .starts_with("### Prober shadow: 1 run\n\n**1 miss**"),
+        "{}",
+        text.stdout
+    );
+    assert_eq!(json.json()["misses"][0]["file"], "src/a.test.ts");
+    assert_eq!(
+        json.json()["recommendations"][0],
+        json!({
+            "option": "max_distance",
+            "value": null,
+            "failures": 0,
+            "failures_needed": 20,
+            "dropped_test_files": 0,
+            "dropped_seconds": 0.0,
+            "impacted_test_files": 0,
+            "impacted_seconds": 0.0
+        })
+    );
+}
+
+#[test]
+fn shadow_aggregate_needs_shadow_files_and_takes_nothing_else() {
+    let repository = TestRepository::with_project_on_main();
+    let empty = TempDir::new().unwrap();
+    let nothing_found =
+        repository.prober(&["shadow", "--aggregate", empty.path().to_str().unwrap()]);
+    let with_selection = repository.prober(&[
+        "shadow",
+        "--aggregate",
+        "shadow.json",
+        "--selection",
+        "prober.json",
+    ]);
+
+    assert_eq!(nothing_found.exit_code, 1);
+    assert_eq!(
+        nothing_found.stderr,
+        "prober shadow: no shadow JSON file found\n"
+    );
+    assert_eq!(with_selection.exit_code, 2);
+    assert!(
+        with_selection.stderr.contains("cannot be used with"),
+        "{}",
+        with_selection.stderr
+    );
+}
+
+#[test]
 fn shadow_requires_a_report() {
     let repository = TestRepository::with_project_on_main();
     let run = repository.prober(&["shadow", "--selection", "prober.json"]);

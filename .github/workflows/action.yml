@@ -96,10 +96,22 @@ jobs:
             '</testsuite></testsuites>' > junit.xml
 
       - name: Compare with the full run
+        id: shadow
         uses: ./
         with:
           working-directory: demo-selected
           shadow-report: junit.xml
+
+      - name: Aggregate the shadow file
+        working-directory: demo-selected
+        env:
+          SHADOW: ${{ steps.shadow.outputs.shadow-file }}
+        run: |
+          [ "$(jq -r '.failures[0].file' "$SHADOW")" = test/cart.test.ts ]
+          [ "$(jq -r '.impacted[0].distance' "$SHADOW")" = 1 ]
+          prober shadow --aggregate "$SHADOW" --format json > aggregate.json
+          [ "$(jq -r '.runs' aggregate.json)" = 1 ]
+          [ "$(jq -r '.failures.missed' aggregate.json)" = 0 ]
 
       - name: None
         id: none

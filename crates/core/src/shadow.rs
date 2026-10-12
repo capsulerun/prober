@@ -56,6 +56,15 @@ pub struct RecordedSelection {
     pub test_files: BTreeSet<RepoPath>,
     pub widened_test_files: BTreeSet<RepoPath>,
     pub distances: BTreeMap<RepoPath, usize>,
+    pub hub_fanouts: BTreeMap<RepoPath, usize>,
+    pub dropped: BTreeMap<RepoPath, DroppedRecord>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedRecord {
+    pub option: String,
+    pub distance: Option<usize>,
+    pub hub_fanout: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +87,24 @@ struct SelectionJson {
 
     #[serde(default)]
     distances: BTreeMap<String, usize>,
+
+    #[serde(default)]
+    hub_fanouts: BTreeMap<String, usize>,
+
+    #[serde(default)]
+    dropped: Vec<DroppedJson>,
+}
+
+#[derive(Deserialize)]
+struct DroppedJson {
+    test: String,
+    option: String,
+
+    #[serde(default)]
+    distance: Option<usize>,
+
+    #[serde(default)]
+    hub_fanout: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -125,10 +152,20 @@ impl RecordedSelection {
             })
             .map(|(path, _)| RepoPath::new(path))
             .collect::<Result<BTreeSet<_>>>()?;
-        let distances = selection
-            .distances
+        let distances = by_path(selection.distances)?;
+        let hub_fanouts = by_path(selection.hub_fanouts)?;
+        let dropped = selection
+            .dropped
             .into_iter()
-            .map(|(path, distance)| Ok((RepoPath::new(path)?, distance)))
+            .map(|dropped| {
+                let record = DroppedRecord {
+                    option: dropped.option,
+                    distance: dropped.distance,
+                    hub_fanout: dropped.hub_fanout,
+                };
+
+                Ok((RepoPath::new(dropped.test)?, record))
+            })
             .collect::<Result<BTreeMap<_, _>>>()?;
 
         Ok(Self {
@@ -138,8 +175,32 @@ impl RecordedSelection {
             test_files,
             widened_test_files,
             distances,
+            hub_fanouts,
+            dropped,
         })
     }
+
+    fn facts(&self, file: &RepoPath) -> (Option<usize>, Option<usize>, Option<&str>) {
+        match self.dropped.get(file) {
+            Some(dropped) => (
+                dropped.distance,
+                dropped.hub_fanout,
+                Some(dropped.option.as_str()),
+            ),
+            None => (
+                self.distances.get(file).copied(),
+                self.hub_fanouts.get(file).copied(),
+                None,
+            ),
+        }
+    }
+}
+
+fn by_path<T>(values: BTreeMap<String, T>) -> Result<BTreeMap<RepoPath, T>> {
+    values
+        .into_iter()
+        .map(|(path, value)| Ok((RepoPath::new(path)?, value)))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -148,6 +209,17 @@ pub struct FailedTestFile {
     pub selected: bool,
     pub widened: bool,
     pub distance: Option<usize>,
+    pub hub_fanout: Option<usize>,
+    pub dropped: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImpactedTestFile {
+    pub file: RepoPath,
+    pub distance: usize,
+    pub hub_fanout: Option<usize>,
+    pub duration: Option<Duration>,
+    pub dropped: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +238,7 @@ pub struct ShadowResult {
     pub failed_test_files: Vec<FailedTestFile>,
     pub flaky_test_files: Vec<RepoPath>,
     pub unattributed_failures: Vec<String>,
+    pub impacted_test_files: Vec<ImpactedTestFile>,
 }
 
 impl ShadowResult {
@@ -181,11 +254,17 @@ impl ShadowResult {
         let failed_test_files = reported_outcomes
             .iter()
             .filter(|outcome| outcome.status == TestStatus::Failed)
-            .map(|outcome| FailedTestFile {
-                file: outcome.file.clone(),
-                selected: is_selected(&outcome.file),
-                widened: is_widened(&outcome.file),
-                distance: selection.distances.get(&outcome.file).copied(),
+            .map(|outcome| {
+                let (distance, hub_fanout, dropped) = selection.facts(&outcome.file);
+
+                FailedTestFile {
+                    file: outcome.file.clone(),
+                    selected: is_selected(&outcome.file),
+                    widened: is_widened(&outcome.file),
+                    distance,
+                    hub_fanout,
+                    dropped: dropped.map(str::to_owned),
+                }
             })
             .collect();
         let widened_outcomes: Vec<&TestFileOutcome> = reported_outcomes
@@ -204,6 +283,22 @@ impl ShadowResult {
             .filter(|test_case| test_case.status == TestStatus::Failed)
             .map(|test_case| test_case.name.clone())
             .collect();
+        let impacted_files = selection.distances.keys().chain(selection.dropped.keys());
+        let mut impacted_test_files: Vec<ImpactedTestFile> = impacted_files
+            .filter_map(|file| {
+                let (distance, hub_fanout, dropped) = selection.facts(file);
+
+                Some(ImpactedTestFile {
+                    file: file.clone(),
+                    distance: distance?,
+                    hub_fanout,
+                    duration: outcomes.outcome(file).map(|outcome| outcome.duration),
+                    dropped: dropped.map(str::to_owned),
+                })
+            })
+            .collect();
+
+        impacted_test_files.sort_by(|left, right| left.file.cmp(&right.file));
 
         Self {
             revisions: selection.revisions.clone(),
@@ -233,6 +328,7 @@ impl ShadowResult {
             failed_test_files,
             flaky_test_files,
             unattributed_failures,
+            impacted_test_files,
         }
     }
 
@@ -260,6 +356,7 @@ impl ShadowResult {
                 selected_but_not_reported: self.selected_but_not_reported,
                 skipped: self.skipped_test_files,
             },
+            reported_seconds: rounded_seconds(self.reported_duration),
             savings: SavingsJson {
                 test_files_ratio: rounded_ratio(
                     self.skipped_test_files as f64,
@@ -288,10 +385,23 @@ impl ShadowResult {
                     selected: failed_test_file.selected,
                     widened: failed_test_file.widened,
                     distance: failed_test_file.distance,
+                    hub_fanout: failed_test_file.hub_fanout,
+                    dropped: failed_test_file.dropped.as_deref(),
                 })
                 .collect(),
             flaky: self.flaky_test_files.iter().map(RepoPath::as_str).collect(),
             unattributed_failures: &self.unattributed_failures,
+            impacted: self
+                .impacted_test_files
+                .iter()
+                .map(|impacted_test_file| ImpactedJson {
+                    file: impacted_test_file.file.as_str(),
+                    distance: impacted_test_file.distance,
+                    hub_fanout: impacted_test_file.hub_fanout,
+                    seconds: impacted_test_file.duration.map(rounded_seconds),
+                    dropped: impacted_test_file.dropped.as_deref(),
+                })
+                .collect(),
             warnings: self.warnings(),
         };
         let mut json =
@@ -339,10 +449,15 @@ impl ShadowResult {
                 .push_str("\n| Failed test file | Selected | Distance |\n| --- | --- | --- |\n");
 
             for failed_test_file in &self.failed_test_files {
-                let selected = match (failed_test_file.selected, failed_test_file.widened) {
-                    (true, true) => "yes, by widening",
-                    (true, false) => "yes",
-                    (false, _) => "**no, miss**",
+                let selected = match (
+                    failed_test_file.selected,
+                    failed_test_file.widened,
+                    &failed_test_file.dropped,
+                ) {
+                    (true, true, _) => "yes, by widening".to_owned(),
+                    (true, false, _) => "yes".to_owned(),
+                    (false, _, Some(option)) => format!("**no, miss**: dropped by `{option}`"),
+                    (false, _, None) => "**no, miss**".to_owned(),
                 };
                 let distance = failed_test_file
                     .distance
@@ -472,12 +587,14 @@ struct ShadowJson<'a> {
     selection_mode: &'static str,
     mode_reasons: &'a [ModeReasonRecord],
     test_files: TestFilesJson,
+    reported_seconds: f64,
     savings: SavingsJson,
     widening: WideningJson<'a>,
     misses: Vec<&'a str>,
     failures: Vec<FailureJson<'a>>,
     flaky: Vec<&'a str>,
     unattributed_failures: &'a [String],
+    impacted: Vec<ImpactedJson<'a>>,
     warnings: Vec<String>,
 }
 
@@ -509,9 +626,20 @@ struct FailureJson<'a> {
     selected: bool,
     widened: bool,
     distance: Option<usize>,
+    hub_fanout: Option<usize>,
+    dropped: Option<&'a str>,
 }
 
-fn count_of(count: usize, singular: &str, plural: &str) -> String {
+#[derive(Serialize)]
+struct ImpactedJson<'a> {
+    file: &'a str,
+    distance: usize,
+    hub_fanout: Option<usize>,
+    seconds: Option<f64>,
+    dropped: Option<&'a str>,
+}
+
+pub(crate) fn count_of(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 {
         return format!("1 {singular}");
     }
@@ -519,7 +647,7 @@ fn count_of(count: usize, singular: &str, plural: &str) -> String {
     format!("{count} {plural}")
 }
 
-fn capitalized(text: &str) -> String {
+pub(crate) fn capitalized(text: &str) -> String {
     let mut characters = text.chars();
 
     match characters.next() {
@@ -605,6 +733,7 @@ mod tests {
     "selected_but_not_reported": 0,
     "skipped": 3
   },
+  "reported_seconds": 20.0,
   "savings": {
     "test_files_ratio": 0.6,
     "seconds": 15.0,
@@ -623,19 +752,39 @@ mod tests {
       "file": "src/a.test.ts",
       "selected": true,
       "widened": false,
-      "distance": 1
+      "distance": 1,
+      "hub_fanout": null,
+      "dropped": null
     },
     {
       "file": "src/c.test.ts",
       "selected": false,
       "widened": false,
-      "distance": null
+      "distance": null,
+      "hub_fanout": null,
+      "dropped": null
     }
   ],
   "flaky": [
     "src/e.test.ts"
   ],
   "unattributed_failures": [],
+  "impacted": [
+    {
+      "file": "src/a.test.ts",
+      "distance": 1,
+      "hub_fanout": null,
+      "seconds": 2.0,
+      "dropped": null
+    },
+    {
+      "file": "src/b.test.ts",
+      "distance": 2,
+      "hub_fanout": null,
+      "seconds": 3.0,
+      "dropped": null
+    }
+  ],
   "warnings": []
 }
 "#
@@ -882,6 +1031,52 @@ Selection mode `all`: ci/deploy.sh (modified) matches always_all \"ci/**\".
         assert_eq!(
             selection.distances,
             BTreeMap::from([(repo_path("src/b.test.ts"), 1)])
+        );
+    }
+
+    #[test]
+    fn failures_of_dropped_tests_are_misses_naming_the_option() {
+        let selection = RecordedSelection::parse(
+            r#"{
+              "schema_version": 1,
+              "mode": "selected",
+              "targets": { "typescript": ["src/a.test.ts"] },
+              "distances": { "src/a.test.ts": 1 },
+              "hub_fanouts": { "src/a.test.ts": 0 },
+              "dropped": [
+                { "test": "src/c.test.ts", "option": "max_distance", "distance": 4, "hub_fanout": 7 }
+              ]
+            }"#,
+        )
+        .unwrap();
+        let shadow_result = ShadowResult::compare(&selection, &full_run_with_a_miss());
+        let json_result: serde_json::Value =
+            serde_json::from_str(&shadow_result.to_json()).unwrap();
+
+        assert_eq!(
+            json_result["failures"][1],
+            serde_json::json!({
+                "file": "src/c.test.ts",
+                "selected": false,
+                "widened": false,
+                "distance": 4,
+                "hub_fanout": 7,
+                "dropped": "max_distance"
+            })
+        );
+        assert_eq!(
+            json_result["impacted"],
+            serde_json::json!([
+                { "file": "src/a.test.ts", "distance": 1, "hub_fanout": 0, "seconds": 2.0, "dropped": null },
+                { "file": "src/c.test.ts", "distance": 4, "hub_fanout": 7, "seconds": 4.0, "dropped": "max_distance" }
+            ])
+        );
+        assert!(
+            shadow_result
+                .to_markdown()
+                .contains("| `src/c.test.ts` | **no, miss**: dropped by `max_distance` | 4 |\n"),
+            "{}",
+            shadow_result.to_markdown()
         );
     }
 }
