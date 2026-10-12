@@ -62,3 +62,25 @@ jobs:
           for archive in prober-*.tar.xz prober-*.zip; do
             gh attestation verify "$archive" --repo "$GITHUB_REPOSITORY"
           done
+
+  action:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    name: Action (${{ matrix.os }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install, cold
+        uses: ./
+        with:
+          version: ${{ inputs.tag }}
+          base: HEAD
+
+      - name: Install, from the tool cache
+        uses: ./
+        with:
+          version: ${{ inputs.tag }}
+          base: HEAD
