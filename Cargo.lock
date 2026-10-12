@@ -2245,7 +2245,7 @@ dependencies = [
 
 [[package]]
 name = "prober"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -2260,7 +2260,7 @@ dependencies = [
 
 [[package]]
 name = "prober-core"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "globset",
@@ -2274,7 +2274,7 @@ dependencies = [
 
 [[package]]
 name = "prober-lang-python"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "globset",
@@ -2291,7 +2291,7 @@ dependencies = [
 
 [[package]]
 name = "prober-lang-rust"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "globset",
@@ -2304,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "prober-lang-typescript"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "dunce",
@@ -2328,7 +2328,7 @@ dependencies = [
 
 [[package]]
 name = "prober-vcs"
-version = "0.0.0"
+version = "0.1.0-rc.3"
 dependencies = [
  "anyhow",
  "gix",
