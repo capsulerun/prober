@@ -1,47 +1,29 @@
 <div align="center">
 
-<h1>Prober</h1>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
+  <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
+  <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="50%"  />
+</picture>
 
 **Run only the tests your change can affect.**
 
 [![CI](https://github.com/capsulerun/prober/actions/workflows/ci.yml/badge.svg)](https://github.com/capsulerun/prober/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/capsulerun/prober?include_prereleases&sort=semver)](https://github.com/capsulerun/prober/releases)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 </div>
 
+Most pipelines run the whole test suite on every change, even when it touches a few files, so CI time and cost grow with every change rather than with what it changes.
+
+Prober outputs the tests a change can affect, each with the reason it was selected. It never runs your tests and keeps no state: the same change always gives the same selection. When it cannot be sure, it selects more, never less, and says why.
 
 
-Most pipelines run the whole test suite on every change, even when it touches a few files, so CI time and cost grow with every change rather than with what it changes. Prober reads the code of both revisions and builds the graph of what depends on what: imports, modules loaded by name, files read from disk, fixtures, manifests, lockfiles and test runner configs. It outputs the tests a change can affect, each with the reason it was selected.
-
-It never runs your tests and keeps no state: the same change always gives the same selection. When it cannot be sure, it selects more, never less, and says why. You can [check it against a full run](#check-it-before-relying-on-it) before relying on it, and [correct it](#configuration-optional) with one line of `prober.toml` when it gets a link wrong.
-
-For example, after a change to `src/pricing/discount.ts`:
-
-```console
-$ prober --base origin/main
-prober: selected 2/3 test files (66.7%)
-test/discount.test.ts
-test/cart.test.ts
-
-$ prober why --base origin/main test/cart.test.ts
-test/cart.test.ts is selected:
-  src/pricing/discount.ts (modified)
-  -> applyDiscount changed
-  -> applyDiscount used by checkout in src/cart.ts
-  -> checkout used at load by test/cart.test.ts
-
-$ prober why --base origin/main test/slug.test.ts
-test/slug.test.ts is not selected: no path links it to the changed file
-```
-
-Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
+> [!NOTE]
+> Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
 
 ## Getting started
 
 ### In GitHub Actions
-
-In a job that runs on pull requests:
 
 ```yaml
 - uses: actions/checkout@v7
@@ -52,7 +34,7 @@ In a job that runs on pull requests:
     TESTS: ${{ steps.prober.outputs.typescript-file }}
 ```
 
-Prober writes the selected test files to `typescript-file`: every test when the change can affect them all (a lockfile or a runner config changed, say), none when it affects no test. The `mode` output (`selected`, `all` or `none`) tells which, for workflows that branch on it. For pytest, use `python-file` the same way; for Rust, `rust-file` lists the crates to pass to `cargo test -p`.
+Prober writes the selected test files to `typescript-file`.
 
 ### Run it locally
 
@@ -70,7 +52,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/capsulerun/prober/relea
 > 
 > </details>
 
-> [!NOTE]
+> [!IMPORTANT]
 > To pin a version, replace `latest/download` with `download/v0.1.0`.
 
 Then, from the repository, pass the tests your change can affect, against the branch it targets, to your test runner:
@@ -220,9 +202,13 @@ The workspace has one crate per part:
 |---|---|
 | `crates/core` | The graph, the selection, the config, the reports and `shadow` |
 | `crates/vcs` | Reading both revisions and the change from git |
-| `crates/lang-typescript`, `crates/lang-python`, `crates/lang-rust` | One frontend per language: what its files depend on, its tests and its presets |
+| `crates/lang-typescript`, `crates/lang-python`, `crates/lang-rust` | One crate per language: what its files depend on, its tests and its presets |
 | `crates/cli` | The `prober` binary |
 
-Each frontend has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. Prober's CI runs Prober on its own pull requests to select which crates to test.
+Each crate has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. Prober's CI runs Prober on its own pull requests to select which crates to test.
 
-Issues and pull requests are welcome. Prober is released under the [MIT License](LICENSE).
+Issues and pull requests are welcome. 
+
+## License
+
+Prober is released under the [MIT License](LICENSE).
