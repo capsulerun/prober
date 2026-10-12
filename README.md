@@ -96,7 +96,7 @@ The history of the base branch is needed to find the merge base. Outside the Git
 | `args` | | Extra arguments for `prober` |
 | `version` | the Action's version | Prober version to install |
 | `verify-attestation` | `true` | `false` checks the checksum only, for runners without `gh` |
-| `shadow-report` | | JUnit reports of a full run, one per line: compares them with the selection made earlier in the job |
+| `shadow-report` | | JUnit reports of a full run, one per line: compares them with the latest selection made earlier in the job |
 
 | Output | |
 |---|---|

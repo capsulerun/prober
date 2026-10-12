@@ -24,7 +24,7 @@ inputs:
     description: Extra arguments passed to prober.
     required: false
   shadow-report:
-    description: JUnit reports of a full test run, one per line. Compares them with the selection made earlier in the job (prober shadow) instead of selecting.
+    description: JUnit reports of a full test run, one per line. Compares them with the latest selection made earlier in the job (prober shadow) instead of selecting.
     required: false
   verify-attestation:
     description: Verify the build provenance attestation of the downloaded binary with gh (true), or its checksum only (false).
