@@ -21,7 +21,7 @@ Prober outputs the tests a change can affect, each with the reason it was select
 
 
 > [!NOTE]
-> Prober supports TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
+> Works with TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
 
 ## Getting started
 
@@ -36,7 +36,7 @@ Prober outputs the tests a change can affect, each with the reason it was select
     TESTS: ${{ steps.prober.outputs.typescript-file }}
 ```
 
-Prober writes the selected test files to `typescript-file`.
+The selected test files are written to `typescript-file`.
 
 ### Run it locally
 
@@ -78,9 +78,9 @@ jq -r '.targets.rust // [] | .[].crate | "-p " + .' selection.json | xargs cargo
 prober --base origin/main -0 | xargs -0 npx vitest run
 ```
 
-If Prober fails, it selects every test; `--on-error fail` makes it exit with an error instead. `PROBER_SELECTION=all` forces every test, for a release branch or an incident.
+If the run fails, every test is selected; `--on-error fail` exits with an error instead. `PROBER_SELECTION=all` forces every test, for a release branch or an incident.
 
-Prober needs the history of the base branch to find the merge base. Outside the GitHub Action, check out with enough history (`fetch-depth: 0` with `actions/checkout`).
+The history of the base branch is needed to find the merge base. Outside the GitHub Action, check out with enough history (`fetch-depth: 0` with `actions/checkout`).
 
 ### Understand a selection
 
@@ -94,7 +94,7 @@ prober why --base origin/main tests/test_parser.py
 prober scan
 ```
 
-`scan` reports what Prober infers from the repository: the links it found, the dynamic imports it could not resolve and how many tests each one reaches, the files no test reaches, and the hubs most tests depend on. Run it once on a new repository to see where a line of configuration would help.
+`scan` reports what is inferred from the repository: the links it found, the dynamic imports it could not resolve and how many tests each one reaches, the files no test reaches, and the hubs most tests depend on. Run it once on a new repository to see where a line of configuration would help.
 
 ### Check it before relying on it
 
@@ -108,13 +108,13 @@ prober shadow --selection selection.json --report junit.xml
 
 ### Configuration (optional)
 
-Prober needs no configuration. An optional `prober.toml` at the root of the repository covers what the code cannot tell, and corrects inference where it selects too much. A mistake in it fails the run with the line at fault; `prober scan` lists each rule with what it matched.
+No configuration is needed. An optional `prober.toml` at the root of the repository covers what the code cannot tell, and corrects inference where it selects too much. A mistake in it fails the run with the line at fault; `prober scan` lists each rule with what it matched.
 
 ```toml
 # Detected from the repository; list presets only to force or restrict them
 presets = "auto"
 
-# Changes Prober cannot reason about: run every test
+# Changes that cannot be reasoned about: run every test
 [always_all]
 files = ["ci/**", "scripts/release/**"]
 
@@ -137,7 +137,7 @@ to = ["test/plugins/{id}.test.ts", "test/registry.test.ts"]
 from = "src/shared/logger.ts"
 to = "test/**/*.e2e.test.ts"
 
-# A dynamic import Prober cannot resolve, now covered by the links above
+# A dynamic import that cannot be resolved, now covered by the links above
 [[ignore]]
 site = "src/loader.ts:42"
 
@@ -150,11 +150,11 @@ Paths are relative to the root of the repository. In patterns, `*` matches withi
 
 #### `presets`
 
-The test runners and frameworks whose conventions Prober applies: test file names, setup files, config files and how their changes are diffed. `"auto"` (the default) detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `vite`, `vitest`.
+The test runners and frameworks whose conventions apply: test file names, setup files, config files and how their changes are diffed. `"auto"` (the default) detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `vite`, `vitest`.
 
 #### `[always_all]`
 
-`files`: patterns of files whose change runs every test. Use it for what Prober cannot reason about, such as CI scripts or custom tooling. Each language already has a few (a toolchain file, `.cargo/config.toml`), while manifests, lockfiles and runner configs are diffed field by field instead.
+`files`: patterns of files whose change runs every test. Use it for what cannot be reasoned about from the code, such as CI scripts or custom tooling. Each language already has a few (a toolchain file, `.cargo/config.toml`), while manifests, lockfiles and runner configs are diffed field by field instead.
 
 #### `[always_run]`
 
@@ -167,8 +167,8 @@ A dependency the code does not show: a change to a file matching `from` selects 
 #### `[[ignore]]`
 
 Removes what inference got wrong. Two forms:
-- `from` and `to`: drops the links where files matching `to` depend on files matching `from`. Prober warns when this also drops imports written in the code.
-- `site`: sets aside the dynamic imports and file reads of a file (`"src/loader.ts"`) or of one of its lines (`"src/loader.ts:42"`) that Prober could not resolve, so they no longer widen the selection. Pair it with a `[[link]]` that says what the site loads.
+- `from` and `to`: drops the links where files matching `to` depend on files matching `from`. A warning says when this also drops imports written in the code.
+- `site`: sets aside the dynamic imports and file reads of a file (`"src/loader.ts"`) or of one of its lines (`"src/loader.ts:42"`) that could not be resolved, so they no longer widen the selection. Pair it with a `[[link]]` that says what the site loads.
 
 #### `[inference]`
 
@@ -178,7 +178,7 @@ Each inference can be switched off, to measure what it adds or when it misbehave
 |---|---|
 | `dynamic_imports` | Computed imports (``import(`./locales/${lang}.js`)``, `importlib.import_module(f"app.{name}")`) resolved to the modules they can load |
 | `plugin_folders` | Folders of plugins loaded by name, each linked to the code that loads it |
-| `widening` | Tests that reach a site Prober could not resolve are selected when a change could reach that site |
+| `widening` | Tests that reach an unresolved site are selected when a change could reach that site |
 | `test_support` | Helpers, fixtures and setup files used by tests, which select only the tests using them |
 | `manifests` | Manifests and lockfiles diffed field by field, instead of running every test |
 | `files` | Files read from literal paths, such as fixtures, snapshots and `include_str!` |
@@ -207,10 +207,10 @@ The workspace has one crate per part:
 | `crates/lang-typescript`, `crates/lang-python`, `crates/lang-rust` | One crate per language: what its files depend on, its tests and its presets |
 | `crates/cli` | The `prober` binary |
 
-Each crate has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. Prober's CI runs Prober on its own pull requests to select which crates to test.
+Each crate has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. The CI runs Prober on its own pull requests to select which crates to test.
 
 Issues and pull requests are welcome. 
 
 ## License
 
-Prober is released under the [MIT License](LICENSE).
+Released under the [MIT License](LICENSE).
