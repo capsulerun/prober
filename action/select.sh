@@ -7,16 +7,18 @@ if command -v cygpath > /dev/null; then
   temporary_directory=$(cygpath -m "$RUNNER_TEMP")
 fi
 
-output_directory="$temporary_directory/prober"
+mkdir -p "$temporary_directory/prober"
+output_directory=$(mktemp -d "$temporary_directory/prober/selection-XXXXXX")
 read -r -a extra_arguments <<< "${EXTRA_ARGS:-}"
 
 if [ "${FORCE_ALL:-false}" = true ]; then
   export PROBER_SELECTION=all
 fi
 
-rm -rf "$output_directory"
 prober --base "$BASE" --format list --on-error "$ON_ERROR" --output-dir "$output_directory" \
   ${extra_arguments[@]+"${extra_arguments[@]}"} > /dev/null
+
+echo "$output_directory/selection.json" > "$temporary_directory/prober/last-selection"
 
 {
   echo "mode=$(jq -r '.mode' "$output_directory/selection.json")"
