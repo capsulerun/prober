@@ -54,6 +54,9 @@ outputs:
   rust-file:
     description: The Rust crates to test, one per line.
     value: ${{ steps.select.outputs.rust-file }}
+  shadow-file:
+    description: With shadow-report, the comparison as JSON, to upload as an artifact and read with prober shadow --aggregate.
+    value: ${{ steps.shadow.outputs.shadow-file }}
 
 runs:
   using: composite
@@ -94,6 +97,7 @@ runs:
       run: bash "$GITHUB_ACTION_PATH/action/select.sh"
 
     - name: Compare with the full run
+      id: shadow
       if: inputs.shadow-report != ''
       shell: bash
       working-directory: ${{ inputs.working-directory }}

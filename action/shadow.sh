@@ -20,5 +20,7 @@ while IFS= read -r report; do
 done <<< "$SHADOW_REPORT"
 
 selection=$(cat "$last_selection")
+shadow_file="$(dirname "$selection")/shadow.json"
 
-prober shadow --selection "$selection" "${report_arguments[@]}" > "$(dirname "$selection")/shadow.json"
+prober shadow --selection "$selection" "${report_arguments[@]}" > "$shadow_file"
+echo "shadow-file=$shadow_file" >> "$GITHUB_OUTPUT"
