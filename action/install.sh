@@ -104,6 +104,10 @@ if [ "$VERIFY_ATTESTATION" = "true" ]; then
   if ! { [ -f "$trusted_root" ] \
     && gh attestation verify "$download_directory/$archive" --repo "$repository" \
       --custom-trusted-root "$trusted_root" > /dev/null 2>&1; }; then
+    if [ -f "$trusted_root" ]; then
+      echo "::notice::$archive does not verify against the Action's Sigstore trust root: checking with the current one"
+    fi
+
     gh attestation verify "$download_directory/$archive" --repo "$repository" > /dev/null \
       || fail "$archive has no valid attestation from $repository"
   fi
