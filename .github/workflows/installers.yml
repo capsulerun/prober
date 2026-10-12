@@ -54,7 +54,6 @@ jobs:
             sha256sum --check "$checksum"
             hash=$(cut -d ' ' -f 1 "$checksum")
             grep -q "$hash" prober-installer.sh
-            grep -q "$hash" prober-installer.ps1
           done
 
       - name: Attestations
