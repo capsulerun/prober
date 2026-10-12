@@ -1840,6 +1840,7 @@ fn shadow_aggregate_reads_the_shadow_files_of_a_directory() {
         json!({
             "option": "max_distance",
             "value": null,
+            "miss_rate": null,
             "failures": 0,
             "failures_needed": 20,
             "dropped_test_files": 0,

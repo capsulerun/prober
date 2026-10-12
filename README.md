@@ -109,19 +109,14 @@ The history of the base branch is needed to find the merge base. Outside the Git
 | `json-file` | The selection with the reasons of each test |
 | `shadow-file` | With `shadow-report`, the comparison as JSON |
 
-To compare with a full run before relying on it, select first, run the whole suite, then compare, and keep the comparison as an artifact for `prober shadow --aggregate`:
+To compare with a full run before relying on it:
 
 ```yaml
 - uses: capsulerun/prober@v0
 - run: npx vitest run --reporter=junit --outputFile=junit.xml
 - uses: capsulerun/prober@v0
-  id: shadow
   with:
     shadow-report: junit.xml
-- uses: actions/upload-artifact@v7
-  with:
-    name: prober-shadow
-    path: ${{ steps.shadow.outputs.shadow-file }}
 ```
 
 ### Understand a selection
@@ -146,17 +141,7 @@ npx vitest run --reporter=junit --outputFile=junit.xml
 prober shadow --selection selection.json --report junit.xml
 ```
 
-`shadow` compares a selection with the results of a full run: the failures it would have caught, those it would have missed, and what it would have saved. In GitHub Actions it also writes a job summary.
-
-After a few weeks of runs, read their comparisons together:
-
-```bash
-gh run list --workflow tests.yml --limit 200 --json databaseId --jq '.[].databaseId' |
-  while read -r run; do gh run download "$run" --name prober-shadow --dir "shadows/$run" 2> /dev/null; done
-prober shadow --aggregate shadows
-```
-
-`--aggregate` reads shadow files, or directories holding them, and reports the runs by mode, what made every test run, the misses, and how far the failures were from their change. For each aggressive option, it gives the value that would have kept every failure, what that value would have saved, and the `prober.toml` lines, once at least 20 failures support it. It follows the `[protected]` and `[[defer]]` of `prober.toml` (`--config` reads another file), and `--format json` gives the same as JSON.
+`shadow` compares a selection with the results of a full run: the failures it would have caught, those it would have missed, and what it would have saved. `prober shadow --aggregate <files>` reads many of these results together and recommends values for the aggressive options.
 
 ### Configuration (optional)
 
@@ -255,14 +240,14 @@ Each inference can be switched off, to measure what it adds or when it misbehave
 
 #### `[aggressive]`, `[[defer]]` and `[protected]`
 
-By default, every test a change can reach is selected. These options drop some of them for more savings. Use them only with a periodic full run on the main branch (hourly or nightly) to catch what they let through, and with values that `prober shadow --aggregate` recommends from your own failures.
+Off by default, they drop some of the tests a change can reach, for more savings. Use them with a periodic full run on the main branch, and values from `prober shadow --aggregate`.
 
 - `max_distance` in `[aggressive]`: drops the tests more than this many files away from every change. A test importing a changed file is at distance 1.
 - `hub_fanout_limit` in `[aggressive]`: past a file that more than this many files depend on, keeps only its direct dependents. A test is dropped when every path to it goes beyond the direct dependents of such a hub.
 - `[[defer]]`: `tests` (one pattern or a list) run only within `max_distance` of a change, for slow suites such as integration or browser tests. Several `[[defer]]` tables can set different distances.
 - `[protected]`: `tests` patterns that these options never drop, such as tests that caught real regressions. Tests that mock a module whose exports changed are protected too.
 
-A dropped test is listed under `dropped` in the JSON and in the summary with the option that dropped it, stderr counts them, and `prober why` names the option. When every test a change reaches is dropped, the mode is `none` (with a `dropped` reason), unless `[always_run]` adds tests. The JSON also gives, for every selected test, its `distances` and its `hub_fanouts`: the smallest `hub_fanout_limit` that keeps it.
+Dropped tests are listed under `dropped` in the JSON and in the summary, and `prober why` names the option that dropped them.
 
 ## Contributing
 

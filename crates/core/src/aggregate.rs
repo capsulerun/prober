@@ -220,9 +220,10 @@ impl Recommendation {
                 impacted_test_files,
                 impacted_seconds,
             } => format!(
-                "`{label}`: `{} = {value}` keeps every one of the {} it rests on, and would drop {dropped_test_files} of {impacted_test_files} impacted test files{}",
+                "`{label}`: `{} = {value}` keeps every one of the {} it rests on, so about 1 failure in {} should fall beyond it, and would drop {dropped_test_files} of {impacted_test_files} impacted test files{}",
                 self.value_key(),
                 count_of(*failures, "failure", "failures"),
+                failures + 1,
                 part_of_duration(*dropped_seconds, *impacted_seconds)
                     .map(|duration| format!(" ({duration})"))
                     .unwrap_or_default()
@@ -429,7 +430,7 @@ impl Aggregate {
 
         if let Some(snippet) = self.config_snippet() {
             markdown.push_str(&format!(
-                "\nWith a periodic full run on the main branch to catch what they let through:\n\n```toml\n{snippet}```\n"
+                "\nWith a periodic full run on the main branch to catch the failures beyond them:\n\n```toml\n{snippet}```\n"
             ));
         }
 
@@ -710,6 +711,7 @@ struct RecommendationJson<'a> {
     tests: &'a [String],
 
     value: Option<usize>,
+    miss_rate: Option<f64>,
     failures: usize,
     failures_needed: usize,
     dropped_test_files: usize,
@@ -724,6 +726,7 @@ impl<'a> RecommendationJson<'a> {
             option: recommendation.option,
             tests: &recommendation.tests,
             value: None,
+            miss_rate: None,
             failures: 0,
             failures_needed: MIN_FAILURES,
             dropped_test_files: 0,
@@ -742,6 +745,7 @@ impl<'a> RecommendationJson<'a> {
                 impacted_seconds,
             } => Self {
                 value: Some(value),
+                miss_rate: Some(rounded_ratio(1.0, (failures + 1) as f64)),
                 failures,
                 dropped_test_files,
                 dropped_seconds: rounded(dropped_seconds),
@@ -955,11 +959,11 @@ Failed test files: 3, 1 missed.
 
         assert_eq!(
             aggregate.recommendations[0].describe(),
-            "`max_distance`: `max_distance = 3` keeps every one of the 20 failures it rests on, and would drop 20 of 40 impacted test files (10.0 min of 10.7 min)"
+            "`max_distance`: `max_distance = 3` keeps every one of the 20 failures it rests on, so about 1 failure in 21 should fall beyond it, and would drop 20 of 40 impacted test files (10.0 min of 10.7 min)"
         );
         assert_eq!(
             aggregate.recommendations[1].describe(),
-            "`hub_fanout_limit`: `hub_fanout_limit = 14` keeps every one of the 20 failures it rests on, and would drop 20 of 40 impacted test files (10.0 min of 10.7 min)"
+            "`hub_fanout_limit`: `hub_fanout_limit = 14` keeps every one of the 20 failures it rests on, so about 1 failure in 21 should fall beyond it, and would drop 20 of 40 impacted test files (10.0 min of 10.7 min)"
         );
         assert!(
             aggregate.to_markdown().ends_with(
@@ -1018,6 +1022,7 @@ Failed test files: 3, 1 missed.
             json!({
                 "option": "max_distance",
                 "value": 3,
+                "miss_rate": 0.0476,
                 "failures": 20,
                 "failures_needed": 20,
                 "dropped_test_files": 20,
