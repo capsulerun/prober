@@ -1,5 +1,5 @@
-name: Prober
-description: Selects the tests a change can affect, and hands them to the next steps through files.
+name: Prober Test Impact Analysis
+description: Test impact analysis for CI. Run only the tests your change can affect.
 author: capsulerun
 branding:
   icon: filter
