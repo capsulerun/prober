@@ -4,6 +4,7 @@ use serde::Deserialize;
 use toml::Spanned;
 use xxhash_rust::xxh3::xxh3_64;
 
+use crate::aggressive::{Aggressive, AggressiveSection, DeferTable, ProtectedSection};
 use crate::changes::FileChange;
 use crate::files::RepoPath;
 use crate::rules::{AlwaysRunSection, ConfigWarning, IgnoreTable, LinkTable, Rules, is_broad};
@@ -28,6 +29,15 @@ struct ConfigFile {
 
     #[serde(default)]
     inference: InferenceSettings,
+
+    #[serde(default)]
+    aggressive: AggressiveSection,
+
+    #[serde(default)]
+    defer: Vec<Spanned<DeferTable>>,
+
+    #[serde(default)]
+    protected: ProtectedSection,
 }
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +139,7 @@ pub struct Config {
     pub always_all: AlwaysAll,
     pub rules: Rules,
     pub inference: InferenceSettings,
+    pub aggressive: Aggressive,
 }
 
 impl Config {
@@ -143,12 +154,19 @@ impl Config {
             config_file.ignore,
             config_file.always_run,
         )?;
+        let aggressive = Aggressive::parse(
+            config_text,
+            config_file.aggressive,
+            config_file.defer,
+            config_file.protected,
+        )?;
 
         Ok(Self {
             presets: Presets::from_field(config_file.presets)?,
             always_all,
             rules,
             inference: config_file.inference,
+            aggressive,
         })
     }
 }
@@ -434,7 +452,7 @@ mod tests {
             ),
             (
                 "anchors = true\n",
-                "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`",
+                "invalid prober.toml at line 1, column 1: unknown field `anchors`, expected one of `presets`, `always_all`, `always_run`, `link`, `ignore`, `inference`, `aggressive`, `defer`, `protected`",
             ),
             (
                 "presets = [\"vitest\", \"nose\"]\n",

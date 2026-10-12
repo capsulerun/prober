@@ -1,5 +1,6 @@
+use std::cmp::Reverse;
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 
 use crate::changes::FileChange;
 use crate::files::{FileId, RepoPath};
@@ -66,16 +67,40 @@ impl Reason {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct HubCrossing {
+    pub fanout: usize,
+    pub hub: Option<FileId>,
+}
+
+impl HubCrossing {
+    fn leaving(self, file: FileId, fanout: usize) -> Self {
+        if fanout > self.fanout {
+            Self {
+                fanout,
+                hub: Some(file),
+            }
+        } else {
+            self
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedTest {
     pub file: FileId,
     pub reason: Reason,
     distance: usize,
+    hub_crossing: HubCrossing,
 }
 
 impl SelectedTest {
     pub fn distance(&self) -> usize {
         self.distance
+    }
+
+    pub fn hub_crossing(&self) -> HubCrossing {
+        self.hub_crossing
     }
 }
 
@@ -633,6 +658,7 @@ fn tests_reached(
     keeps: impl Fn(FileId) -> bool,
 ) -> Vec<SelectedTest> {
     let graph = traversal.graph;
+    let hub_crossings = HubSearch::new(traversal).run(discoveries);
     let mut nodes_by_test: HashMap<FileId, Vec<Node>> = HashMap::new();
 
     for (&node, discovery) in &discoveries.nodes {
@@ -661,14 +687,167 @@ fn tests_reached(
             });
 
             let (reason, distance) = reason_past_mocks(traversal, discoveries, test_file, &nodes)?;
+            let hub_crossing = nodes
+                .iter()
+                .filter_map(|node| hub_crossings.get(node))
+                .min()
+                .copied()
+                .unwrap_or_default();
 
             Some(SelectedTest {
                 file: test_file,
                 reason,
                 distance,
+                hub_crossing,
             })
         })
         .collect()
+}
+
+struct HubSearch<'g> {
+    traversal: Traversal<'g>,
+    fanouts: HashMap<FileId, usize>,
+    reached: HashMap<Node, (ContentChange, HubCrossing)>,
+    entries: HashMap<Node, HubCrossing>,
+    queue: BinaryHeap<Reverse<(HubCrossing, Node)>>,
+}
+
+impl<'g> HubSearch<'g> {
+    fn new(traversal: Traversal<'g>) -> Self {
+        Self {
+            traversal,
+            fanouts: HashMap::new(),
+            reached: HashMap::new(),
+            entries: HashMap::new(),
+            queue: BinaryHeap::new(),
+        }
+    }
+
+    fn run(mut self, discoveries: &Discoveries) -> HashMap<Node, HubCrossing> {
+        let graph = self.traversal.graph;
+        let mut steps = Vec::new();
+
+        for (&node, origin) in &discoveries.origins {
+            self.reach(node, origin.content, HubCrossing::default());
+
+            if graph.is_test(self.traversal.file_of(node)) {
+                self.enter(node, HubCrossing::default());
+            }
+        }
+
+        while let Some(Reverse((crossing, node))) = self.queue.pop() {
+            let (content, best_crossing) = self.reached[&node];
+
+            if best_crossing != crossing {
+                continue;
+            }
+
+            let file = self.traversal.file_of(node);
+
+            steps.clear();
+            self.traversal.successors(node, content, &mut steps);
+
+            for step in &steps {
+                let next_file = self.traversal.file_of(step.node);
+
+                if next_file == file {
+                    self.reach(step.node, step.content, crossing);
+
+                    continue;
+                }
+
+                if graph.is_test(next_file) {
+                    self.enter(step.node, crossing);
+                }
+
+                let fanout = self.fanout(file);
+
+                self.reach(step.node, step.content, crossing.leaving(file, fanout));
+            }
+        }
+
+        self.spread_in_test_files()
+    }
+
+    fn reach(&mut self, node: Node, content: ContentChange, crossing: HubCrossing) {
+        let improves = match self.reached.get(&node) {
+            None => true,
+            Some(&(earlier_content, earlier_crossing)) => {
+                content > earlier_content
+                    || content == earlier_content && crossing < earlier_crossing
+            }
+        };
+
+        if improves {
+            self.reached.insert(node, (content, crossing));
+            self.queue.push(Reverse((crossing, node)));
+        }
+    }
+
+    fn enter(&mut self, node: Node, crossing: HubCrossing) {
+        self.entries
+            .entry(node)
+            .and_modify(|earlier| *earlier = (*earlier).min(crossing))
+            .or_insert(crossing);
+    }
+
+    fn fanout(&mut self, file: FileId) -> usize {
+        let graph = self.traversal.graph;
+
+        *self.fanouts.entry(file).or_insert_with(|| {
+            let mut dependents: Vec<FileId> = graph
+                .dependents(file)
+                .filter(|edge| edge.kind.selects_tests())
+                .map(|edge| edge.dependent)
+                .collect();
+
+            dependents.sort_unstable();
+            dependents.dedup();
+
+            dependents.len()
+        })
+    }
+
+    fn spread_in_test_files(self) -> HashMap<Node, HubCrossing> {
+        let mut crossings = self.entries;
+        let mut queue: BinaryHeap<Reverse<(HubCrossing, Node)>> = crossings
+            .iter()
+            .map(|(&node, &crossing)| Reverse((crossing, node)))
+            .collect();
+        let mut steps = Vec::new();
+
+        while let Some(Reverse((crossing, node))) = queue.pop() {
+            if crossings[&node] != crossing {
+                continue;
+            }
+
+            let file = self.traversal.file_of(node);
+            let content = self
+                .reached
+                .get(&node)
+                .map_or(ContentChange::None, |&(content, _)| content);
+
+            steps.clear();
+            self.traversal.successors(node, content, &mut steps);
+
+            for step in &steps {
+                if self.traversal.file_of(step.node) != file {
+                    continue;
+                }
+
+                let improves = crossings
+                    .get(&step.node)
+                    .is_none_or(|&earlier| crossing < earlier);
+
+                if improves {
+                    crossings.insert(step.node, crossing);
+                    queue.push(Reverse((crossing, step.node)));
+                }
+            }
+        }
+
+        crossings
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -2183,6 +2362,96 @@ mod tests {
         assert_eq!(
             relaxed,
             ["src/hub.test.ts", "src/a.test.ts", "src/b.test.ts"]
+        );
+    }
+
+    fn hub_crossings<'g>(
+        graph: &'g Graph,
+        changes: &[FileChange],
+    ) -> Vec<(&'g str, usize, Option<&'g str>)> {
+        select_tests(graph, changes, Widening::Scoped)
+            .iter()
+            .map(|selected_test| {
+                let hub_crossing = selected_test.hub_crossing();
+
+                (
+                    graph.path(selected_test.file).as_str(),
+                    hub_crossing.fanout,
+                    hub_crossing.hub.map(|hub| graph.path(hub).as_str()),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hub_crossing_is_the_largest_fanout_left_before_the_tests_own_dependency() {
+        let graph = build_graph(
+            &["src/direct.test.ts", "src/use.test.ts", "src/far.test.ts"],
+            &[
+                ("src/direct.test.ts", Import, "src/hub.ts"),
+                ("src/use.ts", Import, "src/hub.ts"),
+                ("src/other.ts", Import, "src/hub.ts"),
+                ("src/use.test.ts", Import, "src/use.ts"),
+                ("src/far.ts", Import, "src/use.ts"),
+                ("src/far.test.ts", Import, "src/far.ts"),
+            ],
+        );
+
+        assert_eq!(
+            hub_crossings(&graph, &[modified("src/hub.ts")]),
+            [
+                ("src/direct.test.ts", 0, None),
+                ("src/use.test.ts", 3, Some("src/hub.ts")),
+                ("src/far.test.ts", 3, Some("src/hub.ts"))
+            ]
+        );
+    }
+
+    #[test]
+    fn hub_crossing_follows_the_path_past_the_smallest_hubs_not_the_closest() {
+        let graph = build_graph(
+            &["src/api.test.ts"],
+            &[
+                ("src/hub.ts", Import, "src/db.ts"),
+                ("src/store.ts", Import, "src/db.ts"),
+                ("src/api.ts", Import, "src/hub.ts"),
+                ("src/one.ts", Import, "src/hub.ts"),
+                ("src/two.ts", Import, "src/hub.ts"),
+                ("src/three.ts", Import, "src/hub.ts"),
+                ("src/cache.ts", Import, "src/store.ts"),
+                ("src/session.ts", Import, "src/cache.ts"),
+                ("src/api.test.ts", Import, "src/api.ts"),
+                ("src/api.test.ts", Import, "src/session.ts"),
+            ],
+        );
+
+        assert_eq!(
+            selected_with_distances(&graph, &[modified("src/db.ts")]),
+            [("src/api.test.ts", 3)]
+        );
+        assert_eq!(
+            hub_crossings(&graph, &[modified("src/db.ts")]),
+            [("src/api.test.ts", 2, Some("src/db.ts"))]
+        );
+    }
+
+    #[test]
+    fn hub_crossing_counts_files_crossed_by_symbol_uses() {
+        let graph = hub_and_its_users().changed("src/hub.ts", &["a"]).build();
+
+        assert_eq!(
+            hub_crossings(&graph, &[modified("src/hub.ts")]),
+            [("src/a.test.ts", 3, Some("src/hub.ts"))]
+        );
+    }
+
+    #[test]
+    fn changed_test_file_crosses_no_hub() {
+        let graph = build_graph(&["src/a.test.ts"], &[("src/a.test.ts", Import, "src/a.ts")]);
+
+        assert_eq!(
+            hub_crossings(&graph, &[modified("src/a.test.ts")]),
+            [("src/a.test.ts", 0, None)]
         );
     }
 }

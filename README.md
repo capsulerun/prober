@@ -180,6 +180,20 @@ site = "src/loader.ts:42"
 # Every inference is on by default; switch one off if it misbehaves
 [inference]
 widening = true
+
+# Opt-in: trade a little safety for savings, with a full run on main as safety net
+[aggressive]
+max_distance = 6
+hub_fanout_limit = 50
+
+# Slow suites run only when the change is close
+[[defer]]
+tests = "test/**/*.integration.test.ts"
+max_distance = 1
+
+# Tests no aggressive option drops
+[protected]
+tests = ["test/session-lifecycle.regression.test.ts"]
 ```
 
 Paths are relative to the root of the repository. In patterns, `*` matches within one path segment, `**` across segments, and `{name}` captures one segment (or part of one) that the other side of the rule reuses.
@@ -222,6 +236,17 @@ Each inference can be switched off, to measure what it adds or when it misbehave
 | `spawned_entrypoints` | Scripts and binaries that tests start as a process |
 | `build_mapping` | Build outputs (`dist/…`) mapped back to their sources |
 | `symbols` | For TypeScript, links followed through the functions and classes a test uses rather than whole files |
+
+#### `[aggressive]`, `[[defer]]` and `[protected]`
+
+By default, every test a change can reach is selected. These options drop some of them for more savings. Use them only with a periodic full run on the main branch (hourly or nightly) to catch what they let through, and check them with `prober shadow` first: its failure distances show how far real failures sit from their change.
+
+- `max_distance` in `[aggressive]`: drops the tests more than this many files away from every change. A test importing a changed file is at distance 1.
+- `hub_fanout_limit` in `[aggressive]`: past a file that more than this many files depend on, keeps only its direct dependents. A test is dropped when every path to it goes beyond the direct dependents of such a hub.
+- `[[defer]]`: `tests` (one pattern or a list) run only within `max_distance` of a change, for slow suites such as integration or browser tests. Several `[[defer]]` tables can set different distances.
+- `[protected]`: `tests` patterns that these options never drop, such as tests that caught real regressions. Tests that mock a module whose exports changed are protected too.
+
+A dropped test is listed under `dropped` in the JSON and in the summary with the option that dropped it, stderr counts them, and `prober why` names the option. When every test a change reaches is dropped, the mode is `none` (with a `dropped` reason), unless `[always_run]` adds tests. The JSON also gives, for every selected test, its `distances` and its `hub_fanouts`: the smallest `hub_fanout_limit` that keeps it.
 
 ## Contributing
 
