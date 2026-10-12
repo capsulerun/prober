@@ -46,39 +46,26 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@1.98.1
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Select crates
-        id: select
+        id: prober
         if: github.event_name == 'pull_request'
-        env:
-          BASE_REF: ${{ github.base_ref }}
-        run: |
-          cargo build --quiet -p prober
-          ./target/debug/prober --base "origin/$BASE_REF" --format json > selection.json
-          echo "mode=$(jq -r .mode selection.json)" >> "$GITHUB_OUTPUT"
-          echo "packages=$(jq -r '[.targets.rust // [] | .[].crate | "-p " + .] | join(" ")' selection.json)" >> "$GITHUB_OUTPUT"
-          {
-            echo "### Prober selection: $(jq -r .mode selection.json)"
-            jq -r '.targets.rust // [] | .[].crate | "- `" + . + "`"' selection.json
-            jq -r '(.mode_reasons // [])[] | "- " + .message' selection.json
-          } >> "$GITHUB_STEP_SUMMARY"
+        uses: ./
 
       - name: Test
         env:
           EVENT: ${{ github.event_name }}
-          MODE: ${{ steps.select.outputs.mode }}
-          PACKAGES: ${{ steps.select.outputs.packages }}
+          MODE: ${{ steps.prober.outputs.mode }}
+          CRATES: ${{ steps.prober.outputs.rust-file }}
         run: |
           if [ "$EVENT" != "pull_request" ] || [ "$MODE" = "all" ]; then
             cargo test --workspace
-          elif [ -n "$PACKAGES" ]; then
-            cargo test $PACKAGES
+          elif [ -s "$CRATES" ]; then
+            sed 's/^/-p /' "$CRATES" | xargs cargo test
           else
             echo "No crate is reached by this change"
           fi

@@ -1402,6 +1402,35 @@ fn nul_separated_list_ends_each_path_with_nul() {
 }
 
 #[test]
+fn output_dir_holds_the_json_the_summary_and_one_list_per_language() {
+    let repository = TestRepository::with_project_on_main();
+    let output_dir = TempDir::new().unwrap();
+
+    repository.change_and_commit("src/a.ts", "export const a = 2;");
+
+    let run = repository.prober(&[
+        "--base",
+        "main",
+        "--output-dir",
+        output_dir.path().to_str().unwrap(),
+    ]);
+    let read = |name: &str| fs::read_to_string(output_dir.path().join(name)).unwrap();
+    let selection: Value = serde_json::from_str(&read("selection.json")).unwrap();
+
+    assert_eq!(run.exit_code, 0, "{}", run.stderr);
+    assert_eq!(run.stdout, "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(selection["mode"], "selected");
+    assert_eq!(read("typescript.txt"), "src/a.test.ts\nsrc/b.test.ts\n");
+    assert_eq!(read("python.txt"), "");
+    assert_eq!(read("rust.txt"), "");
+    assert!(
+        read("summary.md").starts_with("### Prober: selected 2/2 test files (100.0%)\n"),
+        "{}",
+        read("summary.md")
+    );
+}
+
+#[test]
 fn nul_separator_is_rejected_with_json() {
     let repository = TestRepository::with_project_on_main();
     let run = repository.prober(&["--base", "main", "--format", "json", "-0"]);
