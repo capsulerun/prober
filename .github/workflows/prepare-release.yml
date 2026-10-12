@@ -1,0 +1,51 @@
+name: Prepare release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the v (e.g. 0.1.0-rc.1)
+        required: true
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - name: Check the version
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]]; then
+            echo "::error::$VERSION is not a version like 0.1.0 or 0.1.0-rc.1"
+            exit 1
+          fi
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" > /dev/null; then
+            echo "::error::v$VERSION is already tagged"
+            exit 1
+          fi
+
+      - name: Set the version
+        run: |
+          sed -i -E "0,/^version = \"[^\"]*\"$/s//version = \"$VERSION\"/" Cargo.toml
+          cargo update --workspace
+          cargo pkgid -p prober | grep -q "@$VERSION$"
+
+      - name: Tag the release commit
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --all --message "Release v$VERSION"
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+
+      - name: Start the release
+        run: gh workflow run release.yml --ref "v$VERSION" -f tag="v$VERSION"
