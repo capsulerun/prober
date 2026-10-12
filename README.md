@@ -1,19 +1,22 @@
 <div align="center">
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
-  <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
-  <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="30%"  />
-</picture>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
+    <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
+    <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="30%"  />
+  </picture>
+</div>
 
 <div align="center">
   <h3>Run only the tests your change can affect</h3>
 </div>
 
+<div align="center">
+
 [![CI](https://github.com/capsulerun/prober/actions/workflows/ci.yml/badge.svg)](https://github.com/capsulerun/prober/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/capsulerun/prober?include_prereleases&sort=semver)](https://github.com/capsulerun/prober/releases)
 
 </div>
+
 
 Most pipelines run the whole test suite on every change, even when it touches a few files, so CI time and cost grow with every change rather than with what it changes.
 
