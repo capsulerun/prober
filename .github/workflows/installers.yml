@@ -70,8 +70,14 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     name: Action (${{ matrix.os }})
+    env:
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
+
+      - name: Save the Sigstore trust root, as a release commit does
+        shell: bash
+        run: gh attestation trusted-root > action/trusted_root.jsonl
 
       - name: Install, cold
         uses: ./

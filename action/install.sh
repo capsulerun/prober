@@ -99,8 +99,14 @@ fi
 if [ "$VERIFY_ATTESTATION" = "true" ]; then
   command -v gh > /dev/null \
     || fail "gh is needed to verify the attestation of $archive; install it, or set verify-attestation: false to check its checksum only"
-  gh attestation verify "$download_directory/$archive" --repo "$repository" > /dev/null \
-    || fail "$archive has no valid attestation from $repository"
+  trusted_root="$action_path/action/trusted_root.jsonl"
+
+  if ! { [ -f "$trusted_root" ] \
+    && gh attestation verify "$download_directory/$archive" --repo "$repository" \
+      --custom-trusted-root "$trusted_root" > /dev/null 2>&1; }; then
+    gh attestation verify "$download_directory/$archive" --repo "$repository" > /dev/null \
+      || fail "$archive has no valid attestation from $repository"
+  fi
 else
   echo "::warning::The attestation of $archive is not verified (verify-attestation: false), only its checksum"
 fi

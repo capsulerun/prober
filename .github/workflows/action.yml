@@ -156,6 +156,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      - name: Save the Sigstore trust root, as a release commit does
+        run: gh attestation trusted-root > action/trusted_root.jsonl
+
       - name: Install a release
         env:
           INPUT_VERSION: ${{ env.VERSION }}
