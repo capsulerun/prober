@@ -11,6 +11,12 @@ use quick_xml::reader::Reader;
 use crate::files::RepoPath;
 use crate::outcomes::{TestOutcomes, TestStatus};
 
+const NEXTEST_RUN: &str = "nextest-run";
+
+const NEXTEST_BINARY_SEPARATOR: &str = "::";
+
+const PYTHON_MODULE_SEPARATOR: char = '.';
+
 const TEST_SOURCE_EXTENSIONS: [&str; 10] = [
     "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "py", "rs",
 ];
@@ -41,6 +47,11 @@ impl ReportPaths {
 
         normalize(&path_from_repo_root)
     }
+
+    fn resolve_existing(&self, reported_path: &str) -> Option<RepoPath> {
+        self.resolve(reported_path)
+            .filter(|path| self.repo_root.join(path.as_str()).is_file())
+    }
 }
 
 pub fn read_junit_report(
@@ -54,6 +65,7 @@ pub fn read_junit_report(
         outcomes,
         open_suites: Vec::new(),
         open_test_case: None,
+        suites_are_crates: false,
     };
 
     loop {
@@ -127,11 +139,16 @@ struct JunitReader<'a> {
     outcomes: &'a mut TestOutcomes,
     open_suites: Vec<OpenSuite>,
     open_test_case: Option<OpenTestCase>,
+    suites_are_crates: bool,
 }
 
 impl JunitReader<'_> {
     fn open(&mut self, element: &BytesStart) -> Result<()> {
         match element.local_name().as_ref() {
+            "testsuites" => {
+                self.suites_are_crates =
+                    attribute(element, "name")?.as_deref() == Some(NEXTEST_RUN);
+            }
             "testsuite" => self.open_suites.push(OpenSuite {
                 name: attribute(element, "name")?,
                 file: attribute(element, "file")?.or(attribute(element, "filepath")?),
@@ -200,7 +217,10 @@ impl JunitReader<'_> {
     fn record_suite(&mut self, suite: OpenSuite) {
         let outer_suites: Vec<&OpenSuite> = self.open_suites.iter().rev().collect();
         let suites_inner_first: Vec<&OpenSuite> = iter::once(&suite).chain(outer_suites).collect();
-        let suite_file = suite_file(&suites_inner_first, self.report_paths);
+        let suite_crate = self.suites_are_crates.then(|| crate_of(&suite)).flatten();
+        let suite_file = suite_crate
+            .clone()
+            .or_else(|| suite_file(&suites_inner_first, self.report_paths));
 
         if suite.failed_outside_test_cases {
             match &suite_file {
@@ -218,7 +238,11 @@ impl JunitReader<'_> {
         let attributed_files: Vec<Option<RepoPath>> = suite
             .test_cases
             .iter()
-            .map(|test_case| test_case_file(test_case, &suites_inner_first, self.report_paths))
+            .map(|test_case| {
+                suite_crate
+                    .clone()
+                    .or_else(|| test_case_file(test_case, &suites_inner_first, self.report_paths))
+            })
             .collect();
         match (only_file(&attributed_files), suite.time) {
             (Some(file), Some(suite_time)) => {
@@ -287,6 +311,28 @@ fn test_case_file(
     explicit_files
         .chain(path_like_names)
         .find_map(|candidate| report_paths.resolve(candidate))
+        .or_else(|| python_module_file(test_case.class_name.as_deref()?, report_paths))
+}
+
+fn python_module_file(class_name: &str, report_paths: &ReportPaths) -> Option<RepoPath> {
+    if class_name.contains('/') || class_name.chars().any(char::is_whitespace) {
+        return None;
+    }
+
+    let parts: Vec<&str> = class_name.split(PYTHON_MODULE_SEPARATOR).collect();
+
+    (1..=parts.len()).rev().find_map(|length| {
+        report_paths.resolve_existing(&format!("{}.py", parts[..length].join("/")))
+    })
+}
+
+fn crate_of(suite: &OpenSuite) -> Option<RepoPath> {
+    let binary_id = suite.name.as_deref()?;
+    let crate_name = binary_id
+        .split_once(NEXTEST_BINARY_SEPARATOR)
+        .map_or(binary_id, |(crate_name, _)| crate_name);
+
+    RepoPath::new(crate_name).ok()
 }
 
 pub fn looks_like_test_file(name: &str) -> bool {

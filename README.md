@@ -274,6 +274,8 @@ The workspace has one crate per part:
 
 Each crate has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. The CI runs Prober on its own pull requests to select which crates to test.
 
+[`tests/samples`](tests/samples) holds small sample repositories, one per language and one mixing them, that check Prober end to end with real test runners. Prober picks them for its own CI through its
+
 Issues and pull requests are welcome. 
 
 ## License

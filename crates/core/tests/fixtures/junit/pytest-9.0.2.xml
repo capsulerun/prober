@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?><testsuites name="pytest tests"><testsuite name="pytest" errors="0" failures="1" skipped="0" tests="4" time="0.026" hostname="runner"><testcase classname="tests.api.test_users" name="test_create" time="0.000" /><testcase classname="tests.test_orders" name="test_total" time="0.000" /><testcase classname="tests.test_orders.TestCart" name="test_empty" time="0.000" /><testcase classname="tests.test_orders.TestCart" name="test_broken" time="0.000"><failure message="assert False">self = &lt;tests.test_orders.TestCart object at 0x108352850&gt;
+
+    def test_broken(self):
+&gt;       assert False
+E       assert False
+
+tests/test_orders.py:10: AssertionError</failure></testcase></testsuite></testsuites>

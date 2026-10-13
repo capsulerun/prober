@@ -130,3 +130,62 @@ fn sharded_reports_merge_and_a_passing_shard_never_hides_a_failure() {
     );
     assert_eq!(outcomes.outcome(&other).unwrap().status, TestStatus::Passed);
 }
+
+fn read_pytest_report(runner_directory: Option<&str>) -> TestOutcomes {
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/junit");
+    let (repo_root, runner_directory) = match runner_directory {
+        Some(runner_directory) => (fixtures, Some(RepoPath::new(runner_directory).unwrap())),
+        None => (fixtures.join("pytest-project"), None),
+    };
+    let report_paths = ReportPaths::new(&repo_root, runner_directory);
+    let mut outcomes = TestOutcomes::default();
+
+    read_junit_report(&fixture("pytest-9.0.2.xml"), &report_paths, &mut outcomes).unwrap();
+
+    outcomes
+}
+
+#[test]
+fn pytest_default_report_names_modules_mapped_to_the_files_that_exist() {
+    let outcomes = read_pytest_report(None);
+
+    assert_eq!(
+        statuses(&outcomes),
+        [
+            ("tests/api/test_users.py", TestStatus::Passed),
+            ("tests/test_orders.py", TestStatus::Failed),
+        ]
+    );
+    assert_eq!(outcomes.unattributed_test_cases(), []);
+}
+
+#[test]
+fn pytest_report_from_a_package_directory_is_prefixed_with_it() {
+    let outcomes = read_pytest_report(Some("pytest-project"));
+    let files: Vec<&str> = statuses(&outcomes)
+        .into_iter()
+        .map(|(file, _)| file)
+        .collect();
+
+    assert_eq!(
+        files,
+        [
+            "pytest-project/tests/api/test_users.py",
+            "pytest-project/tests/test_orders.py"
+        ]
+    );
+}
+
+#[test]
+fn nextest_report_gives_one_outcome_per_crate() {
+    let outcomes = read_reports(&[&fixture("nextest-0.9.148.xml")], None);
+
+    assert_eq!(
+        statuses(&outcomes),
+        [
+            ("orders", TestStatus::Passed),
+            ("pricing", TestStatus::Failed)
+        ]
+    );
+    assert_eq!(outcomes.unattributed_test_cases(), []);
+}

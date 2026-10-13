@@ -64,8 +64,84 @@ jobs:
         run: |
           if [ "$EVENT" != "pull_request" ] || [ "$MODE" = "all" ]; then
             cargo test --workspace
-          elif [ -s "$CRATES" ]; then
-            sed 's/^/-p /' "$CRATES" | xargs cargo test
-          else
-            echo "No crate is reached by this change"
+            exit
           fi
+
+          members=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[].name' | grep -Fx -f "$CRATES" || true)
+
+          if [ -n "$members" ]; then
+            echo "$members" | sed 's/^/-p /' | xargs cargo test
+          else
+            echo "No crate of the workspace is reached by this change"
+          fi
+
+  samples-reached:
+    name: Samples reached
+    runs-on: ubuntu-latest
+    outputs:
+      samples: ${{ steps.reached.outputs.samples }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: samples
+
+      - name: Select
+        id: prober
+        if: github.event_name == 'pull_request'
+        uses: ./
+
+      - name: Samples reached
+        id: reached
+        env:
+          SELECTION: ${{ steps.prober.outputs.json-file }}
+        run: |
+          samples=$(bash tests/samples/reached.sh ${SELECTION:+"$(dirname "$SELECTION")"})
+          echo "samples=$samples" >> "$GITHUB_OUTPUT"
+          echo "Samples to run: $samples"
+
+  samples:
+    needs: samples-reached
+    if: needs.samples-reached.outputs.samples != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        sample: ${{ fromJSON(needs.samples-reached.outputs.samples) }}
+    runs-on: ubuntu-latest
+    name: Sample (${{ matrix.sample }})
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@1.98.1
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: samples
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
+      - name: Install pytest
+        run: python3 -m pip install --quiet pytest
+
+      - name: Build Prober
+        run: |
+          cargo build --locked -p prober
+          echo "$PWD/target/debug" >> "$GITHUB_PATH"
+
+      - name: Run the sample
+        env:
+          SAMPLE: ${{ matrix.sample }}
+        run: bash tests/samples/check.sh "$SAMPLE"

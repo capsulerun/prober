@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites name="nextest-run" tests="2" skipped="0" failures="1" errors="0" time="0.018">
+    <testsuite name="orders::integration" tests="1" skipped="0" errors="0" failures="0">
+        <testcase name="order_total" classname="orders::integration" time="0.015"/>
+    </testsuite>
+    <testsuite name="pricing" tests="1" skipped="0" errors="0" failures="1">
+        <testcase name="tests::broken" classname="pricing" time="0.015">
+            <failure message="thread &apos;tests::broken&apos; (4788395) panicked at pricing/src/lib.rs:6:19" type="test failure with exit code 101">thread &apos;tests::broken&apos; (4788395) panicked at pricing/src/lib.rs:6:19:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace</failure>
+            <system-out>
+running 1 test
+test tests::broken ... FAILED
+
+failures:
+
+failures:
+    tests::broken
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+</system-out>
+            <system-err>
+thread &apos;tests::broken&apos; (4788395) panicked at pricing/src/lib.rs:6:19:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+</system-err>
+        </testcase>
+    </testsuite>
+</testsuites>
