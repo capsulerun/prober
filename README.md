@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
     <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
-    <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="30%"  />
+    <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="40%"  />
   </picture>
 </div>
 
@@ -273,6 +273,8 @@ The workspace has one crate per part:
 | `crates/cli` | The `prober` binary |
 
 Each crate has unit tests per rule and tests that write small projects to disk and select on them. A change to inference comes with a test of the shape it handles, and with the shapes it must not change. The CI runs Prober on its own pull requests to select which crates to test.
+
+[`tests/samples`](tests/samples) holds small sample repositories, one per language and one mixing them, that check Prober end to end with real test runners. Prober picks them for its own CI through its
 
 Issues and pull requests are welcome. 
 

@@ -1,2 +1,18 @@
 [always_all]
 files = [".github/workflows/**", "prober.toml"]
+
+[[link]]
+from = "crates/lang-{language}/src/**"
+to = "tests/samples/{language}/**"
+
+[[link]]
+from = "crates/*/src/**"
+to = "tests/samples/polyglot/**"
+
+[[link]]
+from = "tests/samples/{sample}/**"
+to = "tests/samples/{sample}/**"
+
+[[link]]
+from = "tests/samples/*.sh"
+to = "tests/samples/**"
