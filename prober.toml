@@ -6,7 +6,7 @@ from = "crates/lang-{language}/src/**"
 to = "tests/samples/{language}/**"
 
 [[link]]
-from = "crates/lang-*/src/**"
+from = "crates/*/src/**"
 to = "tests/samples/polyglot/**"
 
 [[link]]

@@ -18,4 +18,5 @@ hosting = "github"
 install-updater = false
 github-attestations = true
 dispatch-releases = true
+pr-run-mode = "skip"
 allow-dirty = ["ci"]
