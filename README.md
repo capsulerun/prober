@@ -2,7 +2,7 @@
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset=".github/images/logo-dark-prober.svg" />
     <source media="(prefers-color-scheme: light)" srcset=".github/images/logo-light-prober.svg" />
-    <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="40%"  />
+    <img alt="prober logo and name" src=".github/images/logo-light-prober.svg" width="25%"  />
   </picture>
 </div>
 
