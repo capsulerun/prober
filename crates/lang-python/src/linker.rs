@@ -6,9 +6,9 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result};
 use prober_core::changes::FileChange;
 use prober_core::config::{InferenceSettings, Presets};
-use prober_core::files::RepoPath;
+use prober_core::files::{FileId, RepoPath};
 use prober_core::frontend::{ChangeSet, Frontend};
-use prober_core::graph::{Edge, EdgeKind, GraphBuilder, UnresolvedSite};
+use prober_core::graph::{Edge, EdgeKind, GraphBuilder, Inference, UnresolvedSite};
 use prober_core::report::ModeReason;
 use rayon::prelude::*;
 
@@ -31,6 +31,8 @@ use crate::summary::ModuleSummary;
 const PYTEST_PRESET: &str = "pytest";
 
 const DJANGO_PRESET: &str = "django";
+
+const PYTHON_BINDING: &str = "Python binding";
 
 pub struct PythonLinker {
     repo_root: PathBuf,
@@ -186,6 +188,10 @@ impl PythonLinker {
                         kind,
                     });
                 }
+            }
+
+            if self.inference.bindings {
+                self.add_native_imports(file, &summaries[module], graph);
             }
         }
 
@@ -495,6 +501,27 @@ fn modules_outside_packages<'m>(
 }
 
 impl PythonLinker {
+    fn add_native_imports(&self, file: FileId, summary: &ModuleSummary, graph: &mut GraphBuilder) {
+        for native_import in &summary.native_imports {
+            let native = &self.index.native_modules()[native_import.module];
+            let manifest = graph.add_file(native.manifest.clone());
+
+            graph.add_inferred_edge(
+                Edge {
+                    dependent: file,
+                    dependency: manifest,
+                    kind: EdgeKind::Binding,
+                },
+                Inference {
+                    line: native_import.line,
+                    kind: PYTHON_BINDING,
+                    pattern: native.name.clone(),
+                    detail: Some(native.declaration.to_string()),
+                },
+            );
+        }
+    }
+
     fn add_removed_tests(
         &self,
         repo_files: &[RepoPath],

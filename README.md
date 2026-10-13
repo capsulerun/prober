@@ -24,7 +24,7 @@ Prober outputs the tests a change can affect, each with the reason it was select
 
 
 > [!NOTE]
-> Works with TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them.
+> Works with TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them, including through the Python and Node modules built from Rust (maturin, napi).
 
 ## Getting started
 
@@ -240,6 +240,7 @@ Every inference is on by default. Switch one off to measure what it adds, or whe
 | `spawned_entrypoints` | Scripts and binaries that tests start as a process |
 | `build_mapping` | Build outputs (`dist/…`) mapped back to their sources |
 | `symbols` | For TypeScript, links followed through the functions and classes a test uses rather than whole files |
+| `bindings` | Rust crates built into a Python or Node module (maturin, napi), linked to the code importing that module |
 
 #### `[aggressive]`, `[[defer]]` and `[protected]`
 

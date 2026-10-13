@@ -96,9 +96,16 @@ pub(crate) struct StaticImport {
     pub type_only: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct NativeImport {
+    pub line: u32,
+    pub module: usize,
+}
+
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ModuleSummary {
     pub imports: Vec<StaticImport>,
+    pub native_imports: Vec<NativeImport>,
     pub functions: Vec<FunctionSummary>,
     pub bindings: HashMap<String, Expr>,
     pub sites: Vec<Site>,
