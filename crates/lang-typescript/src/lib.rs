@@ -1,3 +1,4 @@
+mod bindings;
 mod build_mapping;
 mod conventions;
 mod dynamic;

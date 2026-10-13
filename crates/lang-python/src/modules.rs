@@ -5,6 +5,7 @@ use std::collections::{BTreeSet, HashSet};
 use prober_core::files::RepoPath;
 use toml::Value;
 
+use crate::bindings::{NativeModule, native_module};
 use crate::conventions::{
     PACKAGE_INIT, is_source_file, is_standard_library, join_directory, parent_directory, split_path,
 };
@@ -32,6 +33,7 @@ pub(crate) struct ModuleIndex {
     directories: HashSet<String>,
     roots: Vec<String>,
     top_level_packages: Vec<String>,
+    native_modules: Vec<NativeModule>,
 }
 
 impl ModuleIndex {
@@ -75,6 +77,8 @@ impl ModuleIndex {
             }
         }
 
+        let mut native_modules = Vec::new();
+
         for manifest in repo_files
             .iter()
             .filter(|path| split_path(path.as_str()).1 == PROJECT_MANIFEST)
@@ -89,6 +93,8 @@ impl ModuleIndex {
                 continue;
             };
 
+            native_modules.extend(native_module(manifest, &document, read_head));
+
             for declared in declared_roots(&Value::Table(document)) {
                 if let Some(root) = normalized_join(project_directory, &declared) {
                     roots.insert(root);
@@ -101,7 +107,32 @@ impl ModuleIndex {
             directories,
             roots: roots.into_iter().collect(),
             top_level_packages: top_level_packages.into_iter().collect(),
+            native_modules,
         }
+    }
+
+    pub fn native_modules(&self) -> &[NativeModule] {
+        &self.native_modules
+    }
+
+    pub fn native_module_named(&self, importer: &RepoPath, dotted: &str) -> Option<usize> {
+        if self.native_modules.is_empty() || dotted.is_empty() {
+            return None;
+        }
+
+        let path = dotted.replace('.', "/");
+
+        self.roots_for(importer)
+            .into_iter()
+            .find_map(|root| self.native_module_at(&join_directory(root, &path)))
+    }
+
+    pub fn native_module_at(&self, location: &str) -> Option<usize> {
+        self.native_modules.iter().position(|native| {
+            location
+                .strip_prefix(native.location.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+        })
     }
 
     pub fn roots(&self) -> impl Iterator<Item = &str> {
@@ -378,6 +409,14 @@ fn declared_roots(document: &Value) -> Vec<String> {
                 .iter()
                 .map(|package| parent_directory(package.trim_end_matches('/')).to_owned()),
         );
+    }
+
+    if let Some(python_source) = tool
+        .and_then(|tool| tool.get("maturin"))
+        .and_then(|maturin| maturin.get("python-source"))
+        .and_then(Value::as_str)
+    {
+        roots.push(python_source.to_owned());
     }
 
     if let Some(python_path) = tool

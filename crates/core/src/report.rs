@@ -919,6 +919,28 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             }
         }
         Link::Edge {
+            kind: EdgeKind::Binding,
+            dependency,
+        } => {
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind: EdgeKind::Binding,
+            };
+
+            match graph.inference(&edge) {
+                Some(inference) if inference.line > 0 => format!(
+                    "-> loaded by {dependent}:{} ({})",
+                    inference.line,
+                    inference.description()
+                ),
+                Some(inference) => {
+                    format!("-> loaded by {dependent} ({})", inference.description())
+                }
+                None => format!("-> loaded by {dependent}"),
+            }
+        }
+        Link::Edge {
             kind: kind @ (EdgeKind::Reads | EdgeKind::Lists | EdgeKind::Dynamic | EdgeKind::Spawn),
             dependency,
         } => {
@@ -1427,6 +1449,80 @@ mod tests {
                 "-> built into dist/entry.js (inferred build mapping dist/ <- src/ (tsconfig.json))",
                 "-> loaded by bin/cli.mjs:3 (inferred path dist/entry.js)",
                 "-> spawned by test/cli.e2e.test.ts:12 (inferred spawn bin/cli.mjs)",
+            ])
+        );
+    }
+
+    #[test]
+    fn binding_hops_name_the_module_and_its_declaration() {
+        let mut builder = GraphBuilder::default();
+        let python_test = builder.add_test_file(repo_path("tests/test_sum.py"), "python");
+        let importer = builder.add_file(repo_path("app/native.py"));
+        let node_test = builder.add_test_file(repo_path("test/sum.test.ts"), "typescript");
+        let loader = builder.add_file(repo_path("binding/index.js"));
+        let manifest = builder.add_test_file(repo_path("core/Cargo.toml"), "rust");
+        let source = builder.add_file(repo_path("core/src/lib.rs"));
+
+        builder.add_edge(Edge {
+            dependent: manifest,
+            dependency: source,
+            kind: EdgeKind::Build,
+        });
+        builder.add_inferred_edge(
+            Edge {
+                dependent: importer,
+                dependency: manifest,
+                kind: EdgeKind::Binding,
+            },
+            Inference {
+                line: 4,
+                kind: "Python binding",
+                pattern: "app._core".to_owned(),
+                detail: Some("pyproject.toml".to_owned()),
+            },
+        );
+        builder.add_inferred_edge(
+            Edge {
+                dependent: loader,
+                dependency: manifest,
+                kind: EdgeKind::Binding,
+            },
+            Inference {
+                line: 0,
+                kind: "Node binding",
+                pattern: "core".to_owned(),
+                detail: Some("binding/package.json".to_owned()),
+            },
+        );
+
+        for (dependent, dependency) in [(python_test, importer), (node_test, loader)] {
+            builder.add_edge(Edge {
+                dependent,
+                dependency,
+                kind: EdgeKind::Import,
+            });
+        }
+
+        let graph = builder.build();
+        let report = report_for_changes(&graph, &[modified("core/src/lib.rs")]);
+        let json_report: serde_json::Value = serde_json::from_str(&report.to_json()).unwrap();
+
+        assert_eq!(
+            json_report["reasons"]["tests/test_sum.py"],
+            serde_json::json!([
+                "core/src/lib.rs (modified)",
+                "-> built into core/Cargo.toml",
+                "-> loaded by app/native.py:4 (inferred Python binding app._core (pyproject.toml))",
+                "-> imported by tests/test_sum.py",
+            ])
+        );
+        assert_eq!(
+            json_report["reasons"]["test/sum.test.ts"],
+            serde_json::json!([
+                "core/src/lib.rs (modified)",
+                "-> built into core/Cargo.toml",
+                "-> loaded by binding/index.js (inferred Node binding core (binding/package.json))",
+                "-> imported by test/sum.test.ts",
             ])
         );
     }

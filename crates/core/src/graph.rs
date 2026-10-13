@@ -20,6 +20,7 @@ pub enum EdgeKind {
     Family,
     Spawn,
     Build,
+    Binding,
     Rule,
 }
 
@@ -35,6 +36,7 @@ impl EdgeKind {
             | EdgeKind::Family
             | EdgeKind::Spawn
             | EdgeKind::Build
+            | EdgeKind::Binding
             | EdgeKind::Rule => true,
             EdgeKind::TypeOnly => false,
         }
@@ -1112,6 +1114,7 @@ mod tests {
         assert!(EdgeKind::Family.selects_tests());
         assert!(EdgeKind::Spawn.selects_tests());
         assert!(EdgeKind::Build.selects_tests());
+        assert!(EdgeKind::Binding.selects_tests());
         assert!(!EdgeKind::TypeOnly.selects_tests());
     }
 
@@ -1123,6 +1126,7 @@ mod tests {
             assert!(EdgeKind::Asset.follows(content));
             assert!(EdgeKind::Spawn.follows(content));
             assert!(EdgeKind::Build.follows(content));
+            assert!(EdgeKind::Binding.follows(content));
         }
 
         assert!(!EdgeKind::Reads.follows(ContentChange::None));

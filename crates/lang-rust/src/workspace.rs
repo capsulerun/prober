@@ -178,7 +178,7 @@ fn is_member(directory: &str, root: &str, workspace: &Table) -> bool {
             .flatten()
             .filter_map(Value::as_str)
             .any(|pattern| {
-                let pattern = pattern.trim_end_matches('/');
+                let pattern = pattern.trim_start_matches("./").trim_end_matches('/');
 
                 pattern == relative
                     || Glob::new(pattern)
@@ -364,7 +364,7 @@ mod tests {
         let workspace = workspace(&[
             (
                 "Cargo.toml",
-                "[workspace]\nmembers = [\"crates/*\"]\nexclude = [\"crates/skipped\"]\n\n[workspace.dependencies]\ncore = { package = \"app-core\", path = \"crates/core\" }\nserde = \"1\"\n",
+                "[workspace]\nmembers = [\"./crates/*\"]\nexclude = [\"crates/skipped/\"]\n\n[workspace.dependencies]\ncore = { package = \"app-core\", path = \"crates/core\" }\nserde = \"1\"\n",
             ),
             (
                 "crates/core/Cargo.toml",

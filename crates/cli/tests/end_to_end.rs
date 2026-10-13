@@ -1034,6 +1034,122 @@ fn rust_crates_are_targets_listed_by_name_and_explained_by_why() {
     assert_eq!(repository.prober(&["--base", "HEAD^"]).stdout, "parse\n");
 }
 
+fn repository_with_bindings() -> TestRepository {
+    TestRepository::with_files_on_main(&[
+        (
+            "Cargo.toml",
+            "[workspace]\nmembers = [\"crates/*\", \"python\", \"node\"]\n",
+        ),
+        (
+            "crates/engine/Cargo.toml",
+            "[package]\nname = \"engine\"\nversion = \"0.1.0\"\n",
+        ),
+        ("crates/engine/src/lib.rs", "pub mod sum;\n"),
+        (
+            "crates/engine/src/sum.rs",
+            "pub fn add(a: i64, b: i64) -> i64 { a + b }\n",
+        ),
+        (
+            "python/Cargo.toml",
+            "[package]\nname = \"engine-python\"\nversion = \"0.1.0\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nengine = { path = \"../crates/engine\" }\n",
+        ),
+        (
+            "python/src/lib.rs",
+            "pub fn add(a: i64, b: i64) -> i64 { engine::sum::add(a, b) }\n",
+        ),
+        (
+            "python/pyproject.toml",
+            "[build-system]\nbuild-backend = \"maturin\"\n\n[tool.maturin]\npython-source = \"python\"\nmodule-name = \"shop._engine\"\n",
+        ),
+        ("python/python/shop/__init__.py", ""),
+        (
+            "python/python/shop/cart.py",
+            "from shop._engine import add\n",
+        ),
+        ("python/python/shop/labels.py", "TITLE = \"Cart\"\n"),
+        ("python/tests/test_cart.py", "from shop.cart import add\n"),
+        (
+            "python/tests/test_labels.py",
+            "from shop.labels import TITLE\n",
+        ),
+        (
+            "node/Cargo.toml",
+            "[package]\nname = \"engine-node\"\nversion = \"0.1.0\"\n\n[lib]\ncrate-type = [\"cdylib\"]\n\n[dependencies]\nengine = { path = \"../crates/engine\" }\n",
+        ),
+        (
+            "node/src/lib.rs",
+            "pub fn add(a: i64, b: i64) -> i64 { engine::sum::add(a, b) }\n",
+        ),
+        (
+            "node/package.json",
+            r#"{ "name": "@shop/engine", "main": "index.js", "napi": { "binaryName": "engine" } }"#,
+        ),
+        (
+            "node/index.js",
+            "module.exports = require('./engine.linux-x64-gnu.node')\n",
+        ),
+        (
+            "node/test/sum.test.ts",
+            "import { add } from \"../index.js\";\n\ntest(\"add\", () => expect(add(1, 2)).toBe(3));\n",
+        ),
+    ])
+}
+
+#[test]
+fn a_rust_change_selects_the_python_and_node_tests_behind_its_bindings() {
+    let repository = repository_with_bindings();
+
+    repository.change_and_commit(
+        "crates/engine/src/sum.rs",
+        "pub fn add(a: i64, b: i64) -> i64 { b + a }\n",
+    );
+
+    let report = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["targets"],
+        json!({
+            "python": ["python/tests/test_cart.py"],
+            "rust": [{ "crate": "engine" }, { "crate": "engine-node" }, { "crate": "engine-python" }],
+            "typescript": ["node/test/sum.test.ts"],
+        })
+    );
+    assert_eq!(
+        report["reasons"]["python/tests/test_cart.py"],
+        json!([
+            "crates/engine/src/sum.rs (modified)",
+            "-> imported by python/src/lib.rs",
+            "-> built into python/Cargo.toml",
+            "-> loaded by python/python/shop/cart.py:1 (inferred Python binding shop._engine (python/pyproject.toml))",
+            "-> imported by python/tests/test_cart.py",
+        ])
+    );
+    assert_eq!(
+        report["reasons"]["node/test/sum.test.ts"],
+        json!([
+            "crates/engine/src/sum.rs (modified)",
+            "-> imported by node/src/lib.rs",
+            "-> built into node/Cargo.toml",
+            "-> loaded by node/index.js (inferred Node binding engine (node/package.json))",
+            "-> used whole at load by node/test/sum.test.ts (analysed at file level: CommonJS exports)",
+        ])
+    );
+
+    repository.write("prober.toml", "[inference]\nbindings = false\n");
+    repository.commit_all("switch bindings off");
+
+    let report = repository
+        .prober(&["--base", "HEAD^^", "--format", "json"])
+        .json();
+
+    assert_eq!(
+        report["targets"],
+        json!({ "rust": [{ "crate": "engine" }, { "crate": "engine-node" }, { "crate": "engine-python" }] })
+    );
+}
+
 fn repository_with_rules() -> TestRepository {
     let repository = TestRepository::with_files_on_main(&[
         ("fixtures/golden/expected.txt", "v1"),

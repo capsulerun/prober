@@ -12,12 +12,13 @@ use ruff_python_ast::{
 use ruff_python_parser::parse_unchecked_source;
 use ruff_text_size::{Ranged, TextSize};
 
+use crate::conventions::join_directory;
 use crate::django::setting_lists;
 use crate::modules::{ImportTarget, ModuleIndex};
 use crate::pytest::items::{PytestItems, pytest_items};
 use crate::summary::{
-    CallSite, Expr, FunctionIndex, FunctionSummary, ModuleRef, ModuleSummary, Site, SiteKind,
-    StaticImport,
+    CallSite, Expr, FunctionIndex, FunctionSummary, ModuleRef, ModuleSummary, NativeImport, Site,
+    SiteKind, StaticImport,
 };
 
 const MAX_CONVERSION_DEPTH: usize = 24;
@@ -899,6 +900,18 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
         });
     }
 
+    fn add_native_import(&mut self, statement: &impl Ranged, module: Option<usize>) {
+        let Some(module) = module.filter(|_| !self.type_only) else {
+            return;
+        };
+        let line = self.summarizer.line(statement.range().start());
+        let native_import = NativeImport { line, module };
+
+        if !self.summary.native_imports.contains(&native_import) {
+            self.summary.native_imports.push(native_import);
+        }
+    }
+
     fn import_from(&mut self, import: &ast::StmtImportFrom) {
         let index = self.summarizer.index;
         let path = self.summarizer.path;
@@ -912,6 +925,14 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
 
         if import.level == 0 {
             let mut target = index.resolve_absolute(path, module);
+
+            self.add_native_import(import, index.native_module_named(path, module));
+
+            for name in &names {
+                let native = index.native_module_named(path, &format!("{module}.{name}"));
+
+                self.add_native_import(import, native);
+            }
 
             if let ImportTarget::Repo(files) = &mut target {
                 for name in names {
@@ -938,12 +959,21 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
             files.extend(resolved.files());
         }
 
+        if !module.is_empty() {
+            let location = join_directory(&directory, &module.replace('.', "/"));
+
+            self.add_native_import(import, index.native_module_at(&location));
+        }
+
         for name in names {
             let submodule = if module.is_empty() {
                 name.to_owned()
             } else {
                 format!("{module}.{name}")
             };
+            let location = join_directory(&directory, &submodule.replace('.', "/"));
+
+            self.add_native_import(import, index.native_module_at(&location));
 
             if let Some(resolved) = index.resolve_in_directory(&directory, &submodule) {
                 files.extend(resolved.files());
@@ -1100,12 +1130,13 @@ impl<'a> Visitor<'a> for SummaryVisitor<'_, 'a, '_> {
         match statement {
             Stmt::Import(import) => {
                 for alias in &import.names {
-                    let target = self
-                        .summarizer
-                        .index
-                        .resolve_absolute(self.summarizer.path, alias.name.as_str());
+                    let index = self.summarizer.index;
+                    let target = index.resolve_absolute(self.summarizer.path, alias.name.as_str());
+                    let native =
+                        index.native_module_named(self.summarizer.path, alias.name.as_str());
 
                     self.add_import(import, target);
+                    self.add_native_import(import, native);
                 }
             }
             Stmt::ImportFrom(import) => self.import_from(import),

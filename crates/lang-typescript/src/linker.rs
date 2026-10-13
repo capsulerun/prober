@@ -16,6 +16,7 @@ use prober_core::report::ModeReason;
 use prober_core::symbols::FallbackCause;
 use rayon::prelude::*;
 
+use crate::bindings::{BindingLink, NapiPackages, loads_the_addon};
 use crate::build_mapping::BuildMapping;
 use crate::conventions::{
     ALWAYS_ALL_DEFAULTS, LANGUAGE, MANIFEST_DEFAULTS, is_asset_file, is_module_file,
@@ -57,6 +58,7 @@ pub struct TypeScriptLinker {
     presets: RunnerPresets,
     symbol_analysis: bool,
     manifest_changes: ManifestChanges,
+    napi_packages: NapiPackages,
 }
 
 pub struct LinkChanges<'c> {
@@ -114,6 +116,7 @@ impl TypeScriptLinker {
         let packages = workspace.packages;
         let build_mapping = Arc::new(BuildMapping::new(&repo_root, repo_files));
         let resolver = head_resolver(&repo_root, &packages, Some(Arc::clone(&build_mapping)));
+        let napi_packages = NapiPackages::read(repo_files, &read_head);
         let linker = Self {
             repo_root,
             packages,
@@ -124,6 +127,7 @@ impl TypeScriptLinker {
             presets: RunnerPresets::default(),
             symbol_analysis: false,
             manifest_changes: ManifestChanges::default(),
+            napi_packages,
         };
 
         Ok(linker.with_presets(&Presets::Auto, repo_files))
@@ -333,6 +337,15 @@ impl TypeScriptLinker {
                 build_output_candidates(&linked_files, &dynamic_inference),
                 graph,
             );
+        }
+
+        if self.inference.bindings {
+            let binding_links = self.napi_packages.links(&linked_files);
+
+            dynamic_inference
+                .unresolved_sites
+                .retain(|site| !loads_the_addon(site, &binding_links));
+            add_binding_links(binding_links, graph);
         }
 
         add_dynamic_inference(dynamic_inference, graph);
@@ -881,6 +894,20 @@ fn add_build_edges(
 
             graph.add_inferred_edge(build_edge, build_source.inference);
         }
+    }
+}
+
+fn add_binding_links(binding_links: Vec<BindingLink>, graph: &mut GraphBuilder) {
+    for binding_link in binding_links {
+        let loader = graph.add_file(binding_link.loader);
+        let crate_manifest = graph.add_file(binding_link.crate_manifest);
+        let binding_edge = Edge {
+            dependent: loader,
+            dependency: crate_manifest,
+            kind: EdgeKind::Binding,
+        };
+
+        graph.add_inferred_edge(binding_edge, binding_link.inference);
     }
 }
 
