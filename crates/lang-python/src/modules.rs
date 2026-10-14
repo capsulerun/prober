@@ -32,6 +32,7 @@ pub(crate) struct ModuleIndex {
     files: HashSet<String>,
     directories: HashSet<String>,
     roots: Vec<String>,
+    root_names: HashSet<String>,
     top_level_packages: Vec<String>,
     native_modules: Vec<NativeModule>,
 }
@@ -102,10 +103,27 @@ impl ModuleIndex {
             }
         }
 
+        let root_names = files
+            .iter()
+            .flat_map(|file| {
+                roots.iter().filter_map(move |root| {
+                    let relative = if root.is_empty() {
+                        file.as_str()
+                    } else {
+                        file.strip_prefix(root.as_str())?.strip_prefix('/')?
+                    };
+                    let name = relative.split('/').next()?;
+
+                    Some(name.strip_suffix(".py").unwrap_or(name).to_owned())
+                })
+            })
+            .collect();
+
         Self {
             files,
             directories,
             roots: roots.into_iter().collect(),
+            root_names,
             top_level_packages: top_level_packages.into_iter().collect(),
             native_modules,
         }
@@ -226,6 +244,12 @@ impl ModuleIndex {
             return ImportTarget::Missing;
         }
 
+        let top_level = dotted.split('.').next().unwrap_or(dotted);
+
+        if !self.is_top_level(importer, top_level) {
+            return outside_target(top_level);
+        }
+
         let resolved: Vec<RepoPath> = self
             .roots_for(importer)
             .into_iter()
@@ -243,13 +267,7 @@ impl ModuleIndex {
             return ImportTarget::Repo(files);
         }
 
-        let top_level = dotted.split('.').next().unwrap_or(dotted);
-
-        if is_standard_library(top_level) {
-            ImportTarget::Standard
-        } else {
-            ImportTarget::External(top_level.to_owned())
-        }
+        outside_target(top_level)
     }
 
     pub fn resolve_module(&self, importer: &RepoPath, dotted: &str) -> Vec<ResolvedModule> {
@@ -328,6 +346,14 @@ impl ModuleIndex {
                 ]
             })
             .collect()
+    }
+
+    fn is_top_level(&self, importer: &RepoPath, name: &str) -> bool {
+        let in_basedir = join_directory(self.basedir(importer.as_str()), name);
+
+        self.root_names.contains(name)
+            || self.is_directory(&in_basedir)
+            || self.contains(&format!("{in_basedir}.py"))
     }
 
     fn resolve_in(&self, root: &str, dotted: &str) -> Option<ResolvedModule> {
@@ -464,6 +490,14 @@ fn deduplicated(mut paths: Vec<RepoPath>) -> Vec<RepoPath> {
     paths.retain(|path| seen.insert(path.clone()));
 
     paths
+}
+
+fn outside_target(top_level: &str) -> ImportTarget {
+    if is_standard_library(top_level) {
+        ImportTarget::Standard
+    } else {
+        ImportTarget::External(top_level.to_owned())
+    }
 }
 
 fn repo_path(path: &str) -> RepoPath {

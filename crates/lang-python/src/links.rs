@@ -8,6 +8,7 @@ use anyhow::Result;
 use globset::{GlobBuilder, GlobSetBuilder};
 use prober_core::files::RepoPath;
 use prober_core::graph::{EdgeKind, Inference, UnresolvedCause};
+use rayon::prelude::*;
 
 use crate::conventions::{is_module_file, join_directory, parent_directory, split_path};
 use crate::evaluator::{Evaluator, Hole, Part, Pattern, Value};
@@ -218,15 +219,19 @@ impl Linking<'_> {
             .filter(|link| link.kind == EdgeKind::Reads && is_data_file(&link.file))
             .map(|link| &link.file)
             .collect();
+
+        data_files
+            .into_par_iter()
+            .flat_map_iter(|data_file| self.modules_listed_by(data_file))
+            .collect()
+    }
+
+    fn modules_listed_by(&self, data_file: &RepoPath) -> Vec<Link> {
+        let path = self.repo_root.join(data_file.as_str());
+        let small = fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= MAX_DATA_FILE_SIZE);
         let mut listed = Vec::new();
 
-        for data_file in data_files {
-            let path = self.repo_root.join(data_file.as_str());
-            let small =
-                fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= MAX_DATA_FILE_SIZE);
-            let Some(text) = small.then(|| fs::read_to_string(&path).ok()).flatten() else {
-                continue;
-            };
+        if let Some(text) = small.then(|| fs::read_to_string(&path).ok()).flatten() {
             let mut seen = HashSet::new();
 
             for (offset, token) in dotted_tokens(&text) {
@@ -542,6 +547,10 @@ impl Resolution<'_> {
             return;
         }
 
+        let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) else {
+            return;
+        };
+
         if attribute_paths {
             let named = (1..=segments.len()).rev().find_map(|length| {
                 let resolved = self
@@ -577,23 +586,21 @@ impl Resolution<'_> {
             }
         }
 
-        if let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) {
-            for file in files
-                .into_iter()
-                .filter(|file| file != module && !self.tests.contains(file))
-            {
-                links.links.push(Link {
-                    reader: module.clone(),
-                    file,
-                    kind,
-                    inference: Inference {
-                        line,
-                        kind: MODULE_PATH,
-                        pattern: text.to_owned(),
-                        detail: None,
-                    },
-                });
-            }
+        for file in files
+            .into_iter()
+            .filter(|file| file != module && !self.tests.contains(file))
+        {
+            links.links.push(Link {
+                reader: module.clone(),
+                file,
+                kind,
+                inference: Inference {
+                    line,
+                    kind: MODULE_PATH,
+                    pattern: text.to_owned(),
+                    detail: None,
+                },
+            });
         }
     }
 

@@ -3,6 +3,7 @@
 use std::env;
 use std::fs;
 use std::io;
+use std::mem;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -261,6 +262,8 @@ impl Workspace {
         let report = report
             .with_revisions(resolved_revisions)
             .with_unhandled(unhandled, changes.len());
+
+        mem::forget(frontends);
 
         Ok(Selection {
             report,

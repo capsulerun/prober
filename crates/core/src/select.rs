@@ -1458,14 +1458,13 @@ mod tests {
         let worker_test = builder.add_test_file(repo_path("src/worker.test.ts"), "typescript");
         let worker = builder.add_file(repo_path("src/worker.ts"));
         let commented = builder.add_file(repo_path("src/commented.ts"));
+        let case_file = builder.add_file(repo_path("tests/cases/basic/index.ts"));
 
         builder.add_edge(Edge {
             dependent: worker_test,
             dependency: worker,
             kind: Import,
         });
-        let case_file = builder.add_file(repo_path("tests/cases/basic/index.ts"));
-
         builder.add_module_changes(commented, Vec::new());
         builder.mark_case_file(case_file);
         builder.add_unresolved_site(UnresolvedSite {
