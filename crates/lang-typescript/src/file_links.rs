@@ -1,4 +1,4 @@
-//! Links through files: literals naming repository files, file system calls and globs, paths listed in data and text files, and the changes that reach a reader without a file at head.
+//! Links through files: literals naming repository files, directories a test builds from its own directory, file system calls and globs, paths listed in data and text files, and the changes that reach a reader without a file at head.
 
 mod accesses;
 pub(crate) mod listed;
@@ -35,6 +35,8 @@ const FILE_PATH: &str = "file path";
 
 const LISTED_PATH: &str = "listed path";
 
+const DIRECTORY_PATH: &str = "directory path";
+
 pub(crate) struct FileLink {
     pub reader: RepoPath,
     pub file: RepoPath,
@@ -52,6 +54,7 @@ pub(crate) struct ReaderChange {
 pub(crate) struct FileLinks {
     pub links: Vec<FileLink>,
     pub reader_changes: Vec<ReaderChange>,
+    pub case_files: Vec<RepoPath>,
 }
 
 pub(crate) struct FileReading<'f> {
@@ -77,6 +80,12 @@ enum ReadTarget {
         candidates: Vec<String>,
     },
     Accessed(AccessTarget),
+    Directory {
+        inference_kind: &'static str,
+        text: String,
+        path: String,
+        cases: bool,
+    },
 }
 
 struct ChangedPaths<'c> {
@@ -131,6 +140,12 @@ impl<'r> Resolution<'r> {
                     Location::Path(path) => self.resolve_path(reading, target, path),
                     Location::Glob(glob) => globbed.push((reading_index, glob.clone())),
                 },
+                ReadTarget::Directory {
+                    inference_kind,
+                    text,
+                    path,
+                    cases,
+                } => self.resolve_directory(reading, inference_kind, text, path, *cases),
             }
         }
 
@@ -214,7 +229,13 @@ impl<'r> Resolution<'r> {
                 self.link(reading, file, &pattern, inference_kind);
             }
 
-            self.resolve_directory_changes(reading, target, path, &pattern);
+            self.resolve_directory_changes(
+                reading,
+                inference_kind,
+                target.recursive,
+                path,
+                &pattern,
+            );
         }
 
         if let Some(change) = changed_paths.removed.get(path) {
@@ -222,14 +243,35 @@ impl<'r> Resolution<'r> {
         }
     }
 
+    fn resolve_directory(
+        &mut self,
+        reading: &Reading,
+        inference_kind: &'static str,
+        text: &str,
+        path: &str,
+        cases: bool,
+    ) {
+        for file in self.directory_files(path, true) {
+            if !self.tests.contains(file) {
+                self.link(reading, file, text, inference_kind);
+
+                if cases {
+                    self.file_links.case_files.push(file.clone());
+                }
+            }
+        }
+
+        self.resolve_directory_changes(reading, inference_kind, true, path, text);
+    }
+
     fn resolve_directory_changes(
         &mut self,
         reading: &Reading,
-        target: &AccessTarget,
+        inference_kind: &'static str,
+        recursive: bool,
         directory: &str,
         pattern: &str,
     ) {
-        let inference_kind = access_inference_kind(target.kind);
         let changed_paths = self.changed_paths;
         let prefix = if directory.is_empty() {
             String::new()
@@ -240,13 +282,13 @@ impl<'r> Resolution<'r> {
             .removed
             .iter()
             .filter(|(path, _)| path.starts_with(&prefix))
-            .filter(|(path, _)| target.recursive || self.is_removed_entry(&prefix, path))
+            .filter(|(path, _)| recursive || self.is_removed_entry(&prefix, path))
             .chain(
                 changed_paths
                     .added
                     .iter()
                     .filter(|(path, _)| path.starts_with(&prefix))
-                    .filter(|(path, _)| !target.recursive && self.is_added_entry(&prefix, path)),
+                    .filter(|(path, _)| !recursive && self.is_added_entry(&prefix, path)),
             )
             .map(|(_, change)| *change)
             .collect();
@@ -367,6 +409,7 @@ impl FileReading<'_> {
         };
         let mut readings = self.named_readings(&is_known);
 
+        readings.extend(self.directory_readings(&repo_index));
         readings.extend(self.accessed_readings(access_summaries));
 
         let mut resolution = Resolution {
@@ -462,6 +505,50 @@ impl FileReading<'_> {
                     })
             })
             .collect()
+    }
+
+    fn directory_readings(&self, repo_index: &RepoIndex) -> Vec<Reading<'_>> {
+        let mut readings = Vec::new();
+
+        for linked_file in self
+            .linked_files
+            .iter()
+            .filter(|linked_file| linked_file.is_test)
+        {
+            let file_directory = parent_directory(&linked_file.path);
+
+            for directory_path in &linked_file.directory_paths {
+                let Some(path) = join_directory(file_directory, &directory_path.text) else {
+                    continue;
+                };
+                let target = if repo_index.file(&path).is_some() {
+                    ReadTarget::Named {
+                        inference_kind: FILE_PATH,
+                        text: directory_path.text.clone(),
+                        candidates: vec![path],
+                    }
+                } else if repo_index.is_directory(&path) && !contains(&path, &linked_file.path) {
+                    ReadTarget::Directory {
+                        inference_kind: DIRECTORY_PATH,
+                        text: directory_path.text.clone(),
+                        cases: file_directory.is_empty()
+                            || path.starts_with(&format!("{file_directory}/")),
+                        path,
+                    }
+                } else {
+                    continue;
+                };
+
+                readings.push(Reading {
+                    reader: &linked_file.path,
+                    line: directory_path.line,
+                    kind: EdgeKind::Reads,
+                    target,
+                });
+            }
+        }
+
+        readings
     }
 
     fn listed_readings<'r>(
@@ -576,6 +663,10 @@ impl FileReading<'_> {
     fn package_directory(&self, path: &RepoPath) -> &str {
         package_directory(self.package_directories, path)
     }
+}
+
+fn contains(directory: &str, path: &RepoPath) -> bool {
+    directory.is_empty() || path.as_str().starts_with(&format!("{directory}/"))
 }
 
 fn names_a_manifest(candidate: &str) -> bool {

@@ -957,11 +957,14 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             };
 
             match graph.inference(&edge) {
-                Some(inference) => format!(
+                Some(inference) if inference.line > 0 => format!(
                     "-> {verb} by {dependent}:{} ({})",
                     inference.line,
                     inference.description()
                 ),
+                Some(inference) => {
+                    format!("-> {verb} by {dependent} ({})", inference.description())
+                }
                 None => format!("-> {verb} by {dependent}"),
             }
         }

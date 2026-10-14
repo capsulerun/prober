@@ -392,6 +392,103 @@ fn tests_are_paired_with_the_files_and_fixtures_named_after_them() {
 }
 
 #[test]
+fn case_folders_reach_the_runners_named_after_them_or_naming_them() {
+    let project = TestProject::new(&[
+        (
+            "tests/Normal.test.mjs",
+            r#"
+import { describeByWalk } from "@acme/test-tools";
+
+describeByWalk(import.meta.filename, () => {});
+"#,
+        ),
+        (
+            "tests/Normal-dev.test.mjs",
+            r#"
+import { describeByWalk } from "@acme/test-tools";
+
+describeByWalk(import.meta.filename, () => {}, { mode: "development" });
+"#,
+        ),
+        (
+            "tests/normalCases/parsing/basic/index.js",
+            "import './data.json';",
+        ),
+        ("tests/normalCases/parsing/basic/data.json", "{}"),
+        ("tests/normalCases/parsing/basic/logo.png", ""),
+        (
+            "tests/RuntimeModeConfig.test.mjs",
+            r#"
+import path from "node:path";
+import { describeByWalk } from "@acme/test-tools";
+
+describeByWalk(import.meta.filename, () => {}, {
+    source: path.resolve(import.meta.dirname, "./configCases"),
+});
+"#,
+        ),
+        ("tests/configCases/asset/index.js", ""),
+        (
+            "test/render.test.ts",
+            r#"
+const pages = new URL("./pages/", import.meta.url);
+const root = require("node:path").join(__dirname, "..");
+"#,
+        ),
+        ("test/pages/home.html", "<html></html>"),
+        ("src/app.ts", ""),
+        (
+            "tests/loader.ts",
+            "export const load = () => import(process.env.PLUGIN!);",
+        ),
+        ("tests/loader.test.ts", r#"import { load } from "./loader";"#),
+    ]);
+
+    assert_eq!(
+        project.outcome_of(&[], &[modified("tests/normalCases/parsing/basic/logo.png")]),
+        selected(&[
+            (
+                "tests/Normal-dev.test.mjs",
+                &[
+                    "tests/normalCases/parsing/basic/logo.png (modified)",
+                    "-> read by tests/Normal-dev.test.mjs (inferred case folder named after the test tests/normalCases/)",
+                ],
+            ),
+            (
+                "tests/Normal.test.mjs",
+                &[
+                    "tests/normalCases/parsing/basic/logo.png (modified)",
+                    "-> read by tests/Normal.test.mjs (inferred case folder named after the test tests/normalCases/)",
+                ],
+            ),
+        ])
+    );
+    assert_eq!(
+        project.outcome_of(&[], &[modified("tests/configCases/asset/index.js")]),
+        selected(&[(
+            "tests/RuntimeModeConfig.test.mjs",
+            &[
+                "tests/configCases/asset/index.js (modified)",
+                "-> read by tests/RuntimeModeConfig.test.mjs:6 (inferred directory path ./configCases)",
+            ],
+        )])
+    );
+    assert_eq!(
+        project
+            .outcome_of(&[], &[modified("test/pages/home.html")])
+            .selected_paths(),
+        ["test/render.test.ts"]
+    );
+    assert_eq!(dependents(&project.link(), "src/app.ts"), []);
+    assert_eq!(
+        project
+            .outcome_of(&[], &[modified("src/app.ts")])
+            .selected_paths(),
+        ["tests/loader.test.ts"]
+    );
+}
+
+#[test]
 fn stylesheets_keep_their_assets_narrowed_to_tests_that_render_them() {
     let project = TestProject::new(&[
         (

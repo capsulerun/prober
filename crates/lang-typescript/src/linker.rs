@@ -11,7 +11,7 @@ use prober_core::changes::{BaseRevision, ChangeKind, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::RepoPath;
 use prober_core::frontend::{ChangeSet, Frontend};
-use prober_core::graph::{Edge, EdgeKind, GraphBuilder, RootScope, UnresolvedSite};
+use prober_core::graph::{Edge, EdgeKind, GraphBuilder, Inference, RootScope, UnresolvedSite};
 use prober_core::report::ModeReason;
 use prober_core::symbols::FallbackCause;
 use rayon::prelude::*;
@@ -27,7 +27,7 @@ use crate::dynamic::spawn::Programs;
 use crate::dynamic::summarizer::{SummaryScope, summarize_program};
 use crate::dynamic::summary::ModuleSummary;
 use crate::dynamic::{DynamicInference, DynamicLoading};
-use crate::families::naming_families;
+use crate::families::{case_folders, naming_families};
 use crate::file_links::listed::document_strings;
 use crate::file_links::{FileLinks, FileReading};
 use crate::file_system::RepoFileSystem;
@@ -47,6 +47,8 @@ use crate::workspaces::{
 pub(crate) const PACKAGE_NODE_PREFIX: &str = "node_modules/";
 
 pub(crate) const RAW_IMPORT_QUERY: &str = "?raw";
+
+const CASE_FOLDER: &str = "case folder named after the test";
 
 pub struct TypeScriptLinker {
     repo_root: PathBuf,
@@ -91,6 +93,7 @@ pub(crate) struct LinkedFile {
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
     pub path_literals: Vec<PathLiteral>,
+    pub directory_paths: Vec<PathLiteral>,
     pub symbols: Option<SymbolAnalysis>,
 }
 
@@ -685,6 +688,7 @@ impl TypeScriptLinker {
             mocks: parsed_imports.mocks,
             glob_imports: parsed_imports.glob_imports,
             path_literals: parsed_imports.path_literals,
+            directory_paths: parsed_imports.directory_paths,
             symbols,
         })
     }
@@ -956,6 +960,30 @@ fn add_naming_families(
             kind: EdgeKind::Family,
         });
     }
+
+    for case_folder in case_folders(repo_files, tests) {
+        let test = graph.add_file(case_folder.test.clone());
+        let inference = Inference {
+            line: 0,
+            kind: CASE_FOLDER,
+            pattern: format!("{}/", case_folder.folder),
+            detail: None,
+        };
+
+        for file in case_folder.files {
+            let file = graph.add_file(file.clone());
+
+            graph.mark_case_file(file);
+            graph.add_inferred_edge(
+                Edge {
+                    dependent: test,
+                    dependency: file,
+                    kind: EdgeKind::Reads,
+                },
+                inference.clone(),
+            );
+        }
+    }
 }
 
 fn add_file_links(file_links: FileLinks, graph: &mut GraphBuilder) {
@@ -977,6 +1005,12 @@ fn add_file_links(file_links: FileLinks, graph: &mut GraphBuilder) {
             reader_change.reader,
             reader_change.description,
         );
+    }
+
+    for case_file in file_links.case_files {
+        let case_file = graph.add_file(case_file);
+
+        graph.mark_case_file(case_file);
     }
 }
 

@@ -148,6 +148,12 @@ impl<'g> Traversal<'g> {
         !self.is_relaxed(Relaxation::FileLevel) && !self.graph.symbols_of(file).is_empty()
     }
 
+    fn may_widen(self, path: &RepoPath) -> bool {
+        self.graph.file_id(path).is_none_or(|file| {
+            !self.graph.is_case_file(file) && !matches!(self.module_changes(file), Some([]))
+        })
+    }
+
     fn module_changes(self, file: FileId) -> Option<&'g [usize]> {
         if self.is_relaxed(Relaxation::FileLevel) {
             return None;
@@ -623,9 +629,9 @@ fn discover_dependents<'a>(
 
     for (site_link, unresolved_site) in widening_sites {
         let loadable_change = changes_by_path.iter().find(|change| {
-            change
-                .touched_paths()
-                .any(|path| traversal.site_can_load(unresolved_site, path))
+            change.touched_paths().any(|path| {
+                traversal.may_widen(path) && traversal.site_can_load(unresolved_site, path)
+            })
         });
         let Some(&change) = loadable_change else {
             continue;
@@ -1440,6 +1446,46 @@ mod tests {
                 "src/pool.ts",
                 "src/pool.test.ts"
             ]
+        );
+    }
+
+    #[test]
+    fn changes_that_alter_no_code_and_case_files_never_widen() {
+        let mut builder = GraphBuilder::default();
+
+        builder.add_language("typescript", |path| path.as_str().ends_with(".ts"));
+
+        let worker_test = builder.add_test_file(repo_path("src/worker.test.ts"), "typescript");
+        let worker = builder.add_file(repo_path("src/worker.ts"));
+        let commented = builder.add_file(repo_path("src/commented.ts"));
+
+        builder.add_edge(Edge {
+            dependent: worker_test,
+            dependency: worker,
+            kind: Import,
+        });
+        let case_file = builder.add_file(repo_path("tests/cases/basic/index.ts"));
+
+        builder.add_module_changes(commented, Vec::new());
+        builder.mark_case_file(case_file);
+        builder.add_unresolved_site(UnresolvedSite {
+            file: worker,
+            line: 3,
+            expression: "request.moduleUrl".to_owned(),
+            cause: UnresolvedCause::Parameter,
+            language: "typescript",
+        });
+
+        let graph = builder.build();
+
+        assert_eq!(widening_sites(&graph, &[modified("src/commented.ts")]), []);
+        assert_eq!(
+            widening_sites(&graph, &[modified("tests/cases/basic/index.ts")]),
+            []
+        );
+        assert_eq!(
+            widening_sites(&graph, &[modified("src/edited.ts")]),
+            [("src/worker.test.ts".to_owned(), Some(0))]
         );
     }
 

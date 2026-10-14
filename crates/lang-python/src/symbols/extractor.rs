@@ -92,6 +92,8 @@ const NAMESPACE_CALLS: [&str; 3] = ["globals", "locals", "vars"];
 
 const LAZY_ATTRIBUTE_FUNCTIONS: [&str; 2] = ["__getattr__", "__dir__"];
 
+const MODULE_GETATTR: &str = "__getattr__";
+
 const RECEIVERS: [&str; 2] = ["self", "cls"];
 
 const CLASS_BODY: &str = "<body>";
@@ -135,6 +137,10 @@ pub(crate) fn extract_symbols(
 
     for statement in &module.body {
         extractor.top_level(statement);
+    }
+
+    for (name, imported) in extractor.lazy_bindings(&module.body) {
+        extractor.bind(name, Binding::Import(imported));
     }
 
     if let Some(cause) = extractor.fallback {
@@ -597,6 +603,99 @@ impl Extractor<'_> {
         index
             .resolve_in_directory(&directory, dotted)
             .map_or(Target::Missing, |resolved| Target::Repo(resolved.module))
+    }
+
+    fn lazy_bindings(&self, body: &[Stmt]) -> Vec<(String, Imported)> {
+        let Some(getattr) = body.iter().find_map(|statement| match statement {
+            Stmt::FunctionDef(definition) if definition.name.as_str() == MODULE_GETATTR => {
+                Some(definition)
+            }
+            _ => None,
+        }) else {
+            return Vec::new();
+        };
+        let mut read = LoadedNames::default();
+
+        read.visit_body(&getattr.body);
+
+        let mut bindings = Vec::new();
+
+        for statement in body {
+            let (target, value) = match statement {
+                Stmt::Assign(assign) if assign.targets.len() == 1 => {
+                    (&assign.targets[0], assign.value.as_ref())
+                }
+                Stmt::AnnAssign(assign) if let Some(value) = &assign.value => {
+                    (assign.target.as_ref(), value.as_ref())
+                }
+                _ => continue,
+            };
+
+            if let (Expr::Name(table), Expr::Dict(entries)) = (target, value)
+                && read.names.contains(table.id.as_str())
+            {
+                for entry in &entries.items {
+                    if let Some(key) = &entry.key {
+                        bindings.extend(self.lazy_entry(key, &entry.value));
+                    }
+                }
+            }
+        }
+
+        bindings.retain(|(name, _)| !self.names.contains_key(name));
+        bindings
+    }
+
+    fn lazy_entry(&self, key: &Expr, value: &Expr) -> Vec<(String, Imported)> {
+        let Some(key) = string_literal(key) else {
+            return Vec::new();
+        };
+        let values: Vec<&str> = match value {
+            Expr::Tuple(ast::ExprTuple { elts, .. }) | Expr::List(ast::ExprList { elts, .. }) => {
+                elts.iter().filter_map(string_literal).collect()
+            }
+            value => string_literal(value).into_iter().collect(),
+        };
+        let named_module = values
+            .iter()
+            .find_map(|value| self.named_module(value))
+            .map(|module| vec![(key.to_owned(), module)]);
+        let names_of_module = || {
+            let module = self.named_module(key)?;
+
+            Some(
+                values
+                    .iter()
+                    .filter(|name| is_identifier(name))
+                    .map(|name| ((*name).to_owned(), module.clone()))
+                    .collect(),
+            )
+        };
+
+        named_module
+            .or_else(names_of_module)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, module)| {
+                let imported = Imported::Name {
+                    module,
+                    name: name.clone(),
+                };
+
+                (name, imported)
+            })
+            .collect()
+    }
+
+    fn named_module(&self, text: &str) -> Option<Target> {
+        let dotted = text.trim_start_matches('.');
+        let level = (text.len() - dotted.len()) as u32;
+
+        if !dotted.split('.').all(is_identifier) || level == 0 && !dotted.contains('.') {
+            return None;
+        }
+
+        Some(self.target(level, dotted)).filter(|target| *target != Target::Missing)
     }
 
     fn import_bindings(&self, import: &ast::StmtImport) -> Vec<(String, Imported)> {
@@ -1080,6 +1179,37 @@ impl<'a> Visitor<'a> for StoreFinder {
 
         visitor::walk_expr(self, expression);
     }
+}
+
+#[derive(Default)]
+struct LoadedNames {
+    names: BTreeSet<String>,
+}
+
+impl<'a> Visitor<'a> for LoadedNames {
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        if let Expr::Name(name) = expression {
+            self.names.insert(name.id.as_str().to_owned());
+        }
+
+        visitor::walk_expr(self, expression);
+    }
+}
+
+fn string_literal(expression: &Expr) -> Option<&str> {
+    match expression {
+        Expr::StringLiteral(literal) => Some(literal.value.to_str()),
+        _ => None,
+    }
+}
+
+fn is_identifier(text: &str) -> bool {
+    let mut characters = text.chars();
+
+    characters
+        .next()
+        .is_some_and(|first| first.is_alphabetic() || first == '_')
+        && characters.all(|character| character.is_alphanumeric() || character == '_')
 }
 
 fn target_names(targets: &[Expr]) -> Option<Vec<String>> {

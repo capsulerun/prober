@@ -245,6 +245,7 @@ pub struct GraphBuilder {
     mocked_modules: HashMap<FileId, Vec<FileId>>,
     changed_contracts: HashSet<FileId>,
     asset_blind_tests: HashSet<FileId>,
+    case_files: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
     test_support_names: HashMap<&'static str, ModuleFilter>,
     ignored_edges: Vec<IgnoredEdge>,
@@ -327,6 +328,10 @@ impl GraphBuilder {
 
     pub fn mark_asset_blind(&mut self, test: FileId) {
         self.asset_blind_tests.insert(test);
+    }
+
+    pub fn mark_case_file(&mut self, file: FileId) {
+        self.case_files.insert(file);
     }
 
     pub fn add_language(&mut self, language: &'static str, loads: ModuleFilter) {
@@ -563,6 +568,7 @@ impl GraphBuilder {
             mocked_modules: self.mocked_modules,
             changed_contracts: self.changed_contracts,
             asset_blind_tests: self.asset_blind_tests,
+            case_files: self.case_files,
             module_filters: self.module_filters,
             ignored_dependents,
             set_aside_sites: self.set_aside_sites,
@@ -602,6 +608,7 @@ pub struct Graph {
     mocked_modules: HashMap<FileId, Vec<FileId>>,
     changed_contracts: HashSet<FileId>,
     asset_blind_tests: HashSet<FileId>,
+    case_files: HashSet<FileId>,
     module_filters: HashMap<&'static str, ModuleFilter>,
     ignored_dependents: HashMap<FileId, Vec<IgnoredEdge>>,
     set_aside_sites: Vec<SetAsideSite>,
@@ -826,6 +833,10 @@ impl Graph {
 
     pub fn is_asset_blind(&self, test: FileId) -> bool {
         self.asset_blind_tests.contains(&test)
+    }
+
+    pub fn is_case_file(&self, file: FileId) -> bool {
+        self.case_files.contains(&file)
     }
 
     pub fn is_asset(&self, file: FileId) -> bool {

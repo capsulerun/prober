@@ -1,4 +1,4 @@
-//! Naming families: tests paired with the files they are named after, beside them or in a mirrored test tree, and with the fixtures named after them.
+//! Naming families: tests paired with the files they are named after, beside them or in a mirrored test tree, and with the fixtures named after them; and the case folders beside a test named after it, which the test reads.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -10,6 +10,8 @@ use crate::workspaces::parent_directory;
 const TEST_DIRECTORIES: [&str; 3] = ["__tests__", "test", "tests"];
 
 const TEST_MARKERS: [&str; 2] = ["test", "spec"];
+
+const CASE_FOLDER_SUFFIXES: [&str; 2] = ["cases", "fixtures"];
 
 pub(crate) fn naming_families<'f>(
     repo_files: &'f [RepoPath],
@@ -76,6 +78,87 @@ pub(crate) fn naming_families<'f>(
     pairs.dedup();
 
     pairs
+}
+
+pub(crate) struct CaseFolder<'f> {
+    pub test: &'f RepoPath,
+    pub folder: &'f str,
+    pub files: Vec<&'f RepoPath>,
+}
+
+pub(crate) fn case_folders<'f>(
+    repo_files: &'f [RepoPath],
+    tests: &'f BTreeSet<RepoPath>,
+) -> Vec<CaseFolder<'f>> {
+    let mut folders_by_parent: HashMap<&str, BTreeSet<&str>> = HashMap::new();
+
+    for file in repo_files {
+        let mut path = file.as_str();
+
+        while let Some((folder, _)) = path.rsplit_once('/') {
+            let (parent, _) = split_path(folder);
+
+            if !folders_by_parent.entry(parent).or_default().insert(folder) {
+                break;
+            }
+
+            path = folder;
+        }
+    }
+
+    let mut sorted_files: Vec<&RepoPath> = repo_files.iter().collect();
+    let mut case_folders = Vec::new();
+
+    sorted_files.sort();
+
+    for test in tests {
+        let stems: Vec<String> = family_stems(test.as_str())
+            .into_iter()
+            .map(folded_name)
+            .collect();
+
+        for &folder in folders_by_parent
+            .get(parent_directory(test))
+            .into_iter()
+            .flatten()
+        {
+            let (_, folder_name) = split_path(folder);
+            let folder_name = folded_name(folder_name);
+            let named_after_test = CASE_FOLDER_SUFFIXES.iter().any(|suffix| {
+                folder_name
+                    .strip_suffix(suffix)
+                    .is_some_and(|stem| !stem.is_empty() && stems.iter().any(|other| other == stem))
+            });
+
+            if !named_after_test {
+                continue;
+            }
+
+            let prefix = format!("{folder}/");
+            let start = sorted_files.partition_point(|file| file.as_str() < prefix.as_str());
+            let files = sorted_files[start..]
+                .iter()
+                .take_while(|file| file.as_str().starts_with(&prefix))
+                .filter(|file| !tests.contains(**file))
+                .copied()
+                .collect();
+
+            case_folders.push(CaseFolder {
+                test,
+                folder,
+                files,
+            });
+        }
+    }
+
+    case_folders
+}
+
+fn folded_name(name: &str) -> String {
+    name.chars()
+        .filter(|character| !matches!(character, '-' | '_'))
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 fn family_stems(test: &str) -> Vec<&str> {

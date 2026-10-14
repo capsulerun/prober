@@ -829,7 +829,7 @@ fn dotted_glob(pattern: &Pattern) -> Option<(String, bool)> {
         return None;
     };
 
-    if !first.contains('.') {
+    if first.is_empty() {
         return None;
     }
 
