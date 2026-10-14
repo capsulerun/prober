@@ -1,8 +1,9 @@
 //! Module trees from each crate target and the files a path reaches through them: child modules, use bindings, globs, extern crates and re-exports, with macros, proc-macro crates and build scripts reaching whole crates.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
+use globset::GlobBuilder;
 use prober_core::files::RepoPath;
 use prober_core::graph::{EdgeKind, Inference};
 
@@ -19,6 +20,10 @@ const INCLUDED_FILE: &str = "included file";
 const MANIFEST_DIRECTORY_PATH: &str = "manifest directory path";
 
 const FILE_PATH: &str = "file path";
+
+pub(crate) const FILE_GLOB: &str = "file glob";
+
+const GLOB_CHARACTER: char = '*';
 
 type ModuleId = usize;
 
@@ -68,12 +73,15 @@ pub(crate) struct ModuleGraph<'g> {
     macros: HashMap<String, Vec<(RepoPath, bool)>>,
     crate_files: Vec<BTreeSet<RepoPath>>,
     lib_files: Vec<BTreeSet<RepoPath>>,
-    reexport_cache: RefCell<HashMap<(ModuleId, String), BTreeSet<Dependency>>>,
-    reexport_lookups: RefCell<HashSet<(ModuleId, String)>>,
+    reexport_cache: RefCell<HashMap<ItemKey, Option<BTreeSet<Dependency>>>>,
+    reexport_lookups: RefCell<HashMap<ItemKey, usize>>,
+    lowest_cycle: Cell<usize>,
     glob_cache: RefCell<HashMap<ModuleId, Vec<GlobResolution>>>,
 }
 
 type GlobResolution = (Option<ModuleId>, BTreeSet<Dependency>);
+
+type ItemKey = (ModuleId, String);
 
 enum Lookup {
     Found(BTreeSet<Dependency>),
@@ -99,7 +107,8 @@ impl<'g> ModuleGraph<'g> {
             crate_files: vec![BTreeSet::new(); workspace.crates.len()],
             lib_files: vec![BTreeSet::new(); workspace.crates.len()],
             reexport_cache: RefCell::new(HashMap::new()),
-            reexport_lookups: RefCell::new(HashSet::new()),
+            reexport_lookups: RefCell::new(HashMap::new()),
+            lowest_cycle: Cell::new(usize::MAX),
             glob_cache: RefCell::new(HashMap::new()),
         };
 
@@ -314,7 +323,7 @@ impl<'g> ModuleGraph<'g> {
                     links.extend(self.impl_links(file, facts, implementation, scope_module));
                 }
 
-                links.extend(self.include_links(file, facts, krate));
+                links.extend(self.include_links(file, facts, module));
             }
 
             for (dependency, kind) in dependencies {
@@ -630,10 +639,8 @@ impl<'g> ModuleGraph<'g> {
                     return resolution;
                 }
 
-                for glob in self.glob_uses(from) {
-                    let used = self.resolve(&glob.path, from, depth + 1);
-
-                    if let Some(module) = used.module
+                for (module, _) in self.glob_resolutions(from) {
+                    if let Some(module) = module
                         && let Some(&child) = self.modules[module].children.get(name)
                     {
                         self.walk(child, rest, &mut resolution);
@@ -742,25 +749,61 @@ impl<'g> ModuleGraph<'g> {
         let key = (module, item.to_owned());
 
         if let Some(cached) = self.reexport_cache.borrow().get(&key) {
-            return Lookup::Found(cached.clone());
+            return match cached {
+                Some(dependencies) => Lookup::Found(dependencies.clone()),
+                None => Lookup::NotFound,
+            };
         }
 
-        if !self.reexport_lookups.borrow_mut().insert(key.clone()) {
+        if let Some(&depth) = self.reexport_lookups.borrow().get(&key) {
+            self.lowest_cycle.set(self.lowest_cycle.get().min(depth));
+
             return Lookup::InProgress;
         }
 
+        let depth = self.reexport_lookups.borrow().len();
+
+        self.reexport_lookups
+            .borrow_mut()
+            .insert(key.clone(), depth);
+
+        let outer_cycle = self.lowest_cycle.replace(usize::MAX);
         let mut dependencies = BTreeSet::new();
         let mut found = false;
+        let mut visited = HashSet::from([module]);
+        let mut pending = vec![module];
 
-        for entry in self.scope_uses(module) {
-            if entry.binding.as_deref() == Some(item) {
-                dependencies.extend(self.resolve(&entry.path, module, 1).dependencies);
-                found = true;
+        while let Some(current) = pending.pop() {
+            if current != module
+                && let Some(cached) = self
+                    .reexport_cache
+                    .borrow()
+                    .get(&(current, item.to_owned()))
+            {
+                if let Some(reexported) = cached {
+                    dependencies.extend(reexported.iter().cloned());
+                    found = true;
+                }
+
+                continue;
             }
-        }
 
-        if !found {
-            for (glob_module, _) in self.glob_resolutions(module) {
+            let bound: Vec<&UseEntry> = self
+                .scope_uses(current)
+                .filter(|entry| entry.binding.as_deref() == Some(item))
+                .collect();
+
+            if !bound.is_empty() {
+                for entry in bound {
+                    dependencies.extend(self.resolve(&entry.path, current, 1).dependencies);
+                }
+
+                found = true;
+
+                continue;
+            }
+
+            for (glob_module, _) in self.glob_resolutions(current) {
                 let Some(glob_module) = glob_module else {
                     continue;
                 };
@@ -768,24 +811,33 @@ impl<'g> ModuleGraph<'g> {
                 if self.defines(glob_module, item) {
                     dependencies.insert(Dependency::File(self.modules[glob_module].file.clone()));
                     found = true;
-                } else if let Lookup::Found(reexported) = self.reexported(glob_module, item) {
-                    dependencies.extend(reexported);
-                    found = true;
+                } else if visited.insert(glob_module) {
+                    pending.push(glob_module);
                 }
             }
         }
 
         self.reexport_lookups.borrow_mut().remove(&key);
 
-        if !found {
-            return Lookup::NotFound;
+        let lowest_cycle = self.lowest_cycle.get();
+        let complete = lowest_cycle >= depth;
+
+        self.lowest_cycle.set(if complete {
+            outer_cycle
+        } else {
+            outer_cycle.min(lowest_cycle)
+        });
+
+        let result = found.then_some(dependencies);
+
+        if complete {
+            self.reexport_cache.borrow_mut().insert(key, result.clone());
         }
 
-        self.reexport_cache
-            .borrow_mut()
-            .insert(key, dependencies.clone());
-
-        Lookup::Found(dependencies)
+        match result {
+            Some(dependencies) => Lookup::Found(dependencies),
+            None => Lookup::NotFound,
+        }
     }
 
     fn glob_resolutions(&self, module: ModuleId) -> Vec<GlobResolution> {
@@ -832,10 +884,6 @@ impl<'g> ModuleGraph<'g> {
         (!bound.is_empty()).then_some(bound)
     }
 
-    fn glob_uses(&self, module: ModuleId) -> impl Iterator<Item = &UseEntry> {
-        self.scope_uses(module).filter(|entry| entry.glob)
-    }
-
     fn extern_crate(&self, name: &str, from: ModuleId) -> Option<Dependency> {
         if BUILTIN_CRATES.contains(&name) {
             return None;
@@ -866,11 +914,78 @@ impl<'g> ModuleGraph<'g> {
         })
     }
 
-    fn include_links(&self, file: &RepoPath, facts: &SourceFacts, krate: usize) -> Vec<Link> {
-        let crate_info = &self.workspace.crates[krate];
+    fn glob_links(
+        &self,
+        file: &RepoPath,
+        crate_info: &Crate,
+        line: u32,
+        pattern: &str,
+    ) -> Vec<Link> {
+        let mut folders = BTreeSet::new();
+
+        for base in [
+            crate_info.directory.as_str(),
+            parent_directory(file.as_str()),
+        ] {
+            let Some(joined) = normalized_join(base, pattern) else {
+                continue;
+            };
+            let Ok(glob) = GlobBuilder::new(&joined).literal_separator(true).build() else {
+                continue;
+            };
+            let matcher = glob.compile_matcher();
+            let literal_directory: Vec<&str> = joined
+                .split('/')
+                .take_while(|segment| !segment.contains(GLOB_CHARACTER))
+                .collect();
+            let prefix = match literal_directory.as_slice() {
+                [] => String::new(),
+                segments => format!("{}/", segments.join("/")),
+            };
+
+            for path in self
+                .repo_files
+                .iter()
+                .filter(|path| path.starts_with(&prefix) && matcher.is_match(path))
+            {
+                let folder = parent_directory(path);
+
+                if !folder.is_empty() && !file.as_str().starts_with(&format!("{folder}/")) {
+                    folders.insert(folder.to_owned());
+                }
+            }
+        }
+
+        folders
+            .into_iter()
+            .map(|folder| Link {
+                dependent: file.clone(),
+                dependency: Dependency::Path(folder),
+                kind: EdgeKind::Reads,
+                inference: Some(Inference {
+                    line,
+                    kind: FILE_GLOB,
+                    pattern: pattern.to_owned(),
+                    detail: None,
+                }),
+            })
+            .collect()
+    }
+
+    fn include_links(&self, file: &RepoPath, facts: &SourceFacts, module: ModuleId) -> Vec<Link> {
+        let tree = &self.trees[self.modules[module].tree];
+        let crate_info = &self.workspace.crates[tree.krate];
         let mut links = Vec::new();
 
         for (line, text) in &facts.strings {
+            if text.contains(GLOB_CHARACTER) {
+                if tree.kind == TargetKind::Test {
+                    links.extend(self.glob_links(file, crate_info, *line, text));
+                }
+
+                continue;
+            }
+
             for base in [
                 crate_info.directory.as_str(),
                 parent_directory(file.as_str()),

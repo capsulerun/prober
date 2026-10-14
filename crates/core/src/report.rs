@@ -853,14 +853,27 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
     match hop.link {
         Link::Edge {
             kind: EdgeKind::Import,
-            ..
-        } => match graph.fallback_of(hop.dependent) {
-            Some(cause) => format!(
-                "-> imported by {dependent} (analysed at file level: {})",
-                cause.description()
-            ),
-            None => format!("-> imported by {dependent}"),
-        },
+            dependency,
+        } => {
+            let edge = Edge {
+                dependent: hop.dependent,
+                dependency,
+                kind: EdgeKind::Import,
+            };
+            let inferred = graph
+                .inference(&edge)
+                .map_or_else(String::new, |inference| {
+                    format!(":{} ({})", inference.line, inference.description())
+                });
+
+            match graph.fallback_of(hop.dependent) {
+                Some(cause) => format!(
+                    "-> imported by {dependent}{inferred} (analysed at file level: {})",
+                    cause.description()
+                ),
+                None => format!("-> imported by {dependent}{inferred}"),
+            }
+        }
         Link::Edge {
             kind: EdgeKind::TypeOnly,
             ..
@@ -957,11 +970,14 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             };
 
             match graph.inference(&edge) {
-                Some(inference) => format!(
+                Some(inference) if inference.line > 0 => format!(
                     "-> {verb} by {dependent}:{} ({})",
                     inference.line,
                     inference.description()
                 ),
+                Some(inference) => {
+                    format!("-> {verb} by {dependent} ({})", inference.description())
+                }
                 None => format!("-> {verb} by {dependent}"),
             }
         }

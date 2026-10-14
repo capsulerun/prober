@@ -113,6 +113,43 @@ fn glob_imports_and_exported_macros_reach_the_users_of_their_module_or_definitio
 }
 
 #[test]
+fn modules_re_exporting_each_other_through_globs_are_resolved_once_per_name() {
+    let count = 12;
+    let mut lib =
+        String::from("pub mod cache;\npub mod disk;\nmod records;\n\npub use records::Record;\n");
+    let project = workspace(&[]);
+
+    for module in 0..count {
+        let globs: String = (0..count)
+            .filter(|other| *other != module)
+            .map(|other| format!("pub use crate::m{other}::*;\n"))
+            .collect();
+
+        lib.push_str(&format!("pub mod m{module};\n"));
+        project.write(
+            &format!("crates/store/src/m{module}.rs"),
+            &format!("{globs}\npub fn f{module}() {{}}\n"),
+        );
+    }
+
+    let unknown_globs: String = (0..6).map(|n| format!("use unknown_{n}::*;\n")).collect();
+
+    project.write("crates/store/src/lib.rs", &lib);
+    project.write(
+        "crates/api/src/handlers.rs",
+        &format!(
+            "{unknown_globs}\npub fn handle() {{\n    store::m0::f11();\n    Missing::call();\n}}\n"
+        ),
+    );
+
+    assert_eq!(
+        project.selected_by("crates/store/src/m11.rs"),
+        ["store", "api"]
+    );
+    assert_eq!(project.selected_by("crates/store/src/cache.rs"), ["store"]);
+}
+
+#[test]
 fn proc_macro_and_build_script_crates_reach_every_user() {
     let project = workspace(&[
         (
@@ -194,6 +231,48 @@ fn included_files_and_integration_tests_belong_to_their_crate() {
     assert_eq!(
         project.selected_by("crates/web/tests/data/routes.json"),
         ["web"]
+    );
+}
+
+#[test]
+fn fixture_folders_matched_by_a_glob_in_an_integration_test_reach_its_crate() {
+    let project = workspace(&[
+        (
+            "crates/web/tests/fixtures.rs",
+            "#[fixture(\"./tests/cases/**/_config.json\")]\nfn case(path: std::path::PathBuf) { web::run(path.parent().unwrap()); }\n",
+        ),
+        ("crates/web/tests/cases/minify/_config.json", "{}\n"),
+        ("crates/web/tests/cases/minify/main.js", "export {};\n"),
+        ("crates/web/tests/cases/minify/dist/out.js", "\n"),
+        (
+            "crates/api/src/glob.rs",
+            "pub const PATTERN: &str = \"tests/**/*.json\";\n",
+        ),
+        ("crates/api/tests/cases/data.json", "{}\n"),
+    ]);
+
+    project.write("crates/api/src/lib.rs", "mod handlers;\nmod glob;\n");
+
+    assert_eq!(
+        project.outcome_of(&[], &[modified("crates/web/tests/cases/minify/main.js")]),
+        selected(&[(
+            "web",
+            &[
+                "crates/web/tests/cases/minify/main.js (modified)",
+                "-> read by crates/web/tests/fixtures.rs:1 (inferred file glob ./tests/cases/**/_config.json)",
+                "-> built into crates/web/Cargo.toml",
+            ],
+        )])
+    );
+    assert_eq!(
+        project.selected_by("crates/web/tests/cases/minify/dist/out.js"),
+        ["web"]
+    );
+    assert!(
+        project
+            .outcome_of(&[], &[modified("crates/api/tests/cases/data.json")])
+            .selected_paths()
+            .is_empty()
     );
 }
 

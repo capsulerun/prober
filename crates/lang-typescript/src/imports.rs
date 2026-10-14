@@ -69,6 +69,16 @@ const SPAWN_MODULES: [&str; 5] = [
 
 const MAX_PATH_LITERAL_LENGTH: usize = 255;
 
+const PATH_JOINING_FUNCTIONS: [&str; 2] = ["join", "resolve"];
+
+const DIRECTORY_VARIABLE: &str = "__dirname";
+
+const DIRECTORY_PROPERTY: &str = "dirname";
+
+const URL_CONSTRUCTOR: &str = "URL";
+
+const URL_PROPERTY: &str = "url";
+
 const MAX_EXTENSION_LENGTH: usize = 10;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -105,6 +115,7 @@ pub struct ParsedImports {
     pub mocks: Vec<MockRequest>,
     pub glob_imports: Vec<GlobImport>,
     pub path_literals: Vec<PathLiteral>,
+    pub directory_paths: Vec<PathLiteral>,
 }
 
 pub(crate) fn collect_imports(program: &Program, source_text: &str) -> ParsedImports {
@@ -203,6 +214,14 @@ impl ImportCollector<'_> {
             line,
             text: text.to_owned(),
         });
+    }
+
+    fn record_directory_path(&mut self, text: String, offset: u32) {
+        let line = self.line_of(offset);
+
+        self.parsed_imports
+            .directory_paths
+            .push(PathLiteral { line, text });
     }
 
     fn line_of(&self, offset: u32) -> u32 {
@@ -344,6 +363,10 @@ impl<'a> Visit<'a> for ImportCollector<'_> {
             self.record_glob_import(call);
         }
 
+        if let Some(text) = joined_to_own_directory(call) {
+            self.record_directory_path(text, call.span.start);
+        }
+
         walk::walk_call_expression(self, call);
     }
 
@@ -369,6 +392,10 @@ impl<'a> Visit<'a> for ImportCollector<'_> {
             && WORKER_CONSTRUCTORS.contains(&constructor.name.as_str())
         {
             self.parsed_imports.has_dynamic_sites = true;
+        }
+
+        if let Some(text) = url_from_own_module(new_expression) {
+            self.record_directory_path(text.to_owned(), new_expression.span.start);
         }
 
         walk::walk_new_expression(self, new_expression);
@@ -429,6 +456,60 @@ fn is_glob_import(callee: &Expression) -> bool {
 
     matches!(&method.object, Expression::ImportMeta(_))
         && GLOB_IMPORT_METHODS.contains(&method.property.name.as_str())
+}
+
+fn joined_to_own_directory(call: &CallExpression) -> Option<String> {
+    let function_name = match call.callee.get_inner_expression() {
+        Expression::StaticMemberExpression(member) => member.property.name.as_str(),
+        Expression::Identifier(reference) => reference.name.as_str(),
+        _ => return None,
+    };
+
+    if !PATH_JOINING_FUNCTIONS.contains(&function_name) {
+        return None;
+    }
+
+    let mut arguments = call.arguments.iter().map(Argument::as_expression);
+
+    if !arguments.next()?.is_some_and(names_own_directory) {
+        return None;
+    }
+
+    let segments: Vec<&str> = arguments
+        .map_while(|argument| argument.and_then(literal_text))
+        .collect();
+
+    (!segments.is_empty() && !segments.iter().any(|segment| segment.starts_with('/')))
+        .then(|| segments.join("/"))
+}
+
+fn url_from_own_module<'e>(new_expression: &'e NewExpression) -> Option<&'e str> {
+    let Expression::Identifier(constructor) = new_expression.callee.get_inner_expression() else {
+        return None;
+    };
+    let [path, base] = new_expression.arguments.as_slice() else {
+        return None;
+    };
+    let names_own_module = base.as_expression().is_some_and(|base| {
+        matches!(base.get_inner_expression(), Expression::StaticMemberExpression(member)
+            if matches!(member.object, Expression::ImportMeta(_)) && member.property.name == URL_PROPERTY)
+    });
+
+    (constructor.name == URL_CONSTRUCTOR && names_own_module)
+        .then(|| path.as_expression().and_then(literal_text))
+        .flatten()
+        .filter(|text| text.starts_with('.'))
+}
+
+fn names_own_directory(expression: &Expression) -> bool {
+    match expression.get_inner_expression() {
+        Expression::Identifier(reference) => reference.name == DIRECTORY_VARIABLE,
+        Expression::StaticMemberExpression(member) => {
+            matches!(member.object, Expression::ImportMeta(_))
+                && member.property.name == DIRECTORY_PROPERTY
+        }
+        _ => false,
+    }
 }
 
 pub(crate) fn is_path_like(text: &str) -> bool {

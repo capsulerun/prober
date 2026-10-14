@@ -10,6 +10,7 @@ use prober_core::symbols::{
 };
 
 use crate::conventions::{PACKAGE_INIT, split_path};
+use crate::links::AttributePath;
 use crate::modules::{ImportTarget, ModuleIndex};
 use crate::pytest::fixtures::ModuleEdge;
 use crate::summary::ModuleSummary;
@@ -21,6 +22,8 @@ const MAX_DEPTH: usize = 32;
 const PYTEST_NAMES: [&str; 2] = ["pytest", "collect_ignore"];
 
 const MODULE_GETATTR: &str = "__getattr__";
+
+const TEST_CASE_SUFFIX: &str = "TestCase";
 
 const STAR_NAMES: &str = "__all__";
 
@@ -37,6 +40,7 @@ pub(crate) struct Analysis<'a> {
     pub providers: &'a HashSet<RepoPath>,
     pub module_edges: &'a HashMap<RepoPath, Vec<ModuleEdge>>,
     pub dependencies: &'a dyn Fn(&ImportTarget) -> Vec<RepoPath>,
+    pub attribute_paths: &'a [AttributePath],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -268,6 +272,50 @@ impl Analysis<'_> {
 
                     edges.add(init, reached, ids, files, graph);
                 }
+            }
+        }
+
+        for attribute_path in self
+            .attribute_paths
+            .iter()
+            .filter(|attribute_path| attribute_path.reader == *path)
+        {
+            let reader = ids[module][symbols.symbol_at(attribute_path.line)];
+
+            for package in attribute_path
+                .packages
+                .iter()
+                .filter(|package| *package != path)
+            {
+                let reached = match resolver.module_indices.get(package) {
+                    Some(&loaded) => Reached::Symbol {
+                        module: loaded,
+                        symbol: ModuleSymbols::INIT,
+                    },
+                    None => Reached::Whole {
+                        path: package.clone(),
+                        cause: WholeModuleCause::NotAnalysed,
+                    },
+                };
+
+                edges.add(reader, reached, ids, files, graph);
+            }
+
+            let module_target = Target::Repo(attribute_path.module.clone());
+
+            if !attribute_path.attributes.is_empty()
+                && let Some(&loaded) = resolver.module_indices.get(&attribute_path.module)
+            {
+                let init = Reached::Symbol {
+                    module: loaded,
+                    symbol: ModuleSymbols::INIT,
+                };
+
+                edges.add(reader, init, ids, files, graph);
+            }
+
+            for reached in resolver.resolve_target(&module_target, &attribute_path.attributes, 0) {
+                edges.add(reader, reached, ids, files, graph);
             }
         }
 
@@ -788,6 +836,7 @@ impl Resolver<'_> {
                         match imported_target(imported) {
                             Target::Standard(_) => continue,
                             Target::Repo(_) => {}
+                            _ if names_a_test_case(imported, base) => continue,
                             _ => return true,
                         }
                     }
@@ -842,6 +891,16 @@ impl Resolver<'_> {
 
         registers
     }
+}
+
+fn names_a_test_case(imported: &Imported, base: &Use) -> bool {
+    let name = match (imported, base.attributes.last()) {
+        (_, Some(attribute)) => attribute,
+        (Imported::Name { name, .. }, None) => name,
+        (Imported::Module(_), None) => return false,
+    };
+
+    name.ends_with(TEST_CASE_SUFFIX)
 }
 
 fn imported_target(imported: &Imported) -> &Target {

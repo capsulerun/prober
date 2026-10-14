@@ -232,11 +232,11 @@ Every inference is on by default. Switch one off to measure what it adds, or whe
 |---|---|
 | `dynamic_imports` | Computed imports (``import(`./locales/${lang}.js`)``, `importlib.import_module(f"app.{name}")`) resolved to the modules they can load |
 | `plugin_folders` | Folders of plugins loaded by name, each linked to the code that loads it |
-| `widening` | Tests that reach an unresolved site are selected when a change could reach that site |
+| `widening` | Tests that reach an unresolved site are selected when a change could reach that site, unless the change alters no code (comments, types) or is a file of a case folder |
 | `test_support` | Helpers, fixtures and setup files used by tests, which select only the tests using them |
 | `manifests` | Manifests and lockfiles diffed field by field, instead of running every test |
-| `files` | Files read from literal paths, such as fixtures, snapshots and `include_str!` |
-| `naming_families` | Tests paired with the modules they are named after |
+| `files` | Files read from literal paths, such as fixtures, snapshots and `include_str!`, folders a test builds from its own directory (`path.join(__dirname, "fixtures")`), and the folders of the files a glob in a Rust integration test matches (`#[fixture("tests/**/_config.json")]`) |
+| `naming_families` | Tests paired with the modules they are named after, and with the case folders beside them named after them (`Normal.test.mjs` reads `normalCases/`) |
 | `spawned_entrypoints` | Scripts and binaries that tests start as a process |
 | `build_mapping` | Build outputs (`dist/…`) mapped back to their sources |
 | `symbols` | For TypeScript and Python, links followed through the functions, classes and methods a test uses rather than whole files |

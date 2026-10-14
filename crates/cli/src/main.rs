@@ -6,6 +6,7 @@ mod why;
 use std::env;
 use std::fs;
 use std::io::{self, Write};
+use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -129,7 +130,13 @@ fn select(arguments: &SelectionArguments) -> ExitCode {
         });
 
     match selection {
-        Ok(selection) => print_selection(&selection, arguments),
+        Ok(selection) => {
+            let exit_code = print_selection(&selection, arguments);
+
+            mem::forget(selection);
+
+            exit_code
+        }
         Err(error) => {
             eprintln!("prober: {error:#}");
 

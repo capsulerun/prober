@@ -1,4 +1,4 @@
-//! Links from evaluated sites and literals: computed imports to modules, globs and plugin folders, paths to the files they read, dotted strings to their modules, and the sites that stay unresolved.
+//! Links from evaluated sites and literals: computed imports to modules, globs and plugin folders, paths to the files they read, dotted strings to their modules or the attributes they name, and the sites that stay unresolved.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -8,6 +8,7 @@ use anyhow::Result;
 use globset::{GlobBuilder, GlobSetBuilder};
 use prober_core::files::RepoPath;
 use prober_core::graph::{EdgeKind, Inference, UnresolvedCause};
+use rayon::prelude::*;
 
 use crate::conventions::{is_module_file, join_directory, parent_directory, split_path};
 use crate::evaluator::{Evaluator, Hole, Part, Pattern, Value};
@@ -60,9 +61,19 @@ pub(crate) struct UnresolvedImport {
     pub cause: UnresolvedCause,
 }
 
+pub(crate) struct AttributePath {
+    pub reader: RepoPath,
+    pub line: u32,
+    pub packages: Vec<RepoPath>,
+    pub module: RepoPath,
+    pub attributes: Vec<String>,
+    pub inference: Inference,
+}
+
 #[derive(Default)]
 pub(crate) struct Links {
     pub links: Vec<Link>,
+    pub attribute_paths: Vec<AttributePath>,
     pub folders: BTreeMap<RepoPath, Vec<RepoPath>>,
     pub unresolved: Vec<UnresolvedImport>,
 }
@@ -71,6 +82,7 @@ pub(crate) struct LinkSettings {
     pub dynamic_imports: bool,
     pub plugin_folders: bool,
     pub files: bool,
+    pub attribute_paths: bool,
 }
 
 struct PendingGlob {
@@ -171,7 +183,17 @@ impl Linking<'_> {
                         EdgeKind::Dynamic
                     };
 
-                    resolution.dotted_string(module, *line, text, kind, &mut links);
+                    let attribute_paths =
+                        self.settings.attribute_paths && kind == EdgeKind::Dynamic;
+
+                    resolution.dotted_string(
+                        module,
+                        *line,
+                        text,
+                        kind,
+                        attribute_paths,
+                        &mut links,
+                    );
                 }
 
                 if self.settings.files {
@@ -197,15 +219,19 @@ impl Linking<'_> {
             .filter(|link| link.kind == EdgeKind::Reads && is_data_file(&link.file))
             .map(|link| &link.file)
             .collect();
+
+        data_files
+            .into_par_iter()
+            .flat_map_iter(|data_file| self.modules_listed_by(data_file))
+            .collect()
+    }
+
+    fn modules_listed_by(&self, data_file: &RepoPath) -> Vec<Link> {
+        let path = self.repo_root.join(data_file.as_str());
+        let small = fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= MAX_DATA_FILE_SIZE);
         let mut listed = Vec::new();
 
-        for data_file in data_files {
-            let path = self.repo_root.join(data_file.as_str());
-            let small =
-                fs::metadata(&path).is_ok_and(|metadata| metadata.len() <= MAX_DATA_FILE_SIZE);
-            let Some(text) = small.then(|| fs::read_to_string(&path).ok()).flatten() else {
-                continue;
-            };
+        if let Some(text) = small.then(|| fs::read_to_string(&path).ok()).flatten() {
             let mut seen = HashSet::new();
 
             for (offset, token) in dotted_tokens(&text) {
@@ -509,6 +535,7 @@ impl Resolution<'_> {
         line: u32,
         text: &str,
         kind: EdgeKind,
+        attribute_paths: bool,
         links: &mut Links,
     ) {
         let segments: Vec<&str> = text.split('.').collect();
@@ -520,23 +547,60 @@ impl Resolution<'_> {
             return;
         }
 
-        if let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) {
-            for file in files
-                .into_iter()
-                .filter(|file| file != module && !self.tests.contains(file))
-            {
-                links.links.push(Link {
-                    reader: module.clone(),
-                    file,
-                    kind,
-                    inference: Inference {
+        let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) else {
+            return;
+        };
+
+        if attribute_paths {
+            let named = (1..=segments.len()).rev().find_map(|length| {
+                let resolved = self
+                    .index
+                    .resolve_module(module, &segments[..length].join("."));
+
+                (!resolved.is_empty()).then_some((resolved, &segments[length..]))
+            });
+
+            if let Some((resolved, attributes)) = named {
+                for resolved in resolved.into_iter().filter(|resolved| {
+                    resolved.module != *module && !self.tests.contains(&resolved.module)
+                }) {
+                    links.attribute_paths.push(AttributePath {
+                        reader: module.clone(),
                         line,
-                        kind: MODULE_PATH,
-                        pattern: text.to_owned(),
-                        detail: None,
-                    },
-                });
+                        packages: resolved.packages,
+                        module: resolved.module,
+                        attributes: attributes
+                            .iter()
+                            .map(|&attribute| attribute.to_owned())
+                            .collect(),
+                        inference: Inference {
+                            line,
+                            kind: MODULE_PATH,
+                            pattern: text.to_owned(),
+                            detail: None,
+                        },
+                    });
+                }
+
+                return;
             }
+        }
+
+        for file in files
+            .into_iter()
+            .filter(|file| file != module && !self.tests.contains(file))
+        {
+            links.links.push(Link {
+                reader: module.clone(),
+                file,
+                kind,
+                inference: Inference {
+                    line,
+                    kind: MODULE_PATH,
+                    pattern: text.to_owned(),
+                    detail: None,
+                },
+            });
         }
     }
 
@@ -829,7 +893,7 @@ fn dotted_glob(pattern: &Pattern) -> Option<(String, bool)> {
         return None;
     };
 
-    if !first.contains('.') {
+    if first.is_empty() {
         return None;
     }
 

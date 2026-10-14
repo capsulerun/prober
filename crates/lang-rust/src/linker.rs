@@ -16,7 +16,7 @@ use crate::conventions::{
     registry_node,
 };
 use crate::manifests::CargoChanges;
-use crate::modules::{Dependency, ModuleGraph};
+use crate::modules::{Dependency, FILE_GLOB, ModuleGraph};
 use crate::source::{SourceFacts, source_facts};
 use crate::workspace::Workspace;
 
@@ -144,9 +144,18 @@ impl RustLinker {
                     .collect(),
             };
             let dependent = graph.add_file(link.dependent.clone());
+            let reads_cases = link
+                .inference
+                .as_ref()
+                .is_some_and(|inference| inference.kind == FILE_GLOB);
 
             for dependency in dependencies {
                 let dependency = graph.add_file(dependency);
+
+                if reads_cases {
+                    graph.mark_case_file(dependency);
+                }
+
                 let edge = Edge {
                     dependent,
                     dependency,

@@ -146,6 +146,26 @@ fn a_computed_import_without_a_literal_package_widens_to_its_dependents() {
 }
 
 #[test]
+fn a_computed_top_level_import_links_the_modules_its_prefix_names() {
+    let project = TestProject::new(&[
+        ("app/__init__.py", ""),
+        (
+            "app/drivers.py",
+            "import importlib\n\n\ndef driver(uri):\n    name = uri.split(\":\")[0]\n    return importlib.import_module(f\"adbc_driver_{name}\")\n\n\ndef codec(name):\n    return importlib.import_module(f\"codec_{name}\")\n\n\ndriver(input())\ncodec(input())\n",
+        ),
+        ("codec_json.py", ""),
+        ("app/extra.py", ""),
+        ("tests/test_drivers.py", "import app.drivers\n"),
+    ]);
+
+    assert!(project.selected_by("app/extra.py").is_empty());
+    assert_eq!(
+        project.selected_by("codec_json.py"),
+        ["tests/test_drivers.py"]
+    );
+}
+
+#[test]
 fn a_computed_import_whose_callers_explode_widens_instead_of_evaluating_them_all() {
     let project = TestProject::new(&[
         ("app/__init__.py", ""),
@@ -208,7 +228,7 @@ fn dotted_module_strings_link_the_module_they_name() {
 
     assert_eq!(
         dependents(&graph, "app/mail.py"),
-        [("tests/test_signup.py", EdgeKind::Dynamic)]
+        [("tests/test_signup.py", EdgeKind::Import)]
     );
     assert!(
         dependents(
