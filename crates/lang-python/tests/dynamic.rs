@@ -19,7 +19,10 @@ fn literal_and_enumerated_computed_imports_link_their_modules() {
             "app/registry.py",
             "import importlib\n\nCODECS = (\"json\", \"xml\")\n\n\ndef load():\n    for name in CODECS:\n        importlib.import_module(f\"app.codecs.{name}_codec\")\n    importlib.import_module(\"app.codecs\")\n",
         ),
-        ("tests/test_registry.py", "from app.registry import load\n"),
+        (
+            "tests/test_registry.py",
+            "from app.registry import load\n\n\ndef test_load():\n    load()\n",
+        ),
     ]);
     let graph = project.link();
 
@@ -34,8 +37,9 @@ fn literal_and_enumerated_computed_imports_link_their_modules() {
             "tests/test_registry.py",
             &[
                 "app/codecs/json_codec.py (modified)",
-                "-> loaded by app/registry.py:8 (inferred computed import app.codecs.json_codec)",
-                "-> imported by tests/test_registry.py",
+                "-> loaded by load in app/registry.py:8 (inferred computed import app.codecs.json_codec)",
+                "-> load used by test_load in tests/test_registry.py",
+                "-> test_load run by tests/test_registry.py",
             ],
         )])
     );
@@ -81,7 +85,10 @@ fn computed_imports_of_plugin_folders_link_each_folder() {
             "core/loader.py",
             "import importlib\n\n\ndef load(domain):\n    return importlib.import_module(f\"core.components.{domain}\")\n",
         ),
-        ("tests/test_loader.py", "from core.loader import load\n"),
+        (
+            "tests/test_loader.py",
+            "from core import loader\n\n\ndef test_load():\n    assert loader.load\n",
+        ),
     ]);
     let graph = project.link();
 
@@ -103,8 +110,9 @@ fn computed_imports_of_plugin_folders_link_each_folder() {
             &[
                 "core/components/light/device.py (modified)",
                 "-> in folder core/components/light/",
-                "-> loaded by core/loader.py:5 (inferred plugin folder core/components/{id}/ (id=light))",
-                "-> imported by tests/test_loader.py",
+                "-> loaded by load in core/loader.py:5 (inferred plugin folder core/components/{id}/ (id=light))",
+                "-> load used by test_load in tests/test_loader.py",
+                "-> test_load run by tests/test_loader.py",
             ],
         )])
     );
@@ -130,7 +138,8 @@ fn a_computed_import_without_a_literal_package_widens_to_its_dependents() {
             &[
                 "app/extra.py (modified)",
                 "-> widened: unresolved dynamic import at app/plugins.py:5 (importlib.import_module(path))",
-                "-> imported by tests/test_plugins.py",
+                "-> load used at load by app/plugins.py",
+                "-> loaded by tests/test_plugins.py",
             ],
         )])
     );
@@ -146,7 +155,10 @@ fn a_computed_import_whose_callers_explode_widens_instead_of_evaluating_them_all
         ),
         ("app/handlers/__init__.py", ""),
         ("app/handlers/sum.py", ""),
-        ("tests/test_expressions.py", "import app.expressions\n"),
+        (
+            "tests/test_expressions.py",
+            "import app.expressions\n\n\ndef test_resolve():\n    app.expressions.resolve(None)\n",
+        ),
     ]);
 
     assert_eq!(
@@ -156,7 +168,8 @@ fn a_computed_import_whose_callers_explode_widens_instead_of_evaluating_them_all
             &[
                 "app/handlers/sum.py (modified)",
                 "-> widened: unresolved dynamic import at app/expressions.py:12 (importlib.import_module(\"app.handlers.\" + resolve(node.lhs) + resolve(node.rhs)))",
-                "-> imported by tests/test_expressions.py",
+                "-> resolve used by test_resolve in tests/test_expressions.py",
+                "-> test_resolve run by tests/test_expressions.py",
             ],
         )])
     );

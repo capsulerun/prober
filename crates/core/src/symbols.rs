@@ -107,6 +107,8 @@ pub enum FallbackCause {
     CommonJs,
     ExportAssignment,
     Eval,
+    Exec,
+    Namespace,
     ParseError,
 }
 
@@ -116,6 +118,8 @@ impl FallbackCause {
             FallbackCause::CommonJs => "commonjs",
             FallbackCause::ExportAssignment => "export_assignment",
             FallbackCause::Eval => "eval",
+            FallbackCause::Exec => "exec",
+            FallbackCause::Namespace => "namespace",
             FallbackCause::ParseError => "parse_error",
         }
     }
@@ -125,6 +129,8 @@ impl FallbackCause {
             FallbackCause::CommonJs => "CommonJS exports",
             FallbackCause::ExportAssignment => "export =",
             FallbackCause::Eval => "direct eval",
+            FallbackCause::Exec => "exec() or eval()",
+            FallbackCause::Namespace => "globals() or sys.modules",
             FallbackCause::ParseError => "parse error",
         }
     }

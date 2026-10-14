@@ -60,7 +60,7 @@ fn a_crate_change_selects_the_tests_importing_its_module_with_the_declaration() 
             &[
                 "python/Cargo.toml (modified)",
                 "-> loaded by python/python/shop/cart.py:1 (inferred Python binding shop._native (python/pyproject.toml))",
-                "-> imported by python/tests/test_cart.py",
+                "-> loaded by python/tests/test_cart.py",
             ],
         )])
     );

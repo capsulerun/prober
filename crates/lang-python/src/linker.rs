@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use anyhow::{Context, Result};
-use prober_core::changes::FileChange;
+use prober_core::changes::{ChangeKind, FileChange};
 use prober_core::config::{InferenceSettings, Presets};
 use prober_core::files::{FileId, RepoPath};
 use prober_core::frontend::{ChangeSet, Frontend};
@@ -27,6 +27,7 @@ use crate::pytest::fixtures::{FixtureScopes, ModuleEdge};
 use crate::pytest::{ConfigChanges, global_plugins, scoped_requests};
 use crate::summarizer::summarize;
 use crate::summary::ModuleSummary;
+use crate::symbols::Analysis;
 
 const PYTEST_PRESET: &str = "pytest";
 
@@ -83,6 +84,10 @@ impl PythonLinker {
         }
     }
 
+    fn analyses_symbols(&self) -> bool {
+        self.pytest && self.inference.symbols
+    }
+
     fn is_test(&self, path: &RepoPath) -> bool {
         if self.pytest {
             self.configs.is_test(path)
@@ -108,7 +113,10 @@ impl PythonLinker {
                     .with_context(|| format!("cannot read {path}"))?;
                 let source = String::from_utf8_lossy(&bytes);
 
-                Ok((path.clone(), summarize(path, &source, &self.index)))
+                Ok((
+                    path.clone(),
+                    summarize(path, &source, &self.index, self.analyses_symbols()),
+                ))
             })
             .collect::<Result<HashMap<RepoPath, ModuleSummary>>>()?;
 
@@ -150,25 +158,7 @@ impl PythonLinker {
                 } else {
                     EdgeKind::Import
                 };
-                let dependencies: Vec<RepoPath> = match &import.target {
-                    ImportTarget::Repo(files) => files.clone(),
-                    ImportTarget::External(name) => {
-                        let mut dependencies = vec![package_node(name)];
-
-                        dependencies.extend(
-                            outside_packages
-                                .get(name.as_str())
-                                .into_iter()
-                                .flatten()
-                                .cloned(),
-                        );
-
-                        dependencies
-                    }
-                    ImportTarget::Standard | ImportTarget::Missing => Vec::new(),
-                };
-
-                for dependency in dependencies
+                for dependency in import_dependencies(&import.target, &outside_packages)
                     .into_iter()
                     .filter(|dependency| dependency != module)
                 {
@@ -307,14 +297,31 @@ impl PythonLinker {
             return Ok(Vec::new());
         }
 
-        if self.inference.symbols {
+        if self.analyses_symbols() {
+            let global_plugins = global_plugins(&self.configs, &self.index, repo_files, &read_head);
+            let providers = self.providers(&modules, summaries, &global_plugins);
+            let base_summaries = self.base_summaries(summaries, change_set)?;
+            let dependencies =
+                |target: &ImportTarget| import_dependencies(target, &outside_packages);
+            let analysed = Analysis {
+                summaries,
+                base_summaries: &base_summaries,
+                index: &self.index,
+                tests: &tests,
+                providers: &providers,
+                module_edges: &module_edges,
+                dependencies: &dependencies,
+            }
+            .add_to(graph);
+
             FixtureScopes {
                 summaries,
                 index: &self.index,
                 tests: &tests,
-                global_plugins: global_plugins(&self.configs, &self.index, repo_files, &read_head),
+                global_plugins,
                 scoped_requests: scoped_requests(&self.configs),
                 module_edges: &module_edges,
+                analysed: &analysed,
             }
             .add_to(graph, change_set.changes, change_set.base)?;
         }
@@ -473,6 +480,29 @@ fn package_node(import_name: &str) -> RepoPath {
     .expect("import names are valid path segments")
 }
 
+fn import_dependencies(
+    target: &ImportTarget,
+    outside_packages: &HashMap<&str, Vec<RepoPath>>,
+) -> Vec<RepoPath> {
+    match target {
+        ImportTarget::Repo(files) => files.clone(),
+        ImportTarget::External(name) => {
+            let mut dependencies = vec![package_node(name)];
+
+            dependencies.extend(
+                outside_packages
+                    .get(name.as_str())
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            );
+
+            dependencies
+        }
+        ImportTarget::Standard | ImportTarget::Missing => Vec::new(),
+    }
+}
+
 fn modules_outside_packages<'m>(
     modules: &[&'m RepoPath],
     index: &ModuleIndex,
@@ -501,6 +531,54 @@ fn modules_outside_packages<'m>(
 }
 
 impl PythonLinker {
+    fn providers(
+        &self,
+        modules: &[&RepoPath],
+        summaries: &HashMap<RepoPath, ModuleSummary>,
+        global_plugins: &[RepoPath],
+    ) -> HashSet<RepoPath> {
+        let mut providers: HashSet<RepoPath> = global_plugins.iter().cloned().collect();
+
+        for &module in modules {
+            if split_path(module.as_str()).1 == CONFTEST {
+                providers.insert(module.clone());
+            }
+
+            for plugin in &summaries[module].pytest.plugins {
+                if let Some(resolved) = self.index.resolve_module(module, plugin).into_iter().next()
+                {
+                    providers.insert(resolved.module);
+                }
+            }
+        }
+
+        providers
+    }
+
+    fn base_summaries(
+        &self,
+        summaries: &HashMap<RepoPath, ModuleSummary>,
+        change_set: &ChangeSet,
+    ) -> Result<HashMap<RepoPath, ModuleSummary>> {
+        let mut base_summaries = HashMap::new();
+
+        for change in change_set.changes.iter().filter(|change| {
+            change.kind == ChangeKind::Modified && summaries.contains_key(&change.path)
+        }) {
+            let Some(bytes) = change_set.base.read_file(&change.path)? else {
+                continue;
+            };
+            let source = String::from_utf8_lossy(&bytes);
+
+            base_summaries.insert(
+                change.path.clone(),
+                summarize(&change.path, &source, &self.index, true),
+            );
+        }
+
+        Ok(base_summaries)
+    }
+
     fn add_native_imports(&self, file: FileId, summary: &ModuleSummary, graph: &mut GraphBuilder) {
         for native_import in &summary.native_imports {
             let native = &self.index.native_modules()[native_import.module];

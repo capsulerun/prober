@@ -10,6 +10,7 @@ mod modules;
 mod pytest;
 mod summarizer;
 mod summary;
+mod symbols;
 
 pub use conventions::{LANGUAGE, is_source_file, is_test_file};
 pub use linker::PythonLinker;

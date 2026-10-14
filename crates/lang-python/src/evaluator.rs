@@ -116,7 +116,11 @@ impl<'s> Evaluator<'s> {
             .map(String::as_str)
             .collect();
 
-        for (module, summary) in summaries {
+        let mut modules: Vec<(&'s RepoPath, &'s ModuleSummary)> = summaries.iter().collect();
+
+        modules.sort_by_key(|(module, _)| *module);
+
+        for &(module, summary) in &modules {
             for (index, function) in summary.functions.iter().enumerate() {
                 let reachable_by_attribute = unresolved_attributes.contains(function.name.as_str());
 
@@ -393,6 +397,21 @@ impl<'s> Evaluator<'s> {
             ),
             Expr::ElementOf(iterable) => match self.evaluate(iterable, frame) {
                 Value::Sequence(items) => union(items),
+                Value::Unknown(hole) => Value::Unknown(hole),
+                _ => Value::Unknown(Hole::Runtime),
+            },
+            Expr::ItemOf { iterable, index } => match self.evaluate(iterable, frame) {
+                Value::Sequence(items) => union(
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            Value::Sequence(mut fields) if *index < fields.len() => {
+                                fields.swap_remove(*index)
+                            }
+                            _ => Value::Unknown(Hole::Runtime),
+                        })
+                        .collect(),
+                ),
                 Value::Unknown(hole) => Value::Unknown(hole),
                 _ => Value::Unknown(Hole::Runtime),
             },

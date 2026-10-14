@@ -74,7 +74,7 @@ fn every_test_runs_with_the_settings_and_the_apps_it_installs() {
                 "polls/test_utils.py",
                 &[
                     "shop/models.py (modified)",
-                    "-> loaded by site/settings.py:1 (inferred installed app shop.apps.ShopConfig)",
+                    "-> loaded by INSTALLED_APPS in site/settings.py:1 (inferred installed app shop.apps.ShopConfig)",
                     "-> imported by polls/test_utils.py",
                 ],
             ),
@@ -82,7 +82,7 @@ fn every_test_runs_with_the_settings_and_the_apps_it_installs() {
                 "shop/tests.py",
                 &[
                     "shop/models.py (modified)",
-                    "-> loaded by site/settings.py:1 (inferred installed app shop.apps.ShopConfig)",
+                    "-> loaded by INSTALLED_APPS in site/settings.py:1 (inferred installed app shop.apps.ShopConfig)",
                     "-> imported by shop/tests.py",
                 ],
             ),

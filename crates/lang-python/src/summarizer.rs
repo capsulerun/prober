@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use prober_core::files::RepoPath;
+use prober_core::symbols::FallbackCause;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
     self as ast, ExceptHandler, Expr as AstExpr, InterpolatedStringElement, Operator, PySourceType,
@@ -20,6 +21,7 @@ use crate::summary::{
     CallSite, Expr, FunctionIndex, FunctionSummary, ModuleRef, ModuleSummary, NativeImport, Site,
     SiteKind, StaticImport,
 };
+use crate::symbols::extract_symbols;
 
 const MAX_CONVERSION_DEPTH: usize = 24;
 
@@ -100,6 +102,7 @@ type ScopeId = usize;
 enum Binding<'a> {
     Value(&'a AstExpr),
     Element(&'a AstExpr),
+    Item(&'a AstExpr, usize),
     Module(ModuleRef),
     Imported(ModuleRef, String),
     Function(FunctionIndex),
@@ -114,7 +117,12 @@ struct Scope<'a> {
     bindings: HashMap<&'a str, Vec<Binding<'a>>>,
 }
 
-pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> ModuleSummary {
+pub(crate) fn summarize(
+    path: &RepoPath,
+    source: &str,
+    index: &ModuleIndex,
+    with_symbols: bool,
+) -> ModuleSummary {
     let parsed = parse_unchecked_source(source, PySourceType::Python);
     let module = parsed.syntax();
     let mut collector = Collector {
@@ -132,6 +140,7 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
     };
 
     collector.collect_body(&module.body, 0, None);
+    collector.collect_comprehensions(&module.body, 0);
 
     let summarizer = Summarizer {
         path,
@@ -143,6 +152,17 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
         converted: RefCell::new(HashMap::new()),
         converting: RefCell::new(HashSet::new()),
     };
+    let (pytest, symbols) = if parsed.errors().is_empty() {
+        let items = pytest_items(module, source);
+        let symbols = with_symbols.then(|| extract_symbols(module, source, path, index, &items));
+
+        (items, symbols)
+    } else {
+        (
+            PytestItems::default(),
+            with_symbols.then_some(Err(FallbackCause::ParseError)),
+        )
+    };
     let summary = ModuleSummary {
         functions: collector
             .functions
@@ -151,11 +171,8 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
             .collect(),
         bindings: summarizer.module_bindings(),
         setting_lists: setting_lists(module),
-        pytest: if !parsed.errors().is_empty() {
-            PytestItems::default()
-        } else {
-            pytest_items(module, source)
-        },
+        pytest,
+        symbols,
         ..ModuleSummary::default()
     };
     let mut visitor = SummaryVisitor {
@@ -364,8 +381,19 @@ impl<'a> Collector<'a, '_> {
         self.function_scopes
             .insert(definition.range().start(), (function_scope, function));
         self.collect_body(&definition.body, function_scope, None);
+        self.collect_comprehensions(&definition.body, function_scope);
 
         function
+    }
+
+    fn collect_comprehensions(&mut self, body: &'a [Stmt], scope: ScopeId) {
+        let mut finder = ComprehensionFinder::default();
+
+        finder.visit_body(body);
+
+        for (target, iterable) in finder.generators {
+            self.bind_elements(scope, target, iterable);
+        }
     }
 
     fn bind_target(&mut self, scope: ScopeId, target: &'a AstExpr, value: &'a AstExpr) {
@@ -385,9 +413,27 @@ impl<'a> Collector<'a, '_> {
     }
 
     fn bind_elements(&mut self, scope: ScopeId, target: &'a AstExpr, iterable: &'a AstExpr) {
-        match target {
-            AstExpr::Name(name) => self.bind(scope, name.id.as_str(), Binding::Element(iterable)),
-            target => self.bind_unknown(scope, target),
+        let items = match target {
+            AstExpr::Tuple(tuple) => Some(&tuple.elts),
+            AstExpr::List(list) => Some(&list.elts),
+            _ => None,
+        };
+
+        match (target, items) {
+            (AstExpr::Name(name), _) => {
+                self.bind(scope, name.id.as_str(), Binding::Element(iterable));
+            }
+            (_, Some(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    match item {
+                        AstExpr::Name(name) => {
+                            self.bind(scope, name.id.as_str(), Binding::Item(iterable, index));
+                        }
+                        item => self.bind_unknown(scope, item),
+                    }
+                }
+            }
+            (target, None) => self.bind_unknown(scope, target),
         }
     }
 
@@ -587,6 +633,10 @@ impl<'a> Summarizer<'a, '_> {
                 Binding::Element(iterable) => {
                     Expr::ElementOf(Box::new(self.convert(iterable, scope, depth + 1)))
                 }
+                Binding::Item(iterable, index) => Expr::ItemOf {
+                    iterable: Box::new(self.convert(iterable, scope, depth + 1)),
+                    index,
+                },
                 Binding::Module(module) => Expr::Module(module),
                 Binding::Imported(module, name) => Expr::Imported { module, name },
                 Binding::Function(function) => Expr::Function(function),
@@ -1516,4 +1566,31 @@ fn line_starts(source: &str) -> Vec<usize> {
     );
 
     starts
+}
+
+#[derive(Default)]
+struct ComprehensionFinder<'a> {
+    generators: Vec<(&'a AstExpr, &'a AstExpr)>,
+}
+
+impl<'a> Visitor<'a> for ComprehensionFinder<'a> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        if !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            visitor::walk_stmt(self, statement);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a AstExpr) {
+        if matches!(expr, AstExpr::Lambda(_)) {
+            return;
+        }
+
+        visitor::walk_expr(self, expr);
+    }
+
+    fn visit_comprehension(&mut self, comprehension: &'a ast::Comprehension) {
+        self.generators
+            .push((&comprehension.target, &comprehension.iter));
+        visitor::walk_comprehension(self, comprehension);
+    }
 }

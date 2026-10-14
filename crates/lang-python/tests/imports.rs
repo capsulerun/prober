@@ -77,26 +77,15 @@ fn type_checking_imports_never_select_tests() {
 fn a_change_selects_the_tests_reaching_it_with_the_import_chain() {
     assert_eq!(
         shop().outcome_of(&[], &[modified("shop/money.py")]),
-        selected(&[
-            (
-                "tests/unit/test_cart.py",
-                &[
-                    "shop/money.py (modified)",
-                    "-> imported by shop/pricing.py",
-                    "-> imported by shop/cart.py",
-                    "-> imported by tests/unit/test_cart.py",
-                ],
-            ),
-            (
-                "tests/unit/test_report.py",
-                &[
-                    "shop/money.py (modified)",
-                    "-> imported by shop/tax.py",
-                    "-> imported by shop/report.py",
-                    "-> imported by tests/unit/test_report.py",
-                ],
-            ),
-        ])
+        selected(&[(
+            "tests/unit/test_cart.py",
+            &[
+                "shop/money.py (modified)",
+                "-> loaded by shop/pricing.py",
+                "-> loaded by shop/cart.py",
+                "-> loaded by tests/unit/test_cart.py",
+            ],
+        )])
     );
 }
 

@@ -343,6 +343,54 @@ fn change_to_one_function_selects_the_tests_using_it_unless_symbols_are_switched
 }
 
 #[test]
+fn change_to_one_python_function_selects_the_tests_calling_it_unless_symbols_are_switched_off() {
+    let parsing = "def parse(text):\n    return text\n\n\ndef format(value):\n    return value\n";
+    let repository = TestRepository::with_files_on_main(&[
+        ("shop/__init__.py", "from shop.text import format, parse\n"),
+        ("shop/text.py", parsing),
+        (
+            "tests/test_parse.py",
+            "import shop\n\n\ndef test_parse():\n    assert shop.parse(\"a\") == \"a\"\n",
+        ),
+        (
+            "tests/test_format.py",
+            "from shop import format\n\n\ndef test_format():\n    assert format(\"a\") == \"a\"\n",
+        ),
+    ]);
+
+    repository.change_and_commit(
+        "shop/text.py",
+        &parsing.replace("return text", "return text.strip()"),
+    );
+
+    let symbol_level = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    repository.write("prober.toml", "[inference]\nsymbols = false\n");
+
+    let file_level = repository.prober(&["--base", "main"]);
+
+    assert_eq!(
+        symbol_level["targets"],
+        json!({ "python": ["tests/test_parse.py"] })
+    );
+    assert_eq!(
+        symbol_level["reasons"]["tests/test_parse.py"],
+        json!([
+            "shop/text.py (modified)",
+            "-> parse changed",
+            "-> parse used by test_parse in tests/test_parse.py",
+            "-> test_parse run by tests/test_parse.py",
+        ])
+    );
+    assert_eq!(
+        file_level.stdout,
+        "tests/test_format.py\ntests/test_parse.py\n"
+    );
+}
+
+#[test]
 fn comment_change_selects_nothing_and_top_level_code_selects_every_importer() {
     let repository = TestRepository::with_project_on_main();
 
@@ -875,11 +923,14 @@ fn polyglot_repository() -> TestRepository {
             "import order from \"../contracts/order.json\";\n\ntest(\"order\", () => expect(order.id).toBe(1));\n",
         ),
         ("service/__init__.py", ""),
-        ("service/orders.py", "from service import pricing\n"),
+        (
+            "service/orders.py",
+            "from service import pricing\n\n\ndef total(amount):\n    return amount * pricing.RATE\n",
+        ),
         ("service/pricing.py", "RATE = 1\n"),
         (
             "tests/test_orders.py",
-            "import json\nfrom pathlib import Path\n\nfrom service.orders import pricing\n\nCONTRACT = Path(__file__).parent.parent / \"contracts\" / \"order.json\"\n",
+            "import json\nfrom pathlib import Path\n\nfrom service.orders import total\n\nCONTRACT = Path(__file__).parent.parent / \"contracts\" / \"order.json\"\n\n\ndef test_total():\n    assert total(1) == 1\n",
         ),
         ("tests/test_health.py", "import os\n"),
     ])
@@ -923,7 +974,7 @@ fn why_and_scan_cover_every_language() {
         repository
             .prober(&["why", "tests/test_orders.py", "--base", "main"])
             .stdout,
-        "tests/test_orders.py is selected:\n  service/pricing.py (modified)\n  -> imported by service/orders.py\n  -> imported by tests/test_orders.py\n"
+        "tests/test_orders.py is selected:\n  service/pricing.py (modified)\n  -> RATE changed\n  -> RATE used by total in service/orders.py\n  -> total used by test_total in tests/test_orders.py\n  -> test_total run by tests/test_orders.py\n"
     );
     assert_eq!(
         repository
@@ -1123,7 +1174,7 @@ fn a_rust_change_selects_the_python_and_node_tests_behind_its_bindings() {
             "-> imported by python/src/lib.rs",
             "-> built into python/Cargo.toml",
             "-> loaded by python/python/shop/cart.py:1 (inferred Python binding shop._engine (python/pyproject.toml))",
-            "-> imported by python/tests/test_cart.py",
+            "-> loaded by python/tests/test_cart.py",
         ])
     );
     assert_eq!(
