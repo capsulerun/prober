@@ -157,6 +157,18 @@ pub(crate) fn extract_symbols(
     );
     init.hash = extractor.init_hasher.finish();
 
+    if extractor.star_imports.is_empty() {
+        let names = &extractor.names;
+
+        for symbol in &mut extractor.symbols {
+            let imports = &symbol.imports;
+
+            symbol.uses.retain(|symbol_use| {
+                names.contains_key(&symbol_use.name) || imports.contains_key(&symbol_use.name)
+            });
+        }
+    }
+
     Ok(ModuleSymbols {
         symbols: extractor.symbols,
         names: extractor.names,
@@ -471,13 +483,18 @@ impl Extractor<'_> {
             _ => (CLASS_BODY.to_owned(), Decoration::Plain, Vec::new()),
         };
         let value = !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+
+        if decoration == Decoration::Plain && !value {
+            return;
+        }
+
         let scope = CollectScope {
             in_class: true,
             lazy_attributes: false,
         };
         let collected = self.collect_in(scope, |collector| collector.visit_stmt(statement));
 
-        if decoration == Decoration::Plain && !(value && collected.calls) {
+        if decoration == Decoration::Plain && !collected.calls {
             return;
         }
 

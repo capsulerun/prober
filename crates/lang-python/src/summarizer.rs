@@ -117,7 +117,12 @@ struct Scope<'a> {
     bindings: HashMap<&'a str, Vec<Binding<'a>>>,
 }
 
-pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> ModuleSummary {
+pub(crate) fn summarize(
+    path: &RepoPath,
+    source: &str,
+    index: &ModuleIndex,
+    with_symbols: bool,
+) -> ModuleSummary {
     let parsed = parse_unchecked_source(source, PySourceType::Python);
     let module = parsed.syntax();
     let mut collector = Collector {
@@ -149,11 +154,14 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
     };
     let (pytest, symbols) = if parsed.errors().is_empty() {
         let items = pytest_items(module, source);
-        let symbols = extract_symbols(module, source, path, index, &items);
+        let symbols = with_symbols.then(|| extract_symbols(module, source, path, index, &items));
 
         (items, symbols)
     } else {
-        (PytestItems::default(), Err(FallbackCause::ParseError))
+        (
+            PytestItems::default(),
+            with_symbols.then_some(Err(FallbackCause::ParseError)),
+        )
     };
     let summary = ModuleSummary {
         functions: collector
@@ -164,7 +172,7 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
         bindings: summarizer.module_bindings(),
         setting_lists: setting_lists(module),
         pytest,
-        symbols: Some(symbols),
+        symbols,
         ..ModuleSummary::default()
     };
     let mut visitor = SummaryVisitor {

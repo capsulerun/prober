@@ -84,6 +84,10 @@ impl PythonLinker {
         }
     }
 
+    fn analyses_symbols(&self) -> bool {
+        self.pytest && self.inference.symbols
+    }
+
     fn is_test(&self, path: &RepoPath) -> bool {
         if self.pytest {
             self.configs.is_test(path)
@@ -109,7 +113,10 @@ impl PythonLinker {
                     .with_context(|| format!("cannot read {path}"))?;
                 let source = String::from_utf8_lossy(&bytes);
 
-                Ok((path.clone(), summarize(path, &source, &self.index)))
+                Ok((
+                    path.clone(),
+                    summarize(path, &source, &self.index, self.analyses_symbols()),
+                ))
             })
             .collect::<Result<HashMap<RepoPath, ModuleSummary>>>()?;
 
@@ -290,7 +297,7 @@ impl PythonLinker {
             return Ok(Vec::new());
         }
 
-        if self.inference.symbols {
+        if self.analyses_symbols() {
             let global_plugins = global_plugins(&self.configs, &self.index, repo_files, &read_head);
             let providers = self.providers(&modules, summaries, &global_plugins);
             let base_summaries = self.base_summaries(summaries, change_set)?;
@@ -565,7 +572,7 @@ impl PythonLinker {
 
             base_summaries.insert(
                 change.path.clone(),
-                summarize(&change.path, &source, &self.index),
+                summarize(&change.path, &source, &self.index, true),
             );
         }
 
