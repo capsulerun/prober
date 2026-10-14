@@ -441,7 +441,10 @@ const root = require("node:path").join(__dirname, "..");
             "tests/loader.ts",
             "export const load = () => import(process.env.PLUGIN!);",
         ),
-        ("tests/loader.test.ts", r#"import { load } from "./loader";"#),
+        (
+            "tests/loader.test.ts",
+            r#"import { load } from "./loader";"#,
+        ),
     ]);
 
     assert_eq!(

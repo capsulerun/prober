@@ -227,6 +227,7 @@ impl PythonLinker {
                 dynamic_imports: self.inference.dynamic_imports,
                 plugin_folders: self.inference.plugin_folders,
                 files: self.inference.files,
+                attribute_paths: self.analyses_symbols(),
             },
         }
         .links()?;
@@ -243,6 +244,26 @@ impl PythonLinker {
             };
 
             graph.add_inferred_edge(edge, link.inference);
+        }
+
+        for attribute_path in &links.attribute_paths {
+            let reader = graph.add_file(attribute_path.reader.clone());
+
+            for loaded in attribute_path
+                .packages
+                .iter()
+                .chain([&attribute_path.module])
+                .filter(|loaded| **loaded != attribute_path.reader)
+            {
+                let loaded = graph.add_file(loaded.clone());
+                let edge = Edge {
+                    dependent: reader,
+                    dependency: loaded,
+                    kind: EdgeKind::Import,
+                };
+
+                graph.add_inferred_edge(edge, attribute_path.inference.clone());
+            }
         }
 
         for (folder, files) in links.folders {
@@ -311,6 +332,7 @@ impl PythonLinker {
                 providers: &providers,
                 module_edges: &module_edges,
                 dependencies: &dependencies,
+                attribute_paths: &links.attribute_paths,
             }
             .add_to(graph);
 

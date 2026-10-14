@@ -1,4 +1,4 @@
-//! Python per function on projects written to disk: a change selects the tests using the functions and classes it changed, through re-exports, attribute chains, star imports and lazy module attributes, while load-time code, registrations and dynamic namespaces still reach every loader.
+//! Python per function on projects written to disk: a change selects the tests using the functions and classes it changed, through re-exports, attribute chains, star imports, lazy module attributes and dotted strings, while load-time code, registrations and dynamic namespaces still reach every loader.
 
 mod test_project;
 
@@ -323,6 +323,67 @@ fn star_imports_and_lazy_attributes_resolve_to_the_symbols_behind_them() {
 }
 
 #[test]
+fn names_in_a_lazy_table_and_dotted_strings_reach_the_symbols_they_name() {
+    let networks = "def validate(value):\n    return \"@\" in value\n\n\nclass Email:\n    def check(self, value):\n        return validate(value)\n\n\ndef unrelated():\n    return 1\n";
+    let project = TestProject::new(&[
+        (
+            "kit/__init__.py",
+            "import importlib\n\n_lazy = {\n    \"Email\": \".networks\",\n    \"Url\": (\"kit\", \".urls\"),\n}\n\n\ndef __getattr__(name):\n    module = importlib.import_module(_lazy[name], __name__)\n    return getattr(module, name)\n",
+        ),
+        ("kit/networks.py", networks),
+        ("kit/urls.py", "class Url:\n    pass\n"),
+        (
+            "tests/test_email.py",
+            "import kit\n\n\ndef test_email():\n    assert kit.Email().check(\"a@b\")\n",
+        ),
+        (
+            "tests/test_url.py",
+            "from kit import Url\n\n\ndef test_url():\n    assert Url()\n",
+        ),
+        (
+            "tests/test_patched.py",
+            "from unittest.mock import patch\n\n\n@patch(\"kit.networks.validate\")\ndef test_patched(validate):\n    validate.return_value = True\n",
+        ),
+    ]);
+
+    assert_eq!(
+        changed_tests(
+            &project,
+            "kit/networks.py",
+            networks,
+            &networks.replace("\"@\" in value", "\"@\" in value.strip()")
+        ),
+        ["tests/test_email.py", "tests/test_patched.py"]
+    );
+    assert_eq!(
+        changed(
+            &project,
+            "kit/urls.py",
+            "class Url:\n    pass\n",
+            "class Url:\n    scheme = \"https\"\n"
+        ),
+        selected(&[(
+            "tests/test_url.py",
+            &[
+                "kit/urls.py (modified)",
+                "-> Url changed",
+                "-> Url used by test_url in tests/test_url.py",
+                "-> test_url run by tests/test_url.py",
+            ],
+        )])
+    );
+    assert!(
+        changed_tests(
+            &project,
+            "kit/networks.py",
+            networks,
+            &networks.replace("return 1", "return 2")
+        )
+        .is_empty()
+    );
+}
+
+#[test]
 fn subclasses_of_a_registering_base_reach_every_loader_and_plain_ones_their_users() {
     let shapes = "class Registry:\n    kinds = {}\n\n    def __init_subclass__(cls, **kwargs):\n        Registry.kinds[cls.__name__] = cls\n\n\nclass Square(Registry):\n    def area(self):\n        return 4\n\n\nclass Plain:\n    pass\n\n\nclass Circle(Plain):\n    def perimeter(self):\n        return 3\n";
     let project = TestProject::new(&[
@@ -354,6 +415,42 @@ fn subclasses_of_a_registering_base_reach_every_loader_and_plain_ones_their_user
             &shapes.replace("return 3", "return 2")
         )
         .is_empty()
+    );
+}
+
+#[test]
+fn bases_from_outside_the_repository_register_unless_they_are_test_cases() {
+    let cases = "from django.db import models\nfrom django.test import TestCase as DjangoTestCase\n\n\nclass ApiTestCase(DjangoTestCase):\n    def login(self):\n        return 1\n\n\nclass Event(models.Model):\n    def title(self):\n        return 2\n";
+    let project = TestProject::new(&[
+        ("testutils/__init__.py", ""),
+        ("testutils/cases.py", cases),
+        (
+            "tests/test_api.py",
+            "from testutils.cases import ApiTestCase\n\n\nclass TestApi(ApiTestCase):\n    def test_login(self):\n        assert self.login() == 1\n",
+        ),
+        (
+            "tests/test_other.py",
+            "import testutils.cases\n\n\ndef test_other():\n    assert True\n",
+        ),
+    ]);
+
+    assert_eq!(
+        changed_tests(
+            &project,
+            "testutils/cases.py",
+            cases,
+            &cases.replace("return 1", "return 3")
+        ),
+        ["tests/test_api.py"]
+    );
+    assert_eq!(
+        changed_tests(
+            &project,
+            "testutils/cases.py",
+            cases,
+            &cases.replace("return 2", "return 4")
+        ),
+        ["tests/test_api.py", "tests/test_other.py"]
     );
 }
 

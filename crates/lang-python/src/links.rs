@@ -1,4 +1,4 @@
-//! Links from evaluated sites and literals: computed imports to modules, globs and plugin folders, paths to the files they read, dotted strings to their modules, and the sites that stay unresolved.
+//! Links from evaluated sites and literals: computed imports to modules, globs and plugin folders, paths to the files they read, dotted strings to their modules or the attributes they name, and the sites that stay unresolved.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -60,9 +60,19 @@ pub(crate) struct UnresolvedImport {
     pub cause: UnresolvedCause,
 }
 
+pub(crate) struct AttributePath {
+    pub reader: RepoPath,
+    pub line: u32,
+    pub packages: Vec<RepoPath>,
+    pub module: RepoPath,
+    pub attributes: Vec<String>,
+    pub inference: Inference,
+}
+
 #[derive(Default)]
 pub(crate) struct Links {
     pub links: Vec<Link>,
+    pub attribute_paths: Vec<AttributePath>,
     pub folders: BTreeMap<RepoPath, Vec<RepoPath>>,
     pub unresolved: Vec<UnresolvedImport>,
 }
@@ -71,6 +81,7 @@ pub(crate) struct LinkSettings {
     pub dynamic_imports: bool,
     pub plugin_folders: bool,
     pub files: bool,
+    pub attribute_paths: bool,
 }
 
 struct PendingGlob {
@@ -171,7 +182,17 @@ impl Linking<'_> {
                         EdgeKind::Dynamic
                     };
 
-                    resolution.dotted_string(module, *line, text, kind, &mut links);
+                    let attribute_paths =
+                        self.settings.attribute_paths && kind == EdgeKind::Dynamic;
+
+                    resolution.dotted_string(
+                        module,
+                        *line,
+                        text,
+                        kind,
+                        attribute_paths,
+                        &mut links,
+                    );
                 }
 
                 if self.settings.files {
@@ -509,6 +530,7 @@ impl Resolution<'_> {
         line: u32,
         text: &str,
         kind: EdgeKind,
+        attribute_paths: bool,
         links: &mut Links,
     ) {
         let segments: Vec<&str> = text.split('.').collect();
@@ -518,6 +540,41 @@ impl Resolution<'_> {
 
         if !is_dotted {
             return;
+        }
+
+        if attribute_paths {
+            let named = (1..=segments.len()).rev().find_map(|length| {
+                let resolved = self
+                    .index
+                    .resolve_module(module, &segments[..length].join("."));
+
+                (!resolved.is_empty()).then_some((resolved, &segments[length..]))
+            });
+
+            if let Some((resolved, attributes)) = named {
+                for resolved in resolved.into_iter().filter(|resolved| {
+                    resolved.module != *module && !self.tests.contains(&resolved.module)
+                }) {
+                    links.attribute_paths.push(AttributePath {
+                        reader: module.clone(),
+                        line,
+                        packages: resolved.packages,
+                        module: resolved.module,
+                        attributes: attributes
+                            .iter()
+                            .map(|&attribute| attribute.to_owned())
+                            .collect(),
+                        inference: Inference {
+                            line,
+                            kind: MODULE_PATH,
+                            pattern: text.to_owned(),
+                            detail: None,
+                        },
+                    });
+                }
+
+                return;
+            }
         }
 
         if let ImportTarget::Repo(files) = self.index.resolve_absolute(module, text) {

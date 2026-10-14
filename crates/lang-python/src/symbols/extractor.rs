@@ -1501,6 +1501,28 @@ mod tests {
     }
 
     #[test]
+    fn names_a_lazy_table_maps_to_modules_are_bound_to_them() {
+        let module = extract(
+            "pkg/__init__.py",
+            "from importlib import import_module\n\n_by_name = {\"Model\": (__spec__.parent, \".main\"), \"tools\": (__spec__.parent, \"__module__\")}\n_by_module = {\"pkg.fields\": [\"Field\", \"computed\"]}\n_unrelated = {\"Config\": \".config\"}\n\n\ndef Field():\n    return None\n\n\ndef __getattr__(name):\n    if name in _by_module[\"pkg.fields\"]:\n        return getattr(import_module(\"pkg.fields\"), name)\n    package, module = _by_name[name]\n    return getattr(import_module(module, package), name)\n",
+            &["pkg/main.py", "pkg/fields.py", "pkg/config.py", "pkg/tools.py"],
+        )
+        .unwrap();
+        let lazy = |module: &str, name: &str| {
+            vec![Binding::Import(Imported::Name {
+                module: Target::Repo(RepoPath::new(module).unwrap()),
+                name: name.to_owned(),
+            })]
+        };
+
+        assert_eq!(module.names["Model"], lazy("pkg/main.py", "Model"));
+        assert_eq!(module.names["computed"], lazy("pkg/fields.py", "computed"));
+        assert_eq!(module.names["Field"], [Binding::Local(4)]);
+        assert!(!module.names.contains_key("tools"));
+        assert!(!module.names.contains_key("Config"));
+    }
+
+    #[test]
     fn dynamic_namespaces_are_tracked_or_fall_back() {
         let analysed = |source: &str| extract("names.py", source, &[]);
 

@@ -228,7 +228,7 @@ fn dotted_module_strings_link_the_module_they_name() {
 
     assert_eq!(
         dependents(&graph, "app/mail.py"),
-        [("tests/test_signup.py", EdgeKind::Dynamic)]
+        [("tests/test_signup.py", EdgeKind::Import)]
     );
     assert!(
         dependents(
