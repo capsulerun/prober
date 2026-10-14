@@ -36,8 +36,8 @@ fn a_changed_pin_selects_the_tests_reaching_its_importers() {
             &[
                 "requirements.txt (modified)",
                 "-> package pyyaml changed (PyYAML==6.0.1 -> PyYAML==6.0.2)",
-                "-> imported by service/config.py",
-                "-> imported by tests/test_config.py",
+                "-> used whole at load by service/config.py",
+                "-> loaded by tests/test_config.py",
             ],
         )])
     );

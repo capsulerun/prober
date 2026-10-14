@@ -15,6 +15,7 @@ use crate::conventions::{CONFTEST, join_directory, parent_directory, split_path}
 use crate::modules::ModuleIndex;
 use crate::pytest::items::{PytestItems, parse_items};
 use crate::summary::ModuleSummary;
+use crate::symbols::AnalysedModule;
 
 const WHOLE_FILE: LineRange = LineRange {
     start: 1,
@@ -35,6 +36,7 @@ pub(crate) struct FixtureScopes<'f> {
     pub global_plugins: Vec<RepoPath>,
     pub scoped_requests: Vec<(String, Vec<String>)>,
     pub module_edges: &'f HashMap<RepoPath, Vec<ModuleEdge>>,
+    pub analysed: &'f HashMap<RepoPath, AnalysedModule>,
 }
 
 struct Provider {
@@ -67,14 +69,20 @@ impl FixtureScopes<'_> {
                 unparsed,
                 ..
             } = self.chain(test, &conftests);
-            let test_file = graph.add_file(test.clone());
-            let test_symbol = graph.add_symbol(Symbol {
-                file: test_file,
-                name: MODULE_INIT_NAME.to_owned(),
-                kind: SymbolKind::ModuleInit,
-                lines: vec![WHOLE_FILE],
-                hash: 0,
-            });
+            let test_symbol = match self.analysed.get(test) {
+                Some(analysed) => analysed.init,
+                None => {
+                    let test_file = graph.add_file(test.clone());
+
+                    graph.add_symbol(Symbol {
+                        file: test_file,
+                        name: MODULE_INIT_NAME.to_owned(),
+                        kind: SymbolKind::ModuleInit,
+                        lines: vec![WHOLE_FILE],
+                        hash: 0,
+                    })
+                }
+            };
 
             for provider in &chain {
                 if !providers.contains_key(provider) {
@@ -128,6 +136,8 @@ impl FixtureScopes<'_> {
         for path in provider_paths {
             self.mirror_module_edges(path, providers[path].module, graph);
         }
+
+        providers.retain(|path, _| !self.analysed.contains_key(path));
 
         add_provider_changes(&providers, self.summaries, changes, base, graph)
     }
@@ -283,6 +293,14 @@ impl FixtureScopes<'_> {
     }
 
     fn register(&self, provider: &RepoPath, graph: &mut GraphBuilder) -> Provider {
+        if let Some(analysed) = self.analysed.get(provider) {
+            return Provider {
+                file: graph.add_file(provider.clone()),
+                module: analysed.init,
+                fixtures: analysed.fixtures.clone(),
+            };
+        }
+
         let items = self
             .items(provider)
             .expect("providers are registered only with parsed items");
@@ -318,6 +336,10 @@ impl FixtureScopes<'_> {
     }
 
     fn mirror_module_edges(&self, module: &RepoPath, symbol: SymbolId, graph: &mut GraphBuilder) {
+        if self.analysed.contains_key(module) {
+            return;
+        }
+
         for edge in self.module_edges.get(module).into_iter().flatten() {
             let file = graph.add_file(edge.dependency.clone());
 

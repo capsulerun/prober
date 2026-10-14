@@ -118,10 +118,14 @@ impl Linking<'_> {
         for &module in &modules {
             let summary = &self.summaries[module];
 
-            for site in &summary.sites {
+            for site in summary
+                .sites
+                .iter()
+                .filter(|site| site.kind != SiteKind::Attribute)
+            {
                 let enabled = match site.kind {
                     SiteKind::Import => self.settings.dynamic_imports,
-                    SiteKind::Path | SiteKind::Listing => self.settings.files,
+                    SiteKind::Path | SiteKind::Listing | SiteKind::Attribute => self.settings.files,
                 };
 
                 if !enabled {
@@ -156,7 +160,7 @@ impl Linking<'_> {
                             &mut links,
                             &mut pending,
                         ),
-                        SiteKind::Path | SiteKind::Listing => {
+                        SiteKind::Path | SiteKind::Listing | SiteKind::Attribute => {
                             resolution.path(&reading, &site_value.value, &mut links, &mut pending);
                         }
                     }

@@ -128,12 +128,31 @@ fn an_overridden_fixture_reaches_the_tests_of_the_override_through_its_own_reque
 #[test]
 fn load_time_code_and_autouse_fixtures_reach_every_test_in_scope() {
     let project = project();
-    let load_time = ROOT_CONFTEST.replace("import pytest\n", "import pytest\n\nTIMEOUT = 5\n");
+    let load_time = ROOT_CONFTEST.replace(
+        "import pytest\n",
+        "import os\n\nimport pytest\n\nos.environ[\"MODE\"] = \"test\"\n",
+    );
 
     assert_eq!(
         changed_conftest(&project, "tests/conftest.py", ROOT_CONFTEST, &load_time).len(),
         5
     );
+
+    let project = self::project();
+    let collected = ROOT_CONFTEST.replace(
+        "import pytest\n",
+        "import pytest\n\ncollect_ignore = [\"legacy\"]\n",
+    );
+
+    assert_eq!(
+        changed_conftest(&project, "tests/conftest.py", ROOT_CONFTEST, &collected).len(),
+        5
+    );
+
+    let project = self::project();
+    let unread = ROOT_CONFTEST.replace("import pytest\n", "import pytest\n\nTIMEOUT = 5\n");
+
+    assert!(changed_conftest(&project, "tests/conftest.py", ROOT_CONFTEST, &unread).is_empty());
 
     let project = self::project();
     let autouse = API_CONFTEST.replace(

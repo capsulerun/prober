@@ -3,9 +3,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use prober_core::files::RepoPath;
+use prober_core::symbols::FallbackCause;
 
 use crate::modules::ImportTarget;
 use crate::pytest::items::PytestItems;
+use crate::symbols::ModuleSymbols;
 
 pub(crate) type FunctionIndex = usize;
 
@@ -25,6 +27,10 @@ pub(crate) enum Expr {
     Choice(Vec<Expr>),
     Sequence(Vec<Expr>),
     ElementOf(Box<Expr>),
+    ItemOf {
+        iterable: Box<Expr>,
+        index: usize,
+    },
     Parameter {
         function: FunctionIndex,
         index: usize,
@@ -68,6 +74,7 @@ pub(crate) enum SiteKind {
     Import,
     Path,
     Listing,
+    Attribute,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -110,11 +117,14 @@ pub(crate) struct ModuleSummary {
     pub bindings: HashMap<String, Expr>,
     pub sites: Vec<Site>,
     pub calls: Vec<CallSite>,
+    pub method_calls: Vec<(String, CallSite)>,
+    pub referenced_attributes: BTreeSet<String>,
     pub escapes: Vec<Expr>,
     pub unresolved_attributes: BTreeSet<String>,
     pub strings: Vec<(u32, String)>,
     pub pytest: PytestItems,
     pub setting_lists: BTreeMap<String, Vec<String>>,
+    pub symbols: Option<Result<ModuleSymbols, FallbackCause>>,
 }
 
 impl ModuleSummary {

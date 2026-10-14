@@ -1048,6 +1048,11 @@ fn describe_use(graph: &Graph, edge: &SymbolEdge) -> String {
         }
         SymbolTarget::Symbol(used) => {
             let used = graph.symbol(used);
+            let runs_its_own = at_load && used.file == user.file && graph.is_test(user.file);
+
+            if runs_its_own && used.kind != SymbolKind::ModuleInit {
+                return format!("-> {} run by {user_file}", used.name);
+            }
 
             match (used.kind == SymbolKind::ModuleInit, at_load) {
                 (true, true) => format!("-> loaded by {user_file}"),

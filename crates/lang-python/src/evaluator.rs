@@ -24,6 +24,8 @@ const MAX_EVALUATION_STEPS: usize = 20_000;
 
 const MAX_SITE_STEPS: usize = 1_000_000;
 
+const RECEIVERS: [&str; 2] = ["self", "cls"];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FunctionRef<'s> {
     pub module: &'s RepoPath,
@@ -115,19 +117,70 @@ impl<'s> Evaluator<'s> {
             .flat_map(|summary| &summary.unresolved_attributes)
             .map(String::as_str)
             .collect();
+        let referenced_attributes: HashSet<&str> = summaries
+            .values()
+            .flat_map(|summary| &summary.referenced_attributes)
+            .map(String::as_str)
+            .collect();
+        let mut methods: HashMap<&str, Vec<(FunctionRef<'s>, usize)>> = HashMap::new();
 
         for (module, summary) in summaries {
             for (index, function) in summary.functions.iter().enumerate() {
-                let reachable_by_attribute = unresolved_attributes.contains(function.name.as_str());
+                let name = function.name.as_str();
+                let reachable_by_attribute = unresolved_attributes.contains(name);
+                let escapes = match &function.class {
+                    Some(_) => {
+                        function.nested || referenced_attributes.contains(name) || is_special(name)
+                    }
+                    None => reachable_by_attribute,
+                };
 
-                if function.escapes || function.class.is_some() || reachable_by_attribute {
+                if function.escapes || escapes {
                     escaping.insert(FunctionRef { module, index });
                 }
-            }
 
+                if function.class.is_some() && !function.nested {
+                    let receiver_shift = usize::from(
+                        function
+                            .parameters
+                            .first()
+                            .is_some_and(|first| RECEIVERS.contains(&first.as_str())),
+                    );
+
+                    methods
+                        .entry(name)
+                        .or_default()
+                        .push((FunctionRef { module, index }, receiver_shift));
+                }
+            }
+        }
+
+        for (module, summary) in summaries {
             for call in &summary.calls {
                 if let Some((function, receiver_shift)) = evaluator.callee(module, &call.callee) {
                     callers.entry(function).or_default().push(CallerRef {
+                        module,
+                        call,
+                        receiver_shift,
+                    });
+                }
+
+                if let Expr::Method { name, .. } = &call.callee {
+                    for &(method, receiver_shift) in
+                        methods.get(name.as_str()).into_iter().flatten()
+                    {
+                        callers.entry(method).or_default().push(CallerRef {
+                            module,
+                            call,
+                            receiver_shift,
+                        });
+                    }
+                }
+            }
+
+            for (name, call) in &summary.method_calls {
+                for &(method, receiver_shift) in methods.get(name.as_str()).into_iter().flatten() {
+                    callers.entry(method).or_default().push(CallerRef {
                         module,
                         call,
                         receiver_shift,
@@ -393,6 +446,21 @@ impl<'s> Evaluator<'s> {
             ),
             Expr::ElementOf(iterable) => match self.evaluate(iterable, frame) {
                 Value::Sequence(items) => union(items),
+                Value::Unknown(hole) => Value::Unknown(hole),
+                _ => Value::Unknown(Hole::Runtime),
+            },
+            Expr::ItemOf { iterable, index } => match self.evaluate(iterable, frame) {
+                Value::Sequence(items) => union(
+                    items
+                        .into_iter()
+                        .map(|item| match item {
+                            Value::Sequence(mut fields) if *index < fields.len() => {
+                                fields.swap_remove(*index)
+                            }
+                            _ => Value::Unknown(Hole::Runtime),
+                        })
+                        .collect(),
+                ),
                 Value::Unknown(hole) => Value::Unknown(hole),
                 _ => Value::Unknown(Hole::Runtime),
             },
@@ -1086,4 +1154,8 @@ mod tests {
             root("tests/test_a.json")
         );
     }
+}
+
+fn is_special(name: &str) -> bool {
+    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
 }

@@ -4,6 +4,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use prober_core::files::RepoPath;
+use prober_core::symbols::FallbackCause;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{
     self as ast, ExceptHandler, Expr as AstExpr, InterpolatedStringElement, Operator, PySourceType,
@@ -20,6 +21,7 @@ use crate::summary::{
     CallSite, Expr, FunctionIndex, FunctionSummary, ModuleRef, ModuleSummary, NativeImport, Site,
     SiteKind, StaticImport,
 };
+use crate::symbols::extract_symbols;
 
 const MAX_CONVERSION_DEPTH: usize = 24;
 
@@ -73,6 +75,13 @@ const LISTING_FUNCTIONS: [&str; 6] = [
     "shutil.copytree",
 ];
 
+const ATTRIBUTE_FUNCTIONS: [&str; 4] = [
+    "builtins.getattr",
+    "builtins.hasattr",
+    "operator.attrgetter",
+    "operator.methodcaller",
+];
+
 const IMPORT_FUNCTIONS: [&str; 3] = [
     "importlib.import_module",
     "builtins.__import__",
@@ -92,7 +101,16 @@ const TRANSPARENT_DECORATORS: [&str; 10] = [
     "wraps",
 ];
 
-const BUILTINS: [&str; 6] = ["open", "__import__", "str", "repr", "format", "print"];
+const BUILTINS: [&str; 8] = [
+    "open",
+    "__import__",
+    "str",
+    "repr",
+    "format",
+    "print",
+    "getattr",
+    "hasattr",
+];
 
 type ScopeId = usize;
 
@@ -100,6 +118,7 @@ type ScopeId = usize;
 enum Binding<'a> {
     Value(&'a AstExpr),
     Element(&'a AstExpr),
+    Item(&'a AstExpr, usize),
     Module(ModuleRef),
     Imported(ModuleRef, String),
     Function(FunctionIndex),
@@ -143,6 +162,14 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
         converted: RefCell::new(HashMap::new()),
         converting: RefCell::new(HashSet::new()),
     };
+    let (pytest, symbols) = if parsed.errors().is_empty() {
+        let items = pytest_items(module, source);
+        let symbols = extract_symbols(module, source, path, index, &items);
+
+        (items, symbols)
+    } else {
+        (PytestItems::default(), Err(FallbackCause::ParseError))
+    };
     let summary = ModuleSummary {
         functions: collector
             .functions
@@ -151,11 +178,8 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
             .collect(),
         bindings: summarizer.module_bindings(),
         setting_lists: setting_lists(module),
-        pytest: if !parsed.errors().is_empty() {
-            PytestItems::default()
-        } else {
-            pytest_items(module, source)
-        },
+        pytest,
+        symbols: Some(symbols),
         ..ModuleSummary::default()
     };
     let mut visitor = SummaryVisitor {
@@ -385,9 +409,27 @@ impl<'a> Collector<'a, '_> {
     }
 
     fn bind_elements(&mut self, scope: ScopeId, target: &'a AstExpr, iterable: &'a AstExpr) {
-        match target {
-            AstExpr::Name(name) => self.bind(scope, name.id.as_str(), Binding::Element(iterable)),
-            target => self.bind_unknown(scope, target),
+        let items = match target {
+            AstExpr::Tuple(tuple) => Some(&tuple.elts),
+            AstExpr::List(list) => Some(&list.elts),
+            _ => None,
+        };
+
+        match (target, items) {
+            (AstExpr::Name(name), _) => {
+                self.bind(scope, name.id.as_str(), Binding::Element(iterable));
+            }
+            (_, Some(items)) => {
+                for (index, item) in items.iter().enumerate() {
+                    match item {
+                        AstExpr::Name(name) => {
+                            self.bind(scope, name.id.as_str(), Binding::Item(iterable, index));
+                        }
+                        item => self.bind_unknown(scope, item),
+                    }
+                }
+            }
+            (target, None) => self.bind_unknown(scope, target),
         }
     }
 
@@ -587,6 +629,10 @@ impl<'a> Summarizer<'a, '_> {
                 Binding::Element(iterable) => {
                     Expr::ElementOf(Box::new(self.convert(iterable, scope, depth + 1)))
                 }
+                Binding::Item(iterable, index) => Expr::ItemOf {
+                    iterable: Box::new(self.convert(iterable, scope, depth + 1)),
+                    index,
+                },
                 Binding::Module(module) => Expr::Module(module),
                 Binding::Imported(module, name) => Expr::Imported { module, name },
                 Binding::Function(function) => Expr::Function(function),
@@ -1051,6 +1097,17 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
                     self.add_site(call, SiteKind::Listing, value, None);
                 }
             }
+            Some(name) if ATTRIBUTE_FUNCTIONS.contains(&name) => {
+                let position = usize::from(matches!(name, "builtins.getattr" | "builtins.hasattr"));
+
+                if let Some(attribute) = arguments.args.get(position)
+                    && !matches!(attribute, AstExpr::StringLiteral(_))
+                {
+                    let value = summarizer.convert(attribute, scope, 0);
+
+                    self.add_site(call, SiteKind::Attribute, value, None);
+                }
+            }
             _ => {}
         }
 
@@ -1082,7 +1139,18 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
 
         match summarizer.function_reference(&call.func, scope) {
             Some(callee) => self.add_call(call, callee, &arguments.args, &arguments.keywords),
-            None => self.add_unresolved_attribute(&call.func),
+            None => {
+                self.add_unresolved_attribute(&call.func);
+
+                if let AstExpr::Attribute(attribute) = call.func.as_ref() {
+                    let method_call =
+                        self.call_site(call, Expr::Unknown, &arguments.args, &arguments.keywords);
+
+                    self.summary
+                        .method_calls
+                        .push((attribute.attr.as_str().to_owned(), method_call));
+                }
+            }
         }
 
         for (position, argument) in arguments.args.iter().enumerate() {
@@ -1106,10 +1174,22 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
         arguments: &'a [AstExpr],
         keywords: &'a [ast::Keyword],
     ) {
+        let call_site = self.call_site(call, callee, arguments, keywords);
+
+        self.summary.calls.push(call_site);
+    }
+
+    fn call_site(
+        &self,
+        call: &'a ast::ExprCall,
+        callee: Expr,
+        arguments: &'a [AstExpr],
+        keywords: &'a [ast::Keyword],
+    ) -> CallSite {
         let summarizer = self.summarizer;
         let scope = self.scope;
 
-        self.summary.calls.push(CallSite {
+        CallSite {
             line: summarizer.line(call.range().start()),
             unit: self.unit(),
             callee,
@@ -1121,7 +1201,7 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
                 })
                 .collect(),
             keywords: summarizer.keywords(keywords, scope, 0),
-        });
+        }
     }
 }
 
@@ -1190,6 +1270,12 @@ impl<'a> Visitor<'a> for SummaryVisitor<'_, 'a, '_> {
                 match summarizer.function_reference(expr, self.scope) {
                     Some(reference) => self.summary.escapes.push(reference),
                     None => self.add_unresolved_attribute(expr),
+                }
+
+                if let AstExpr::Attribute(attribute) = expr {
+                    self.summary
+                        .referenced_attributes
+                        .insert(attribute.attr.as_str().to_owned());
                 }
             }
             _ => {}

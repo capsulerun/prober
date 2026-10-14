@@ -875,11 +875,14 @@ fn polyglot_repository() -> TestRepository {
             "import order from \"../contracts/order.json\";\n\ntest(\"order\", () => expect(order.id).toBe(1));\n",
         ),
         ("service/__init__.py", ""),
-        ("service/orders.py", "from service import pricing\n"),
+        (
+            "service/orders.py",
+            "from service import pricing\n\n\ndef total(amount):\n    return amount * pricing.RATE\n",
+        ),
         ("service/pricing.py", "RATE = 1\n"),
         (
             "tests/test_orders.py",
-            "import json\nfrom pathlib import Path\n\nfrom service.orders import pricing\n\nCONTRACT = Path(__file__).parent.parent / \"contracts\" / \"order.json\"\n",
+            "import json\nfrom pathlib import Path\n\nfrom service.orders import total\n\nCONTRACT = Path(__file__).parent.parent / \"contracts\" / \"order.json\"\n\n\ndef test_total():\n    assert total(1) == 1\n",
         ),
         ("tests/test_health.py", "import os\n"),
     ])
@@ -923,7 +926,7 @@ fn why_and_scan_cover_every_language() {
         repository
             .prober(&["why", "tests/test_orders.py", "--base", "main"])
             .stdout,
-        "tests/test_orders.py is selected:\n  service/pricing.py (modified)\n  -> imported by service/orders.py\n  -> imported by tests/test_orders.py\n"
+        "tests/test_orders.py is selected:\n  service/pricing.py (modified)\n  -> RATE changed\n  -> RATE used by total in service/orders.py\n  -> total used by test_total in tests/test_orders.py\n  -> test_total run by tests/test_orders.py\n"
     );
     assert_eq!(
         repository
@@ -1123,7 +1126,7 @@ fn a_rust_change_selects_the_python_and_node_tests_behind_its_bindings() {
             "-> imported by python/src/lib.rs",
             "-> built into python/Cargo.toml",
             "-> loaded by python/python/shop/cart.py:1 (inferred Python binding shop._engine (python/pyproject.toml))",
-            "-> imported by python/tests/test_cart.py",
+            "-> loaded by python/tests/test_cart.py",
         ])
     );
     assert_eq!(
