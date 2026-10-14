@@ -94,12 +94,17 @@ struct Members {
 }
 
 impl Members {
-    fn index(modules: &[Module]) -> Self {
+    fn index(modules: &[Module], tests: &BTreeSet<RepoPath>) -> Self {
         let mut members = Members::default();
 
         for (module, analysed) in modules.iter().enumerate() {
+            let in_tests = tests.contains(analysed.path);
+
             for (symbol, local) in analysed.symbols.symbols.iter().enumerate() {
-                for written in &local.attributes.written {
+                let writes_at_load =
+                    matches!(local.kind, SymbolKind::ModuleInit | SymbolKind::Class) && !in_tests;
+
+                for written in local.attributes.written.iter().filter(|_| writes_at_load) {
                     members
                         .writers
                         .entry(written.clone())
@@ -218,7 +223,7 @@ impl Analysis<'_> {
             computed_names: HashMap::new(),
         };
 
-        resolver.members = Members::index(&resolver.modules);
+        resolver.members = Members::index(&resolver.modules, self.tests);
         resolver.index_classes();
         resolver.computed_names = self.computed_names(&resolver.modules);
 
@@ -411,7 +416,7 @@ impl Analysis<'_> {
 
         let is_provider = self.providers.contains(path);
         let held = match local.decoration {
-            Decoration::Registering => true,
+            Decoration::Registering => resolver.registers(module, symbol),
             Decoration::Fixture => !is_provider,
             Decoration::Plain => {
                 local.calls_at_load
@@ -482,7 +487,7 @@ impl Analysis<'_> {
                 }
                 Changed::Binding(name) => {
                     let reaches = resolver
-                        .resolve_attributes(module, &[name.clone()], 0)
+                        .resolve_attributes(module, std::slice::from_ref(&name), 0)
                         .into_iter()
                         .map(|reached| target(reached, ids, files, graph).0)
                         .collect();
@@ -775,6 +780,49 @@ impl Resolver<'_> {
             .collect()
     }
 
+    fn registers(&mut self, module: usize, symbol: usize) -> bool {
+        let local = &self.modules[module].symbols.symbols[symbol];
+
+        local.decoration == Decoration::Registering
+            && local
+                .decorators
+                .iter()
+                .any(|decorator| self.decorator_registers(module, decorator.as_ref()))
+    }
+
+    fn decorator_registers(&mut self, module: usize, decorator: Option<&Use>) -> bool {
+        let Some(decorator) = decorator else {
+            return true;
+        };
+        let symbols = self.modules[module].symbols;
+        let Some(bindings) = symbols.names.get(&decorator.name) else {
+            return true;
+        };
+
+        for binding in bindings {
+            if let Binding::Import(imported) = binding
+                && !matches!(imported_target(imported), Target::Repo(_))
+            {
+                return true;
+            }
+
+            for reached in self.resolve_binding(module, binding, &decorator.attributes, 0) {
+                let Reached::Symbol { module, symbol } = reached else {
+                    return true;
+                };
+                let target = &self.modules[module].symbols.symbols[symbol];
+                let wraps = matches!(target.kind, SymbolKind::Function | SymbolKind::Member)
+                    && !target.stores_argument;
+
+                if !wraps {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     fn is_class_level(&mut self, module: usize, class: usize, depth: usize) -> bool {
         let key = (module, class);
 
@@ -789,7 +837,7 @@ impl Resolver<'_> {
             None => true,
             Some(header) => {
                 header.keywords
-                    || local.decoration == Decoration::Registering
+                    || self.registers(module, class)
                     || header
                         .bases
                         .iter()

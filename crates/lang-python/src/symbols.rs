@@ -78,6 +78,8 @@ pub(crate) struct LocalSymbol {
     pub imports: BTreeMap<String, Vec<Imported>>,
     pub attributes: Attributes,
     pub decoration: Decoration,
+    pub decorators: Vec<Option<Use>>,
+    pub stores_argument: bool,
     pub calls_at_load: bool,
     pub class: Option<ClassHeader>,
     pub member: Option<Member>,

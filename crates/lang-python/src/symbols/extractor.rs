@@ -50,6 +50,35 @@ const PLAIN_DECORATORS: [&str; 27] = [
 
 const MARK_PREFIXES: [&str; 2] = ["pytest.mark.", "mark."];
 
+const NON_STORING_CALLS: [&str; 26] = [
+    "callable",
+    "cast",
+    "debug",
+    "error",
+    "exception",
+    "format",
+    "getattr",
+    "getdoc",
+    "getfullargspec",
+    "getmodule",
+    "getsource",
+    "hasattr",
+    "info",
+    "isasyncgenfunction",
+    "isclass",
+    "iscoroutinefunction",
+    "isfunction",
+    "isgeneratorfunction",
+    "isinstance",
+    "ismethod",
+    "partial",
+    "signature",
+    "update_wrapper",
+    "warn",
+    "warning",
+    "wraps",
+];
+
 const TYPE_CHECKING: &str = "TYPE_CHECKING";
 
 const FUTURE_MODULE: &str = "__future__";
@@ -91,6 +120,8 @@ pub(crate) fn extract_symbols(
             imports: BTreeMap::new(),
             attributes: Attributes::default(),
             decoration: Decoration::Plain,
+            decorators: Vec::new(),
+            stores_argument: false,
             calls_at_load: false,
             class: None,
             member: None,
@@ -159,6 +190,8 @@ struct Definition {
     class: Option<ClassHeader>,
     member: Option<Member>,
     value: bool,
+    decorators: Vec<Option<Use>>,
+    stores_argument: bool,
 }
 
 impl Extractor<'_> {
@@ -176,6 +209,14 @@ impl Extractor<'_> {
     }
 
     fn collect(&self, visit: impl FnOnce(&mut Collector<'_, '_>)) -> Collected {
+        self.collect_in(None, visit)
+    }
+
+    fn collect_in(
+        &self,
+        class_name: Option<&str>,
+        visit: impl FnOnce(&mut Collector<'_, '_>),
+    ) -> Collected {
         let mut collector = Collector {
             extractor: self,
             collected: Collected::default(),
@@ -184,6 +225,7 @@ impl Extractor<'_> {
                 .iter()
                 .map(|receiver| (*receiver).to_owned())
                 .collect(),
+            class_name: class_name.map(str::to_owned),
         };
 
         visit(&mut collector);
@@ -200,6 +242,7 @@ impl Extractor<'_> {
                     .fixtures
                     .iter()
                     .find(|fixture| fixture.lines.start == lines.start);
+                let (decoration, decorators) = decoration(&definition.decorator_list);
                 let (name, kind, decoration) = match fixture {
                     Some(fixture) => (
                         fixture.name.clone(),
@@ -209,7 +252,7 @@ impl Extractor<'_> {
                     None => (
                         definition.name.as_str().to_owned(),
                         SymbolKind::Function,
-                        decoration(&definition.decorator_list),
+                        decoration,
                     ),
                 };
                 let collected = self.collect(|collector| collector.visit_stmt(statement));
@@ -224,6 +267,8 @@ impl Extractor<'_> {
                         class: None,
                         member: None,
                         value: false,
+                        decorators,
+                        stores_argument: stores_argument(statement),
                     },
                     collected,
                     &[definition.name.as_str()],
@@ -295,6 +340,8 @@ impl Extractor<'_> {
             imports,
             attributes,
             decoration: definition.decoration,
+            decorators: definition.decorators,
+            stores_argument: definition.stores_argument,
             class: definition.class,
             member: definition.member,
         };
@@ -337,6 +384,8 @@ impl Extractor<'_> {
                 class: None,
                 member: None,
                 value: true,
+                decorators: Vec::new(),
+                stores_argument: false,
             },
             collected,
             &bound,
@@ -391,16 +440,19 @@ impl Extractor<'_> {
 
         let member_lines: Vec<LineRange> =
             members.iter().map(|member| self.lines(*member)).collect();
+        let (class_decoration, class_decorators) = decoration(&definition.decorator_list);
         let class = self.define(
             Definition {
                 name: class_name.to_owned(),
                 kind: SymbolKind::Class,
                 lines: ranges_without(self.lines(statement), &member_lines),
                 hash: hasher.finish(),
-                decoration: decoration(&definition.decorator_list),
+                decoration: class_decoration,
                 class: Some(class_header(definition)),
                 member: None,
                 value: false,
+                decorators: class_decorators,
+                stores_argument: false,
             },
             collected,
             &[class_name],
@@ -408,12 +460,13 @@ impl Extractor<'_> {
 
         for member in members {
             let keys = member_keys(member).expect("members have keys");
-            let decoration = match member {
+            let (decoration, decorators) = match member {
                 Stmt::FunctionDef(function) => decoration(&function.decorator_list),
                 Stmt::ClassDef(nested) => decoration(&nested.decorator_list),
-                _ => Decoration::Plain,
+                _ => (Decoration::Plain, Vec::new()),
             };
-            let collected = self.collect(|collector| collector.visit_stmt(member));
+            let collected =
+                self.collect_in(Some(class_name), |collector| collector.visit_stmt(member));
 
             self.define(
                 Definition {
@@ -425,6 +478,8 @@ impl Extractor<'_> {
                     class: None,
                     member: Some(Member { class, keys }),
                     value: matches!(member, Stmt::Assign(_)),
+                    decorators,
+                    stores_argument: stores_argument(member),
                 },
                 collected,
                 &[],
@@ -611,6 +666,9 @@ fn merge(symbol: &mut LocalSymbol, other: LocalSymbol) {
         symbol.decoration = Decoration::Registering;
     }
 
+    symbol.decorators.extend(other.decorators);
+    symbol.stores_argument |= other.stores_argument;
+
     symbol.calls_at_load |= other.calls_at_load;
 }
 
@@ -619,6 +677,7 @@ struct Collector<'c, 'e> {
     collected: Collected,
     forwarded: Vec<BTreeSet<String>>,
     self_like: BTreeSet<String>,
+    class_name: Option<String>,
 }
 
 impl Collector<'_, '_> {
@@ -658,7 +717,9 @@ impl Collector<'_, '_> {
         };
 
         match call.func.as_ref() {
-            Expr::Name(_) => self.is_self(&call.func),
+            Expr::Name(callee) => {
+                self.is_self(&call.func) || self.class_name.as_deref() == Some(callee.id.as_str())
+            }
             Expr::Call(inner) => {
                 dotted_name(&inner.func) == "type"
                     && inner
@@ -948,25 +1009,106 @@ fn class_header(definition: &ast::StmtClassDef) -> ClassHeader {
     }
 }
 
-fn decoration(decorators: &[ast::Decorator]) -> Decoration {
-    let registering = decorators.iter().any(|decorator| {
-        let callee = match &decorator.expression {
-            Expr::Call(call) => call.func.as_ref(),
-            expression => expression,
-        };
-        let dotted = dotted_name(callee);
-        let last = dotted.rsplit('.').next().unwrap_or_default();
+fn decoration(decorators: &[ast::Decorator]) -> (Decoration, Vec<Option<Use>>) {
+    let unknown: Vec<Option<Use>> = decorators
+        .iter()
+        .filter_map(|decorator| {
+            let callee = match &decorator.expression {
+                Expr::Call(call) => call.func.as_ref(),
+                expression => expression,
+            };
+            let dotted = dotted_name(callee);
+            let last = dotted.rsplit('.').next().unwrap_or_default();
+            let plain = MARK_PREFIXES
+                .iter()
+                .any(|prefix| dotted.starts_with(prefix))
+                || PLAIN_DECORATORS.contains(&last);
 
-        !(MARK_PREFIXES
-            .iter()
-            .any(|prefix| dotted.starts_with(prefix))
-            || PLAIN_DECORATORS.contains(&last))
-    });
+            (!plain).then(|| attribute_chain(callee))
+        })
+        .collect();
 
-    if registering {
-        Decoration::Registering
+    if unknown.is_empty() {
+        (Decoration::Plain, unknown)
     } else {
-        Decoration::Plain
+        (Decoration::Registering, unknown)
+    }
+}
+
+fn stores_argument(statement: &Stmt) -> bool {
+    let mut finder = StoreFinder::default();
+
+    finder.visit_stmt(statement);
+
+    finder.found
+}
+
+#[derive(Default)]
+struct StoreFinder {
+    parameters: BTreeSet<String>,
+    found: bool,
+}
+
+impl StoreFinder {
+    fn is_parameter(&self, expression: &Expr) -> bool {
+        matches!(expression, Expr::Name(name) if self.parameters.contains(name.id.as_str()))
+    }
+}
+
+impl<'a> Visitor<'a> for StoreFinder {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        match statement {
+            Stmt::FunctionDef(definition) => {
+                let first = definition
+                    .parameters
+                    .posonlyargs
+                    .iter()
+                    .chain(&definition.parameters.args)
+                    .next();
+
+                self.parameters
+                    .extend(first.map(|parameter| parameter.parameter.name.as_str().to_owned()));
+            }
+            Stmt::Assign(assign)
+                if self.is_parameter(&assign.value)
+                    && assign.targets.iter().any(|target| {
+                        matches!(target, Expr::Subscript(_) | Expr::Attribute(_))
+                    }) =>
+            {
+                self.found = true;
+            }
+            _ => {}
+        }
+
+        visitor::walk_stmt(self, statement);
+    }
+
+    fn visit_expr(&mut self, expression: &'a Expr) {
+        if let Expr::Call(call) = expression {
+            let callee = dotted_name(&call.func);
+            let last = callee.rsplit('.').next().unwrap_or_default();
+            let passes_parameter = call
+                .arguments
+                .args
+                .iter()
+                .chain(call.arguments.keywords.iter().map(|keyword| &keyword.value))
+                .any(|argument| self.is_parameter(argument));
+            let stores = match call.func.as_ref() {
+                Expr::Attribute(_) => passes_parameter && !NON_STORING_CALLS.contains(&last),
+                _ => {
+                    last == "setattr"
+                        && call
+                            .arguments
+                            .args
+                            .get(2)
+                            .is_some_and(|value| self.is_parameter(value))
+                }
+            };
+
+            self.found |= stores;
+        }
+
+        visitor::walk_expr(self, expression);
     }
 }
 

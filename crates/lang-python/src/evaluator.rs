@@ -1093,6 +1093,10 @@ fn with_suffix(path: &Pattern, suffix: &Pattern) -> Pattern {
     Pattern(parts).concatenated(suffix)
 }
 
+fn is_special(name: &str) -> bool {
+    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1154,8 +1158,4 @@ mod tests {
             root("tests/test_a.json")
         );
     }
-}
-
-fn is_special(name: &str) -> bool {
-    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
 }
