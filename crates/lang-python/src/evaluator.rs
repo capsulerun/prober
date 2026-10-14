@@ -1,14 +1,14 @@
 //! Partial evaluation across modules: the strings, paths and modules a summarized expression can be, with parameters followed through every visible caller.
 
 use std::cell::Cell;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use prober_core::files::RepoPath;
 
 use crate::conventions::{PACKAGE_INIT, join_directory, parent_directory, split_path};
 use crate::modules::ModuleIndex;
-use crate::summary::{CallSite, Expr, FunctionIndex, ModuleRef, ModuleSummary, Site, SiteKind};
+use crate::summary::{CallSite, Expr, FunctionIndex, ModuleRef, ModuleSummary, Site};
 
 const MAX_ALTERNATIVES: usize = 32;
 
@@ -23,8 +23,6 @@ const MAX_EXPANSIONS: usize = 50_000;
 const MAX_EVALUATION_STEPS: usize = 20_000;
 
 const MAX_SITE_STEPS: usize = 1_000_000;
-
-const RECEIVERS: [&str; 2] = ["self", "cls"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FunctionRef<'s> {
@@ -95,10 +93,7 @@ pub(crate) struct Evaluator<'s> {
     summaries: &'s HashMap<RepoPath, ModuleSummary>,
     index: &'s ModuleIndex,
     callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>>,
-    method_names: HashMap<FunctionRef<'s>, (&'s str, usize)>,
-    callers_by_name: HashMap<(&'s str, usize), Vec<CallerRef<'s>>>,
     escaping: HashSet<FunctionRef<'s>>,
-    escaping_by_name: HashSet<FunctionRef<'s>>,
     steps: Cell<usize>,
     site_steps: Cell<usize>,
 }
@@ -109,67 +104,31 @@ impl<'s> Evaluator<'s> {
             summaries,
             index,
             callers: HashMap::new(),
-            method_names: HashMap::new(),
-            callers_by_name: HashMap::new(),
             escaping: HashSet::new(),
-            escaping_by_name: HashSet::new(),
             steps: Cell::new(0),
             site_steps: Cell::new(0),
         };
         let mut callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>> = HashMap::new();
         let mut escaping = HashSet::new();
-        let mut escaping_by_name = HashSet::new();
         let unresolved_attributes: HashSet<&str> = summaries
             .values()
             .flat_map(|summary| &summary.unresolved_attributes)
             .map(String::as_str)
             .collect();
-        let referenced_attributes: HashSet<&str> = summaries
-            .values()
-            .flat_map(|summary| &summary.referenced_attributes)
-            .map(String::as_str)
-            .collect();
-        let mut method_names: HashMap<FunctionRef<'s>, (&'s str, usize)> = HashMap::new();
-        let mut shifts: HashMap<&'s str, BTreeSet<usize>> = HashMap::new();
-        let mut callers_by_name: HashMap<(&'s str, usize), Vec<CallerRef<'s>>> = HashMap::new();
+
         let mut modules: Vec<(&'s RepoPath, &'s ModuleSummary)> = summaries.iter().collect();
 
         modules.sort_by_key(|(module, _)| *module);
 
         for &(module, summary) in &modules {
             for (index, function) in summary.functions.iter().enumerate() {
-                let name = function.name.as_str();
-                let reachable_by_attribute = unresolved_attributes.contains(name);
-                let escapes_by_name = match &function.class {
-                    Some(_) => {
-                        function.nested || referenced_attributes.contains(name) || is_special(name)
-                    }
-                    None => reachable_by_attribute,
-                };
+                let reachable_by_attribute = unresolved_attributes.contains(function.name.as_str());
 
                 if function.escapes || function.class.is_some() || reachable_by_attribute {
                     escaping.insert(FunctionRef { module, index });
                 }
-
-                if function.escapes || escapes_by_name {
-                    escaping_by_name.insert(FunctionRef { module, index });
-                }
-
-                if function.class.is_some() && !function.nested {
-                    let receiver_shift = usize::from(
-                        function
-                            .parameters
-                            .first()
-                            .is_some_and(|first| RECEIVERS.contains(&first.as_str())),
-                    );
-
-                    method_names.insert(FunctionRef { module, index }, (name, receiver_shift));
-                    shifts.entry(name).or_default().insert(receiver_shift);
-                }
             }
-        }
 
-        for &(module, summary) in &modules {
             for call in &summary.calls {
                 if let Some((function, receiver_shift)) = evaluator.callee(module, &call.callee) {
                     callers.entry(function).or_default().push(CallerRef {
@@ -180,50 +139,15 @@ impl<'s> Evaluator<'s> {
                 }
             }
 
-            let named_calls = summary
-                .calls
-                .iter()
-                .filter_map(|call| match &call.callee {
-                    Expr::Method { name, .. } => Some((name.as_str(), call)),
-                    _ => None,
-                })
-                .chain(
-                    summary
-                        .method_calls
-                        .iter()
-                        .map(|(name, call)| (name.as_str(), call)),
-                );
-
-            for (name, call) in named_calls {
-                let Some((&name, method_shifts)) = shifts.get_key_value(name) else {
-                    continue;
-                };
-
-                for &receiver_shift in method_shifts {
-                    callers_by_name
-                        .entry((name, receiver_shift))
-                        .or_default()
-                        .push(CallerRef {
-                            module,
-                            call,
-                            receiver_shift,
-                        });
-                }
-            }
-
             for escape in &summary.escapes {
                 if let Some((function, _)) = evaluator.callee(module, escape) {
                     escaping.insert(function);
-                    escaping_by_name.insert(function);
                 }
             }
         }
 
         evaluator.callers = callers;
-        evaluator.method_names = method_names;
-        evaluator.callers_by_name = callers_by_name;
         evaluator.escaping = escaping;
-        evaluator.escaping_by_name = escaping_by_name;
 
         evaluator
     }
@@ -295,25 +219,12 @@ impl<'s> Evaluator<'s> {
 
             return;
         };
-        let by_attribute = site.kind == SiteKind::Attribute;
-        let escaping = if by_attribute {
-            &self.escaping_by_name
-        } else {
-            &self.escaping
-        };
-        let explicit = self.callers.get(&function).map_or(&[][..], Vec::as_slice);
-        let by_name = self
-            .method_names
-            .get(&function)
-            .filter(|_| by_attribute)
-            .and_then(|key| self.callers_by_name.get(key))
-            .map_or(&[][..], Vec::as_slice);
-        let caller_count = explicit.len() + by_name.len();
+        let callers = self.callers.get(&function).map_or(&[][..], Vec::as_slice);
         let can_expand = chain.len() < MAX_CALLER_DEPTH
-            && caller_count > 0
-            && *expansions + caller_count <= MAX_EXPANSIONS;
+            && !callers.is_empty()
+            && *expansions + callers.len() <= MAX_EXPANSIONS;
 
-        if !can_expand || escaping.contains(&function) {
+        if !can_expand || self.escaping.contains(&function) {
             results.push(SiteValue { reader, value });
         }
 
@@ -321,7 +232,7 @@ impl<'s> Evaluator<'s> {
             return;
         }
 
-        for caller in explicit.iter().chain(by_name) {
+        for caller in callers {
             let mut extended = chain.clone();
 
             extended.push(caller);
@@ -1131,10 +1042,6 @@ fn with_suffix(path: &Pattern, suffix: &Pattern) -> Pattern {
     }
 
     Pattern(parts).concatenated(suffix)
-}
-
-fn is_special(name: &str) -> bool {
-    name.len() > 4 && name.starts_with("__") && name.ends_with("__")
 }
 
 #[cfg(test)]

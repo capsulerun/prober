@@ -53,27 +53,10 @@ pub(crate) struct ClassHeader {
     pub init_subclass: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Member {
-    pub class: usize,
-    pub keys: Vec<String>,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct Attributes {
-    pub read: BTreeSet<String>,
-    pub read_on_self: BTreeSet<String>,
-    pub written: BTreeSet<String>,
-    pub computed: bool,
-    pub computed_on_self: bool,
-    pub computed_on_argument: bool,
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Namespace {
     pub reads: bool,
     pub writes: bool,
-    pub writes_through_class: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -84,14 +67,12 @@ pub(crate) struct LocalSymbol {
     pub hash: u64,
     pub uses: BTreeSet<Use>,
     pub imports: BTreeMap<String, Vec<Imported>>,
-    pub attributes: Attributes,
     pub namespace: Namespace,
     pub decoration: Decoration,
     pub decorators: Vec<Option<Use>>,
     pub stores_argument: bool,
     pub calls_at_load: bool,
     pub class: Option<ClassHeader>,
-    pub member: Option<Member>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

@@ -1,11 +1,11 @@
-//! The symbols of one module: load-time code, top-level functions, classes and variables with their fingerprints, the names each uses, and what the module's names are bound to.
+//! The symbols of one module: load-time code and top-level functions, classes and variables with their fingerprints, the names each uses, and what the module's names are bound to.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use prober_core::files::RepoPath;
 use prober_core::symbols::{FallbackCause, LineRange, MODULE_INIT_NAME, SymbolKind};
-use ruff_python_ast::comparable::{ComparableExpr, ComparableStmt};
+use ruff_python_ast::comparable::ComparableStmt;
 use ruff_python_ast::visitor::{self, Visitor};
 use ruff_python_ast::{self as ast, Expr, ExprContext, ModModule, Stmt};
 use ruff_text_size::{Ranged, TextSize};
@@ -14,8 +14,7 @@ use crate::conventions::{is_standard_library, join_directory};
 use crate::modules::ModuleIndex;
 use crate::pytest::items::PytestItems;
 use crate::symbols::{
-    Attributes, Binding, ClassHeader, Decoration, Imported, LocalSymbol, Member, ModuleSymbols,
-    Namespace, Target, Use,
+    Binding, ClassHeader, Decoration, Imported, LocalSymbol, ModuleSymbols, Namespace, Target, Use,
 };
 
 const PLAIN_DECORATORS: [&str; 27] = [
@@ -93,9 +92,9 @@ const NAMESPACE_CALLS: [&str; 3] = ["globals", "locals", "vars"];
 
 const LAZY_ATTRIBUTE_FUNCTIONS: [&str; 2] = ["__getattr__", "__dir__"];
 
-const PROXY_METHODS: [&str; 2] = ["__getattr__", "__getattribute__"];
-
 const RECEIVERS: [&str; 2] = ["self", "cls"];
+
+const CLASS_BODY: &str = "<body>";
 
 pub(crate) fn extract_symbols(
     module: &ModModule,
@@ -120,14 +119,12 @@ pub(crate) fn extract_symbols(
             hash: 0,
             uses: BTreeSet::new(),
             imports: BTreeMap::new(),
-            attributes: Attributes::default(),
             namespace: Namespace::default(),
             decoration: Decoration::Plain,
             decorators: Vec::new(),
             stores_argument: false,
             calls_at_load: false,
             class: None,
-            member: None,
         }],
         names: BTreeMap::new(),
         star_imports: Vec::new(),
@@ -184,7 +181,6 @@ struct Extractor<'e> {
 struct Collected {
     uses: BTreeSet<Use>,
     imports: BTreeMap<String, Vec<Imported>>,
-    attributes: Attributes,
     namespace: Namespace,
     namespace_escapes: bool,
     globals: BTreeSet<String>,
@@ -193,9 +189,8 @@ struct Collected {
 }
 
 #[derive(Default)]
-struct CollectScope<'s> {
-    class_name: Option<&'s str>,
-    arguments: BTreeSet<String>,
+struct CollectScope {
+    in_class: bool,
     lazy_attributes: bool,
 }
 
@@ -206,7 +201,6 @@ struct Definition {
     hash: u64,
     decoration: Decoration,
     class: Option<ClassHeader>,
-    member: Option<Member>,
     value: bool,
     decorators: Vec<Option<Use>>,
     stores_argument: bool,
@@ -235,20 +229,10 @@ impl Extractor<'_> {
         scope: CollectScope,
         visit: impl FnOnce(&mut Collector<'_, '_>),
     ) -> Collected {
-        let self_like = match scope.class_name {
-            Some(_) => RECEIVERS
-                .iter()
-                .map(|receiver| (*receiver).to_owned())
-                .collect(),
-            None => BTreeSet::new(),
-        };
         let mut collector = Collector {
             extractor: self,
             collected: Collected::default(),
-            forwarded: Vec::new(),
-            self_like,
-            class_name: scope.class_name.map(str::to_owned),
-            arguments: scope.arguments,
+            in_class: scope.in_class,
             lazy_attributes: scope.lazy_attributes,
             namespace_aliases: BTreeSet::new(),
         };
@@ -281,12 +265,7 @@ impl Extractor<'_> {
                     ),
                 };
                 let scope = CollectScope {
-                    class_name: None,
-                    arguments: definition
-                        .parameters
-                        .iter()
-                        .map(|parameter| parameter.name().as_str().to_owned())
-                        .collect(),
+                    in_class: false,
                     lazy_attributes: LAZY_ATTRIBUTE_FUNCTIONS.contains(&definition.name.as_str()),
                 };
                 let collected = self.collect_in(scope, |collector| collector.visit_stmt(statement));
@@ -299,7 +278,6 @@ impl Extractor<'_> {
                         hash: statement_hash(statement),
                         decoration,
                         class: None,
-                        member: None,
                         value: false,
                         decorators,
                         stores_argument: stores_argument(statement),
@@ -359,7 +337,6 @@ impl Extractor<'_> {
         let Collected {
             uses,
             imports,
-            attributes,
             namespace,
             namespace_escapes,
             globals,
@@ -379,13 +356,11 @@ impl Extractor<'_> {
             hash: definition.hash,
             uses,
             imports,
-            attributes,
             namespace,
             decoration: definition.decoration,
             decorators: definition.decorators,
             stores_argument: definition.stores_argument,
             class: definition.class,
-            member: definition.member,
         };
         let index = match self.by_name.get(&symbol.name) {
             Some(&index) => {
@@ -424,7 +399,6 @@ impl Extractor<'_> {
                 hash: statement_hash(statement),
                 decoration: Decoration::Plain,
                 class: None,
-                member: None,
                 value: true,
                 decorators: Vec::new(),
                 stores_argument: false,
@@ -436,11 +410,11 @@ impl Extractor<'_> {
 
     fn define_class(&mut self, definition: &ast::StmtClassDef, statement: &Stmt) {
         let class_name = definition.name.as_str();
-        let (members, content): (Vec<&Stmt>, Vec<&Stmt>) = definition
-            .body
-            .iter()
-            .partition(|member| member_keys(member).is_some());
-        let collected = self.collect(|collector| {
+        let scope = CollectScope {
+            in_class: true,
+            lazy_attributes: false,
+        };
+        let collected = self.collect_in(scope, |collector| {
             for decorator in &definition.decorator_list {
                 collector.visit_expr(&decorator.expression);
             }
@@ -449,87 +423,79 @@ impl Extractor<'_> {
                 collector.visit_arguments(arguments);
             }
 
-            for statement in &content {
-                collector.visit_stmt(statement);
-            }
+            collector.visit_body(&definition.body);
         });
-        let mut hasher = DefaultHasher::new();
+        let (decoration, decorators) = decoration(&definition.decorator_list);
 
-        class_name.hash(&mut hasher);
-
-        for decorator in &definition.decorator_list {
-            ComparableExpr::from(&decorator.expression).hash(&mut hasher);
-        }
-
-        if let Some(arguments) = &definition.arguments {
-            for base in &arguments.args {
-                ComparableExpr::from(base).hash(&mut hasher);
-            }
-
-            for keyword in &arguments.keywords {
-                keyword
-                    .arg
-                    .as_ref()
-                    .map(|arg| arg.as_str())
-                    .hash(&mut hasher);
-                ComparableExpr::from(&keyword.value).hash(&mut hasher);
-            }
-        }
-
-        for statement in &content {
-            ComparableStmt::from(*statement).hash(&mut hasher);
-        }
-
-        let member_lines: Vec<LineRange> =
-            members.iter().map(|member| self.lines(*member)).collect();
-        let (class_decoration, class_decorators) = decoration(&definition.decorator_list);
-        let class = self.define(
+        self.define(
             Definition {
                 name: class_name.to_owned(),
                 kind: SymbolKind::Class,
-                lines: ranges_without(self.lines(statement), &member_lines),
-                hash: hasher.finish(),
-                decoration: class_decoration,
+                lines: vec![self.lines(statement)],
+                hash: statement_hash(statement),
+                decoration,
                 class: Some(class_header(definition)),
-                member: None,
                 value: false,
-                decorators: class_decorators,
+                decorators,
                 stores_argument: false,
             },
             collected,
             &[class_name],
         );
 
-        for member in members {
-            let keys = member_keys(member).expect("members have keys");
-            let (decoration, decorators) = match member {
-                Stmt::FunctionDef(function) => decoration(&function.decorator_list),
-                Stmt::ClassDef(nested) => decoration(&nested.decorator_list),
-                _ => (Decoration::Plain, Vec::new()),
-            };
-            let scope = CollectScope {
-                class_name: Some(class_name),
-                ..CollectScope::default()
-            };
-            let collected = self.collect_in(scope, |collector| collector.visit_stmt(member));
-
-            self.define(
-                Definition {
-                    name: format!("{class_name}.{}", keys[0]),
-                    kind: SymbolKind::Member,
-                    lines: vec![self.lines(member)],
-                    hash: statement_hash(member),
-                    decoration,
-                    class: None,
-                    member: Some(Member { class, keys }),
-                    value: matches!(member, Stmt::Assign(_)),
-                    decorators,
-                    stores_argument: stores_argument(member),
-                },
-                collected,
-                &[],
-            );
+        for member in &definition.body {
+            self.define_member(class_name, member);
         }
+    }
+
+    fn define_member(&mut self, class_name: &str, statement: &Stmt) {
+        let (name, decoration, decorators) = match statement {
+            Stmt::FunctionDef(member) => {
+                let (decoration, decorators) = decoration(&member.decorator_list);
+
+                (member.name.as_str().to_owned(), decoration, decorators)
+            }
+            Stmt::ClassDef(member) => {
+                let (decoration, decorators) = decoration(&member.decorator_list);
+
+                (member.name.as_str().to_owned(), decoration, decorators)
+            }
+            Stmt::Assign(assign) if let Some(names) = target_names(&assign.targets) => {
+                (names[0].clone(), Decoration::Plain, Vec::new())
+            }
+            Stmt::AnnAssign(assign)
+                if let Some(names) = target_names(std::slice::from_ref(assign.target.as_ref())) =>
+            {
+                (names[0].clone(), Decoration::Plain, Vec::new())
+            }
+            _ => (CLASS_BODY.to_owned(), Decoration::Plain, Vec::new()),
+        };
+        let value = !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_));
+        let scope = CollectScope {
+            in_class: true,
+            lazy_attributes: false,
+        };
+        let collected = self.collect_in(scope, |collector| collector.visit_stmt(statement));
+
+        if decoration == Decoration::Plain && !(value && collected.calls) {
+            return;
+        }
+
+        self.define(
+            Definition {
+                name: format!("{class_name}.{name}"),
+                kind: SymbolKind::Member,
+                lines: vec![self.lines(statement)],
+                hash: statement_hash(statement),
+                decoration,
+                class: None,
+                value,
+                decorators,
+                stores_argument: false,
+            },
+            collected,
+            &[],
+        );
     }
 
     fn init_statement(&mut self, statement: &Stmt) {
@@ -538,7 +504,6 @@ impl Extractor<'_> {
         let Collected {
             uses,
             imports,
-            attributes,
             namespace,
             namespace_escapes,
             globals,
@@ -556,12 +521,6 @@ impl Extractor<'_> {
         init.namespace.writes |= namespace.writes;
 
         init.uses.extend(uses);
-        init.attributes.read.extend(attributes.read);
-        init.attributes.read_on_self.extend(attributes.read_on_self);
-        init.attributes.written.extend(attributes.written);
-        init.attributes.computed |= attributes.computed;
-        init.attributes.computed_on_self |= attributes.computed_on_self;
-        init.attributes.computed_on_argument |= attributes.computed_on_argument;
 
         for (name, imported) in imports {
             for imported in imported {
@@ -705,18 +664,8 @@ fn merge(symbol: &mut LocalSymbol, other: LocalSymbol) {
     symbol.hash = hasher.finish();
     symbol.lines.extend(other.lines);
     symbol.uses.extend(other.uses);
-    symbol.attributes.read.extend(other.attributes.read);
-    symbol
-        .attributes
-        .read_on_self
-        .extend(other.attributes.read_on_self);
-    symbol.attributes.written.extend(other.attributes.written);
-    symbol.attributes.computed |= other.attributes.computed;
-    symbol.attributes.computed_on_self |= other.attributes.computed_on_self;
-    symbol.attributes.computed_on_argument |= other.attributes.computed_on_argument;
     symbol.namespace.reads |= other.namespace.reads;
     symbol.namespace.writes |= other.namespace.writes;
-    symbol.namespace.writes_through_class |= other.namespace.writes_through_class;
 
     for (name, imported) in other.imports {
         symbol.imports.entry(name).or_default().extend(imported);
@@ -728,17 +677,13 @@ fn merge(symbol: &mut LocalSymbol, other: LocalSymbol) {
 
     symbol.decorators.extend(other.decorators);
     symbol.stores_argument |= other.stores_argument;
-
     symbol.calls_at_load |= other.calls_at_load;
 }
 
 struct Collector<'c, 'e> {
     extractor: &'c Extractor<'e>,
     collected: Collected,
-    forwarded: Vec<BTreeSet<String>>,
-    self_like: BTreeSet<String>,
-    class_name: Option<String>,
-    arguments: BTreeSet<String>,
+    in_class: bool,
     lazy_attributes: bool,
     namespace_aliases: BTreeSet<String>,
 }
@@ -751,57 +696,6 @@ impl Collector<'_, '_> {
             if !imports.contains(&imported) {
                 imports.push(imported);
             }
-        }
-    }
-
-    fn read_chain(&mut self, chain: Use) {
-        let attributes = &mut self.collected.attributes;
-
-        if let Some((first, rest)) = chain.attributes.split_first() {
-            if self.self_like.contains(&chain.name) {
-                attributes.read_on_self.insert(first.clone());
-            } else {
-                attributes.read.insert(first.clone());
-            }
-
-            attributes.read.extend(rest.iter().cloned());
-        }
-
-        self.collected.uses.insert(chain);
-    }
-
-    fn is_self(&self, expression: &Expr) -> bool {
-        match expression {
-            Expr::Name(name) => self.self_like.contains(name.id.as_str()),
-            Expr::Call(call) => {
-                self.class_name.is_some()
-                    && matches!(call.func.as_ref(), Expr::Name(callee) if callee.id.as_str() == "super")
-            }
-            _ => false,
-        }
-    }
-
-    fn constructs_self(&self, value: &Expr) -> bool {
-        let Expr::Call(call) = value else {
-            return self.is_self(value);
-        };
-
-        match call.func.as_ref() {
-            Expr::Name(callee) => {
-                self.is_self(&call.func) || self.class_name.as_deref() == Some(callee.id.as_str())
-            }
-            Expr::Call(inner) => {
-                dotted_name(&inner.func) == "type"
-                    && inner
-                        .arguments
-                        .args
-                        .first()
-                        .is_some_and(|argument| self.is_self(argument))
-            }
-            Expr::Attribute(attribute) => {
-                attribute.attr.as_str() == "__class__" && self.is_self(&attribute.value)
-            }
-            _ => false,
         }
     }
 
@@ -819,60 +713,6 @@ impl Collector<'_, '_> {
     fn namespace_write(&mut self) {
         if !self.lazy_attributes {
             self.collected.namespace.writes = true;
-        }
-    }
-
-    fn call(&mut self, call: &ast::ExprCall) {
-        let callee = dotted_name(&call.func);
-        let last = callee.rsplit('.').next().unwrap_or_default();
-        let writes = matches!(last, "setattr" | "delattr");
-        let name_argument = match last {
-            "getattr" | "hasattr" | "setattr" | "delattr" => call.arguments.args.get(1),
-            "attrgetter" | "methodcaller" => call.arguments.args.first(),
-            "getmembers" => {
-                self.collected.attributes.computed = true;
-
-                return;
-            }
-            _ => return,
-        };
-        let Some(name_argument) = name_argument else {
-            return;
-        };
-        let Expr::StringLiteral(literal) = name_argument else {
-            let forwards = matches!(
-                name_argument,
-                Expr::Name(name) if self.forwarded.last().is_some_and(|forwarded| forwarded.contains(name.id.as_str()))
-            );
-            let receiver = call
-                .arguments
-                .args
-                .first()
-                .filter(|_| matches!(last, "getattr" | "hasattr"));
-            let on_self = receiver.is_some_and(|receiver| self.is_self(receiver));
-            let on_argument = receiver.is_some_and(|receiver| {
-                matches!(receiver, Expr::Name(name) if self.arguments.contains(name.id.as_str()))
-            });
-            let attributes = &mut self.collected.attributes;
-
-            if !writes && !forwards {
-                if on_self {
-                    attributes.computed_on_self = true;
-                } else if on_argument {
-                    attributes.computed_on_argument = true;
-                } else {
-                    attributes.computed = true;
-                }
-            }
-
-            return;
-        };
-        let names = literal.value.to_str().split('.').map(str::to_owned);
-
-        if writes {
-            self.collected.attributes.written.extend(names);
-        } else {
-            self.collected.attributes.read.extend(names);
         }
     }
 }
@@ -899,20 +739,7 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
                 self.collected
                     .bound
                     .insert(definition.name.as_str().to_owned());
-
-                let forwarded = if PROXY_METHODS.contains(&definition.name.as_str()) {
-                    definition
-                        .parameters
-                        .iter_non_variadic_params()
-                        .map(|parameter| parameter.parameter.name.as_str().to_owned())
-                        .collect()
-                } else {
-                    BTreeSet::new()
-                };
-
-                self.forwarded.push(forwarded);
                 visitor::walk_stmt(self, statement);
-                self.forwarded.pop();
             }
             Stmt::ClassDef(definition) => {
                 self.collected
@@ -927,23 +754,14 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
                             self.namespace_aliases.insert(alias.id.as_str().to_owned());
                         }
                         Expr::Attribute(attribute)
-                            if self.class_name.is_some() && self.is_self(&attribute.value) =>
+                            if self.in_class
+                                && matches!(attribute.value.as_ref(), Expr::Name(receiver) if RECEIVERS.contains(&receiver.id.as_str())) =>
                         {
-                            self.collected.namespace.writes_through_class = true;
-                            self.visit_expr(target);
+                            self.namespace_write();
                         }
                         _ => self.collected.namespace_escapes = true,
                     }
                 }
-            }
-            Stmt::Assign(assign) => {
-                if let [Expr::Name(target)] = assign.targets.as_slice()
-                    && self.constructs_self(&assign.value)
-                {
-                    self.self_like.insert(target.id.as_str().to_owned());
-                }
-
-                visitor::walk_stmt(self, statement);
             }
             _ => visitor::walk_stmt(self, statement),
         }
@@ -1025,40 +843,14 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
                 }
                 _ => {}
             },
-            Expr::Attribute(attribute) => {
-                match (attribute.ctx, attribute_chain(&attribute.value)) {
-                    (ExprContext::Load, Some(_)) => {
-                        if let Some(chain) = attribute_chain(expression) {
-                            self.read_chain(chain);
-                        }
-                    }
-                    (context, receiver) => {
-                        let attribute_name = attribute.attr.as_str().to_owned();
-                        let on_self = self.is_self(&attribute.value);
-                        let attributes = &mut self.collected.attributes;
-
-                        match context {
-                            ExprContext::Load if on_self => {
-                                attributes.read_on_self.insert(attribute_name);
-                            }
-                            ExprContext::Load => {
-                                attributes.read.insert(attribute_name);
-                            }
-                            _ => {
-                                attributes.written.insert(attribute_name);
-                            }
-                        }
-
-                        match receiver {
-                            Some(receiver) => self.read_chain(receiver),
-                            None => visitor::walk_expr(self, expression),
-                        }
-                    }
+            Expr::Attribute(attribute) => match attribute_chain(expression) {
+                Some(chain) if attribute.ctx == ExprContext::Load => {
+                    self.collected.uses.insert(chain);
                 }
-            }
-            Expr::Call(call) => {
+                _ => visitor::walk_expr(self, expression),
+            },
+            Expr::Call(_) => {
                 self.collected.calls = true;
-                self.call(call);
                 visitor::walk_expr(self, expression);
             }
             Expr::Await(_) | Expr::Yield(_) | Expr::YieldFrom(_) => {
@@ -1375,15 +1167,6 @@ fn line_starts(source: &str) -> Vec<usize> {
     starts
 }
 
-fn member_keys(statement: &Stmt) -> Option<Vec<String>> {
-    match statement {
-        Stmt::FunctionDef(function) => Some(vec![function.name.as_str().to_owned()]),
-        Stmt::ClassDef(nested) => Some(vec![nested.name.as_str().to_owned()]),
-        Stmt::Assign(assign) => target_names(&assign.targets),
-        _ => None,
-    }
-}
-
 fn ranges_without(range: LineRange, taken: &[LineRange]) -> Vec<LineRange> {
     let mut ranges = Vec::new();
     let mut start = range.start;
@@ -1445,7 +1228,7 @@ mod tests {
     }
 
     #[test]
-    fn load_time_code_definitions_and_members_become_symbols() {
+    fn load_time_code_and_top_level_definitions_become_symbols() {
         let module = extract(
             "app/shapes.py",
             "import os\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from app.other import Other\n\nLIMIT = 3\nCACHE = os.getenv(\"CACHE\")\n\n\ndef area(side):\n    return side * LIMIT\n\n\nclass Square:\n    sides = 4\n\n    def perimeter(self):\n        return self.side * self.sides\n\n\nprint(area(2))\n\nif __name__ == \"__main__\":\n    area(1)\n",
@@ -1466,8 +1249,6 @@ mod tests {
                 ("CACHE", SymbolKind::Variable),
                 ("area", SymbolKind::Function),
                 ("Square", SymbolKind::Class),
-                ("Square.sides", SymbolKind::Member),
-                ("Square.perimeter", SymbolKind::Member),
             ]
         );
         assert!(!symbol(&module, "LIMIT").calls_at_load);
@@ -1488,9 +1269,42 @@ mod tests {
         }));
         assert!(!module.names.contains_key("Other"));
         assert_eq!(
-            symbol(&module, "Square.perimeter").attributes.read_on_self,
-            BTreeSet::from(["side".to_owned(), "sides".to_owned()])
+            symbol(&module, "Square").lines,
+            [LineRange { start: 15, end: 19 }]
         );
+    }
+
+    #[test]
+    fn class_members_acting_at_load_become_symbols_of_their_own() {
+        let module = extract(
+            "app/views.py",
+            "from app.web import named, route\n\n\nclass Views:\n    \"\"\"Pages.\"\"\"\n\n    title = named(\"views\")\n    size = 3\n\n    @route(\"/home\")\n    def home(self):\n        return \"home\"\n\n    @property\n    def helper(self):\n        return 1\n\n    named(title)\n",
+            &["app/__init__.py", "app/web.py"],
+        )
+        .unwrap();
+        let kinds: Vec<(&str, SymbolKind)> = module
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind))
+            .collect();
+
+        assert_eq!(
+            kinds,
+            [
+                (MODULE_INIT_NAME, SymbolKind::ModuleInit),
+                ("Views", SymbolKind::Class),
+                ("Views.title", SymbolKind::Member),
+                ("Views.home", SymbolKind::Member),
+                ("Views.<body>", SymbolKind::Member),
+            ]
+        );
+        assert!(symbol(&module, "Views.title").calls_at_load);
+        assert_eq!(
+            symbol(&module, "Views.home").decoration,
+            Decoration::Registering
+        );
+        assert!(!module.names.contains_key("Views.home"));
+        assert_eq!(module.symbol_at(12), 1);
     }
 
     #[test]
@@ -1537,28 +1351,6 @@ mod tests {
             [Target::Repo(RepoPath::new("pkg/extra.py").unwrap())]
         );
         assert_eq!(module.names["run"], [Binding::Local(1)]);
-    }
-
-    #[test]
-    fn computed_attributes_are_told_apart_by_their_receiver() {
-        let module = extract(
-            "lib.py",
-            "class Box:\n    def get(self, name):\n        return getattr(self, name)\n\n    def __getattr__(self, name):\n        return getattr(self._inner, name)\n\n\ndef walk(cls, name):\n    return getattr(cls, name)\n\n\ndef fetch(obj, name):\n    return getattr(obj.inner, name), getattr(obj, \"size\")\n",
-            &[],
-        )
-        .unwrap();
-
-        assert!(symbol(&module, "Box.get").attributes.computed_on_self);
-        assert_eq!(
-            symbol(&module, "Box.__getattr__").attributes,
-            Attributes {
-                read_on_self: BTreeSet::from(["_inner".to_owned()]),
-                ..Attributes::default()
-            }
-        );
-        assert!(symbol(&module, "walk").attributes.computed_on_argument);
-        assert!(symbol(&module, "fetch").attributes.computed);
-        assert!(symbol(&module, "fetch").attributes.read.contains("size"));
     }
 
     #[test]

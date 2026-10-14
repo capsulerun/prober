@@ -91,7 +91,6 @@ pub(crate) struct Linking<'l> {
     pub summaries: &'l HashMap<RepoPath, ModuleSummary>,
     pub tests: &'l BTreeSet<RepoPath>,
     pub settings: LinkSettings,
-    pub evaluator: &'l Evaluator<'l>,
 }
 
 impl Linking<'_> {
@@ -109,7 +108,7 @@ impl Linking<'_> {
             sorted_files: &sorted_files,
             index: self.index,
         };
-        let evaluator = self.evaluator;
+        let evaluator = Evaluator::new(self.summaries, self.index);
         let mut links = Links::default();
         let mut pending = Vec::new();
         let mut modules: Vec<&RepoPath> = self.summaries.keys().collect();
@@ -119,14 +118,10 @@ impl Linking<'_> {
         for &module in &modules {
             let summary = &self.summaries[module];
 
-            for site in summary
-                .sites
-                .iter()
-                .filter(|site| site.kind != SiteKind::Attribute)
-            {
+            for site in &summary.sites {
                 let enabled = match site.kind {
                     SiteKind::Import => self.settings.dynamic_imports,
-                    SiteKind::Path | SiteKind::Listing | SiteKind::Attribute => self.settings.files,
+                    SiteKind::Path | SiteKind::Listing => self.settings.files,
                 };
 
                 if !enabled {
@@ -161,7 +156,7 @@ impl Linking<'_> {
                             &mut links,
                             &mut pending,
                         ),
-                        SiteKind::Path | SiteKind::Listing | SiteKind::Attribute => {
+                        SiteKind::Path | SiteKind::Listing => {
                             resolution.path(&reading, &site_value.value, &mut links, &mut pending);
                         }
                     }

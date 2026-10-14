@@ -98,15 +98,8 @@ fn a_change_inside_one_function_selects_the_tests_calling_it_through_the_package
 }
 
 #[test]
-fn a_method_change_reaches_the_readers_of_its_name_and_a_constructor_every_user() {
+fn a_method_change_reaches_the_users_of_its_class() {
     let head = CORE.replace("len(self.rows)", "len(self.rows) + 0");
-
-    assert_eq!(
-        changed_tests(&frame(), "frame/core.py", CORE, &head),
-        ["tests/test_csv.py"]
-    );
-
-    let head = CORE.replace("self.rows = rows", "self.rows = list(rows)");
 
     assert_eq!(
         changed_tests(&frame(), "frame/core.py", CORE, &head),
@@ -135,6 +128,64 @@ fn a_registered_function_reaches_every_test_loading_its_module() {
             &PLUGINS.replace("text.lower()", "text.lower().strip()")
         ),
         ["tests/test_lower.py"]
+    );
+    assert_eq!(
+        changed_tests(
+            &frame(),
+            "frame/plugins.py",
+            PLUGINS,
+            &PLUGINS.replace("@register(\"upper\")\n", "")
+        ),
+        ["tests/test_lower.py", "tests/test_registry.py"]
+    );
+}
+
+#[test]
+fn registered_methods_and_class_attributes_computed_by_a_call_reach_every_loader() {
+    let routes = "from app.web import named, route\n\n\nclass Views:\n    title = named(\"views\")\n\n    @route(\"/home\")\n    def home(self):\n        return \"home\"\n\n    def helper(self):\n        return 1\n";
+    let project = TestProject::new(&[
+        ("app/__init__.py", ""),
+        (
+            "app/web.py",
+            "ROUTES = {}\nNAMES = []\n\n\ndef route(path):\n    def decorate(function):\n        ROUTES[path] = function\n        return function\n\n    return decorate\n\n\ndef named(name):\n    NAMES.append(name)\n\n    return name\n",
+        ),
+        ("app/routes.py", routes),
+        (
+            "tests/test_home.py",
+            "import app.routes\nfrom app.web import ROUTES\n\n\ndef test_home():\n    assert ROUTES[\"/home\"](None) == \"home\"\n",
+        ),
+        (
+            "tests/test_views.py",
+            "from app.routes import Views\n\n\ndef test_helper():\n    assert Views().helper() == 1\n",
+        ),
+    ]);
+
+    assert_eq!(
+        changed_tests(
+            &project,
+            "app/routes.py",
+            routes,
+            &routes.replace("return \"home\"", "return \"house\"")
+        ),
+        ["tests/test_home.py", "tests/test_views.py"]
+    );
+    assert_eq!(
+        changed_tests(
+            &project,
+            "app/routes.py",
+            routes,
+            &routes.replace("named(\"views\")", "named(\"pages\")")
+        ),
+        ["tests/test_home.py", "tests/test_views.py"]
+    );
+    assert_eq!(
+        changed_tests(
+            &project,
+            "app/routes.py",
+            routes,
+            &routes.replace("return 1", "return 2")
+        ),
+        ["tests/test_views.py"]
     );
 }
 
@@ -174,6 +225,37 @@ fn a_rebound_name_reaches_the_tests_using_it_through_the_package() {
     assert_eq!(
         changed_tests(&frame(), "frame/__init__.py", INIT, &head),
         ["tests/test_csv.py"]
+    );
+}
+
+#[test]
+fn an_import_added_to_a_module_reaches_its_readers_not_every_user_of_the_name() {
+    let report = "from app.format import title\n\n\ndef render():\n    return title(\"x\")\n";
+    let project = TestProject::new(&[
+        ("app/__init__.py", ""),
+        ("app/report.py", report),
+        (
+            "app/format.py",
+            "def title(text):\n    return text.title()\n\n\ndef upper(text):\n    return text.upper()\n",
+        ),
+        (
+            "tests/test_upper.py",
+            "from app.format import upper\n\n\ndef test_upper():\n    assert upper(\"a\") == \"A\"\n",
+        ),
+        (
+            "tests/test_render.py",
+            "from app.report import render\n\n\ndef test_render():\n    assert render() == \"X\"\n",
+        ),
+    ]);
+
+    assert!(
+        changed_tests(
+            &project,
+            "app/report.py",
+            report,
+            &report.replace("import title", "import title, upper")
+        )
+        .is_empty()
     );
 }
 
@@ -363,62 +445,5 @@ fn a_namespace_handed_to_other_code_is_analysed_at_file_level() {
                 "-> used whole at load by tests/test_beta.py (analysed at file level: globals() or sys.modules)",
             ],
         )])
-    );
-}
-
-#[test]
-fn a_class_decorator_walking_its_class_makes_only_that_class_whole() {
-    let shapes = "def dispatch(cls):\n    for name in dir(cls):\n        getattr(cls, name)\n\n    return cls\n\n\n@dispatch\nclass Square:\n    def area(self):\n        return 4\n\n\nclass Circle:\n    def area(self):\n        return 3\n";
-    let project = TestProject::new(&[
-        ("shapes.py", shapes),
-        (
-            "tests/test_square.py",
-            "from shapes import Square\n\n\ndef test_square():\n    assert Square()\n",
-        ),
-        (
-            "tests/test_circle.py",
-            "from shapes import Circle\n\n\ndef test_circle():\n    assert Circle()\n",
-        ),
-    ]);
-
-    assert_eq!(
-        changed_tests(
-            &project,
-            "shapes.py",
-            shapes,
-            &shapes.replace("return 4", "return 5")
-        ),
-        ["tests/test_square.py"]
-    );
-    assert!(
-        changed_tests(
-            &project,
-            "shapes.py",
-            shapes,
-            &shapes.replace("return 3", "return 2")
-        )
-        .is_empty()
-    );
-}
-
-#[test]
-fn a_computed_name_passed_as_a_literal_by_the_callers_of_a_method_reaches_only_that_name() {
-    let library = "class Frame:\n    def write(self):\n        return 1\n\n\nclass Series:\n    def __init__(self, s):\n        self._s = s\n\n    def _comp(self, other, op):\n        return getattr(self._s, op)(other)\n\n    def __eq__(self, other):\n        return self._comp(other, \"eq\")\n";
-    let project = TestProject::new(&[
-        ("library.py", library),
-        (
-            "tests/test_series.py",
-            "from library import Series\n\n\ndef test_eq():\n    assert Series(1) == Series(1)\n",
-        ),
-    ]);
-
-    assert!(
-        changed_tests(
-            &project,
-            "library.py",
-            library,
-            &library.replace("return 1", "return 2")
-        )
-        .is_empty()
     );
 }

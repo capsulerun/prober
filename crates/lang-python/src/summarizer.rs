@@ -75,13 +75,6 @@ const LISTING_FUNCTIONS: [&str; 6] = [
     "shutil.copytree",
 ];
 
-const ATTRIBUTE_FUNCTIONS: [&str; 4] = [
-    "builtins.getattr",
-    "builtins.hasattr",
-    "operator.attrgetter",
-    "operator.methodcaller",
-];
-
 const IMPORT_FUNCTIONS: [&str; 3] = [
     "importlib.import_module",
     "builtins.__import__",
@@ -101,16 +94,7 @@ const TRANSPARENT_DECORATORS: [&str; 10] = [
     "wraps",
 ];
 
-const BUILTINS: [&str; 8] = [
-    "open",
-    "__import__",
-    "str",
-    "repr",
-    "format",
-    "print",
-    "getattr",
-    "hasattr",
-];
+const BUILTINS: [&str; 6] = ["open", "__import__", "str", "repr", "format", "print"];
 
 type ScopeId = usize;
 
@@ -1109,17 +1093,6 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
                     self.add_site(call, SiteKind::Listing, value, None);
                 }
             }
-            Some(name) if ATTRIBUTE_FUNCTIONS.contains(&name) => {
-                let position = usize::from(matches!(name, "builtins.getattr" | "builtins.hasattr"));
-
-                if let Some(attribute) = arguments.args.get(position)
-                    && !matches!(attribute, AstExpr::StringLiteral(_))
-                {
-                    let value = summarizer.convert(attribute, scope, 0);
-
-                    self.add_site(call, SiteKind::Attribute, value, None);
-                }
-            }
             _ => {}
         }
 
@@ -1151,18 +1124,7 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
 
         match summarizer.function_reference(&call.func, scope) {
             Some(callee) => self.add_call(call, callee, &arguments.args, &arguments.keywords),
-            None => {
-                self.add_unresolved_attribute(&call.func);
-
-                if let AstExpr::Attribute(attribute) = call.func.as_ref() {
-                    let method_call =
-                        self.call_site(call, Expr::Unknown, &arguments.args, &arguments.keywords);
-
-                    self.summary
-                        .method_calls
-                        .push((attribute.attr.as_str().to_owned(), method_call));
-                }
-            }
+            None => self.add_unresolved_attribute(&call.func),
         }
 
         for (position, argument) in arguments.args.iter().enumerate() {
@@ -1186,22 +1148,10 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
         arguments: &'a [AstExpr],
         keywords: &'a [ast::Keyword],
     ) {
-        let call_site = self.call_site(call, callee, arguments, keywords);
-
-        self.summary.calls.push(call_site);
-    }
-
-    fn call_site(
-        &self,
-        call: &'a ast::ExprCall,
-        callee: Expr,
-        arguments: &'a [AstExpr],
-        keywords: &'a [ast::Keyword],
-    ) -> CallSite {
         let summarizer = self.summarizer;
         let scope = self.scope;
 
-        CallSite {
+        self.summary.calls.push(CallSite {
             line: summarizer.line(call.range().start()),
             unit: self.unit(),
             callee,
@@ -1213,7 +1163,7 @@ impl<'a> SummaryVisitor<'_, 'a, '_> {
                 })
                 .collect(),
             keywords: summarizer.keywords(keywords, scope, 0),
-        }
+        });
     }
 }
 
@@ -1282,12 +1232,6 @@ impl<'a> Visitor<'a> for SummaryVisitor<'_, 'a, '_> {
                 match summarizer.function_reference(expr, self.scope) {
                     Some(reference) => self.summary.escapes.push(reference),
                     None => self.add_unresolved_attribute(expr),
-                }
-
-                if let AstExpr::Attribute(attribute) = expr {
-                    self.summary
-                        .referenced_attributes
-                        .insert(attribute.attr.as_str().to_owned());
                 }
             }
             _ => {}

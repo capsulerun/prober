@@ -12,11 +12,7 @@ pub(crate) enum Changed {
         index: usize,
         kind: SymbolChangeKind,
     },
-    Removed {
-        name: String,
-        keys: Vec<String>,
-        class: Option<String>,
-    },
+    Removed(String),
     Binding(String),
 }
 
@@ -66,17 +62,9 @@ pub(crate) fn module_changes(
 
     changed.extend(
         base_names
-            .iter()
-            .filter(|(name, _)| !head_names.contains_key(*name))
-            .map(|(name, &index)| {
-                let member = base.symbols[index].member.as_ref();
-
-                Changed::Removed {
-                    name: (*name).to_owned(),
-                    keys: member.map(|member| member.keys.clone()).unwrap_or_default(),
-                    class: member.map(|member| base.symbols[member.class].name.clone()),
-                }
-            }),
+            .keys()
+            .filter(|name| !head_names.contains_key(*name))
+            .map(|name| Changed::Removed((*name).to_owned())),
     );
 
     let base_imports = import_bindings(base);
