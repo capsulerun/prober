@@ -91,6 +91,7 @@ pub(crate) struct Linking<'l> {
     pub summaries: &'l HashMap<RepoPath, ModuleSummary>,
     pub tests: &'l BTreeSet<RepoPath>,
     pub settings: LinkSettings,
+    pub evaluator: &'l Evaluator<'l>,
 }
 
 impl Linking<'_> {
@@ -108,7 +109,7 @@ impl Linking<'_> {
             sorted_files: &sorted_files,
             index: self.index,
         };
-        let evaluator = Evaluator::new(self.summaries, self.index);
+        let evaluator = self.evaluator;
         let mut links = Links::default();
         let mut pending = Vec::new();
         let mut modules: Vec<&RepoPath> = self.summaries.keys().collect();
@@ -598,46 +599,24 @@ impl Resolution<'_> {
             return Ok(());
         }
 
-        let mut builder = GlobSetBuilder::new();
-        let mut owners = Vec::new();
-
-        for (pending_index, pending_glob) in pending.iter().enumerate() {
-            for glob in &pending_glob.globs {
-                let Ok(glob) = GlobBuilder::new(glob).literal_separator(true).build() else {
-                    continue;
-                };
-
-                builder.add(glob);
-                owners.push(pending_index);
-            }
-        }
-
-        let glob_set = builder.build()?;
-        let mut matched: Vec<BTreeSet<&RepoPath>> = vec![BTreeSet::new(); pending.len()];
-
-        for &file in self.sorted_files {
-            for glob_index in glob_set.matches(file.as_str()) {
-                let pending_glob = &pending[owners[glob_index]];
-
-                if pending_glob.kind == EdgeKind::Dynamic && !is_module_file(file) {
-                    continue;
-                }
-
-                matched[owners[glob_index]].insert(file);
-            }
-        }
+        let matched = self.match_globs(&pending);
 
         for (pending_glob, matched) in pending.iter().zip(matched) {
-            let site = UnresolvedImport {
+            let site = |cause| UnresolvedImport {
                 module: pending_glob.site_module.clone(),
                 line: pending_glob.line,
                 expression: pending_glob.expression.clone(),
-                cause: UnresolvedCause::NoMatchingFile,
+                cause,
+            };
+            let Some(matched) = matched else {
+                links.unresolved.push(site(UnresolvedCause::TooWide));
+
+                continue;
             };
 
             if matched.is_empty() {
                 if pending_glob.kind == EdgeKind::Dynamic {
-                    links.unresolved.push(site);
+                    links.unresolved.push(site(UnresolvedCause::NoMatchingFile));
                 }
 
                 continue;
@@ -704,6 +683,68 @@ impl Resolution<'_> {
         }
 
         Ok(())
+    }
+
+    fn match_globs(&self, pending: &[PendingGlob]) -> Vec<Option<BTreeSet<&RepoPath>>> {
+        let all = pending
+            .iter()
+            .enumerate()
+            .flat_map(|(index, pending_glob)| {
+                pending_glob
+                    .globs
+                    .iter()
+                    .map(move |glob| (index, glob.as_str()))
+            });
+
+        if let Some(matched) = self.match_glob_set(pending, all) {
+            return matched.into_iter().map(Some).collect();
+        }
+
+        pending
+            .iter()
+            .enumerate()
+            .map(|(index, pending_glob)| {
+                let own = pending_glob.globs.iter().map(|glob| (index, glob.as_str()));
+
+                self.match_glob_set(pending, own)
+                    .map(|mut matched| std::mem::take(&mut matched[index]))
+            })
+            .collect()
+    }
+
+    fn match_glob_set<'g>(
+        &self,
+        pending: &[PendingGlob],
+        globs: impl Iterator<Item = (usize, &'g str)>,
+    ) -> Option<Vec<BTreeSet<&RepoPath>>> {
+        let mut builder = GlobSetBuilder::new();
+        let mut owners = Vec::new();
+
+        for (pending_index, glob) in globs {
+            let Ok(glob) = GlobBuilder::new(glob).literal_separator(true).build() else {
+                continue;
+            };
+
+            builder.add(glob);
+            owners.push(pending_index);
+        }
+
+        let glob_set = builder.build().ok()?;
+        let mut matched: Vec<BTreeSet<&RepoPath>> = vec![BTreeSet::new(); pending.len()];
+
+        for &file in self.sorted_files {
+            for glob_index in glob_set.matches(file.as_str()) {
+                let pending_glob = &pending[owners[glob_index]];
+
+                if pending_glob.kind == EdgeKind::Dynamic && !is_module_file(file) {
+                    continue;
+                }
+
+                matched[owners[glob_index]].insert(file);
+            }
+        }
+
+        Some(matched)
     }
 
     fn plugin_folders(

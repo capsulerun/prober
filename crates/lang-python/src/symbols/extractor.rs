@@ -15,7 +15,7 @@ use crate::modules::ModuleIndex;
 use crate::pytest::items::PytestItems;
 use crate::symbols::{
     Attributes, Binding, ClassHeader, Decoration, Imported, LocalSymbol, Member, ModuleSymbols,
-    Target, Use,
+    Namespace, Target, Use,
 };
 
 const PLAIN_DECORATORS: [&str; 27] = [
@@ -89,6 +89,8 @@ const EXECUTING_FUNCTIONS: [&str; 2] = ["exec", "eval"];
 
 const NAMESPACE_FUNCTION: &str = "globals";
 
+const NAMESPACE_CALLS: [&str; 3] = ["globals", "locals", "vars"];
+
 const LAZY_ATTRIBUTE_FUNCTIONS: [&str; 2] = ["__getattr__", "__dir__"];
 
 const PROXY_METHODS: [&str; 2] = ["__getattr__", "__getattribute__"];
@@ -119,6 +121,7 @@ pub(crate) fn extract_symbols(
             uses: BTreeSet::new(),
             imports: BTreeMap::new(),
             attributes: Attributes::default(),
+            namespace: Namespace::default(),
             decoration: Decoration::Plain,
             decorators: Vec::new(),
             stores_argument: false,
@@ -130,10 +133,15 @@ pub(crate) fn extract_symbols(
         star_imports: Vec::new(),
         by_name: HashMap::new(),
         init_hasher: DefaultHasher::new(),
+        fallback: None,
     };
 
     for statement in &module.body {
         extractor.top_level(statement);
+    }
+
+    if let Some(cause) = extractor.fallback {
+        return Err(cause);
     }
 
     let line_count = extractor.line(TextSize::of(source)).max(1);
@@ -169,6 +177,7 @@ struct Extractor<'e> {
     star_imports: Vec<Target>,
     by_name: HashMap<String, usize>,
     init_hasher: DefaultHasher,
+    fallback: Option<FallbackCause>,
 }
 
 #[derive(Default)]
@@ -176,9 +185,18 @@ struct Collected {
     uses: BTreeSet<Use>,
     imports: BTreeMap<String, Vec<Imported>>,
     attributes: Attributes,
+    namespace: Namespace,
+    namespace_escapes: bool,
     globals: BTreeSet<String>,
     bound: BTreeSet<String>,
     calls: bool,
+}
+
+#[derive(Default)]
+struct CollectScope<'s> {
+    class_name: Option<&'s str>,
+    arguments: BTreeSet<String>,
+    lazy_attributes: bool,
 }
 
 struct Definition {
@@ -209,23 +227,30 @@ impl Extractor<'_> {
     }
 
     fn collect(&self, visit: impl FnOnce(&mut Collector<'_, '_>)) -> Collected {
-        self.collect_in(None, visit)
+        self.collect_in(CollectScope::default(), visit)
     }
 
     fn collect_in(
         &self,
-        class_name: Option<&str>,
+        scope: CollectScope,
         visit: impl FnOnce(&mut Collector<'_, '_>),
     ) -> Collected {
+        let self_like = match scope.class_name {
+            Some(_) => RECEIVERS
+                .iter()
+                .map(|receiver| (*receiver).to_owned())
+                .collect(),
+            None => BTreeSet::new(),
+        };
         let mut collector = Collector {
             extractor: self,
             collected: Collected::default(),
             forwarded: Vec::new(),
-            self_like: RECEIVERS
-                .iter()
-                .map(|receiver| (*receiver).to_owned())
-                .collect(),
-            class_name: class_name.map(str::to_owned),
+            self_like,
+            class_name: scope.class_name.map(str::to_owned),
+            arguments: scope.arguments,
+            lazy_attributes: scope.lazy_attributes,
+            namespace_aliases: BTreeSet::new(),
         };
 
         visit(&mut collector);
@@ -255,7 +280,16 @@ impl Extractor<'_> {
                         decoration,
                     ),
                 };
-                let collected = self.collect(|collector| collector.visit_stmt(statement));
+                let scope = CollectScope {
+                    class_name: None,
+                    arguments: definition
+                        .parameters
+                        .iter()
+                        .map(|parameter| parameter.name().as_str().to_owned())
+                        .collect(),
+                    lazy_attributes: LAZY_ATTRIBUTE_FUNCTIONS.contains(&definition.name.as_str()),
+                };
+                let collected = self.collect_in(scope, |collector| collector.visit_stmt(statement));
 
                 self.define(
                     Definition {
@@ -326,10 +360,17 @@ impl Extractor<'_> {
             uses,
             imports,
             attributes,
+            namespace,
+            namespace_escapes,
             globals,
             calls,
             ..
         } = collected;
+
+        if namespace_escapes {
+            self.fallback.get_or_insert(FallbackCause::Namespace);
+        }
+
         let symbol = LocalSymbol {
             calls_at_load: definition.value && calls,
             name: definition.name,
@@ -339,6 +380,7 @@ impl Extractor<'_> {
             uses,
             imports,
             attributes,
+            namespace,
             decoration: definition.decoration,
             decorators: definition.decorators,
             stores_argument: definition.stores_argument,
@@ -465,8 +507,11 @@ impl Extractor<'_> {
                 Stmt::ClassDef(nested) => decoration(&nested.decorator_list),
                 _ => (Decoration::Plain, Vec::new()),
             };
-            let collected =
-                self.collect_in(Some(class_name), |collector| collector.visit_stmt(member));
+            let scope = CollectScope {
+                class_name: Some(class_name),
+                ..CollectScope::default()
+            };
+            let collected = self.collect_in(scope, |collector| collector.visit_stmt(member));
 
             self.define(
                 Definition {
@@ -494,11 +539,21 @@ impl Extractor<'_> {
             uses,
             imports,
             attributes,
+            namespace,
+            namespace_escapes,
             globals,
             bound,
             ..
         } = self.collect(|collector| collector.visit_stmt(statement));
+
+        if namespace_escapes {
+            self.fallback.get_or_insert(FallbackCause::Namespace);
+        }
+
         let init = &mut self.symbols[ModuleSymbols::INIT];
+
+        init.namespace.reads |= namespace.reads;
+        init.namespace.writes |= namespace.writes;
 
         init.uses.extend(uses);
         init.attributes.read.extend(attributes.read);
@@ -506,6 +561,7 @@ impl Extractor<'_> {
         init.attributes.written.extend(attributes.written);
         init.attributes.computed |= attributes.computed;
         init.attributes.computed_on_self |= attributes.computed_on_self;
+        init.attributes.computed_on_argument |= attributes.computed_on_argument;
 
         for (name, imported) in imports {
             for imported in imported {
@@ -657,6 +713,10 @@ fn merge(symbol: &mut LocalSymbol, other: LocalSymbol) {
     symbol.attributes.written.extend(other.attributes.written);
     symbol.attributes.computed |= other.attributes.computed;
     symbol.attributes.computed_on_self |= other.attributes.computed_on_self;
+    symbol.attributes.computed_on_argument |= other.attributes.computed_on_argument;
+    symbol.namespace.reads |= other.namespace.reads;
+    symbol.namespace.writes |= other.namespace.writes;
+    symbol.namespace.writes_through_class |= other.namespace.writes_through_class;
 
     for (name, imported) in other.imports {
         symbol.imports.entry(name).or_default().extend(imported);
@@ -678,6 +738,9 @@ struct Collector<'c, 'e> {
     forwarded: Vec<BTreeSet<String>>,
     self_like: BTreeSet<String>,
     class_name: Option<String>,
+    arguments: BTreeSet<String>,
+    lazy_attributes: bool,
+    namespace_aliases: BTreeSet<String>,
 }
 
 impl Collector<'_, '_> {
@@ -708,7 +771,14 @@ impl Collector<'_, '_> {
     }
 
     fn is_self(&self, expression: &Expr) -> bool {
-        matches!(expression, Expr::Name(name) if self.self_like.contains(name.id.as_str()))
+        match expression {
+            Expr::Name(name) => self.self_like.contains(name.id.as_str()),
+            Expr::Call(call) => {
+                self.class_name.is_some()
+                    && matches!(call.func.as_ref(), Expr::Name(callee) if callee.id.as_str() == "super")
+            }
+            _ => false,
+        }
     }
 
     fn constructs_self(&self, value: &Expr) -> bool {
@@ -735,6 +805,23 @@ impl Collector<'_, '_> {
         }
     }
 
+    fn is_namespace(&self, expression: &Expr) -> bool {
+        match expression {
+            Expr::Call(call) => {
+                call.arguments.args.is_empty()
+                    && matches!(call.func.as_ref(), Expr::Name(name) if name.id.as_str() == NAMESPACE_FUNCTION)
+            }
+            Expr::Name(name) => self.namespace_aliases.contains(name.id.as_str()),
+            _ => false,
+        }
+    }
+
+    fn namespace_write(&mut self) {
+        if !self.lazy_attributes {
+            self.collected.namespace.writes = true;
+        }
+    }
+
     fn call(&mut self, call: &ast::ExprCall) {
         let callee = dotted_name(&call.func);
         let last = callee.rsplit('.').next().unwrap_or_default();
@@ -757,18 +844,24 @@ impl Collector<'_, '_> {
                 name_argument,
                 Expr::Name(name) if self.forwarded.last().is_some_and(|forwarded| forwarded.contains(name.id.as_str()))
             );
-            let on_self = call
+            let receiver = call
                 .arguments
                 .args
                 .first()
-                .is_some_and(|receiver| self.is_self(receiver))
-                && matches!(last, "getattr" | "hasattr");
+                .filter(|_| matches!(last, "getattr" | "hasattr"));
+            let on_self = receiver.is_some_and(|receiver| self.is_self(receiver));
+            let on_argument = receiver.is_some_and(|receiver| {
+                matches!(receiver, Expr::Name(name) if self.arguments.contains(name.id.as_str()))
+            });
+            let attributes = &mut self.collected.attributes;
 
             if !writes && !forwards {
                 if on_self {
-                    self.collected.attributes.computed_on_self = true;
+                    attributes.computed_on_self = true;
+                } else if on_argument {
+                    attributes.computed_on_argument = true;
                 } else {
-                    self.collected.attributes.computed = true;
+                    attributes.computed = true;
                 }
             }
 
@@ -827,6 +920,22 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
                     .insert(definition.name.as_str().to_owned());
                 visitor::walk_stmt(self, statement);
             }
+            Stmt::Assign(assign) if self.is_namespace(&assign.value) => {
+                for target in &assign.targets {
+                    match target {
+                        Expr::Name(alias) => {
+                            self.namespace_aliases.insert(alias.id.as_str().to_owned());
+                        }
+                        Expr::Attribute(attribute)
+                            if self.class_name.is_some() && self.is_self(&attribute.value) =>
+                        {
+                            self.collected.namespace.writes_through_class = true;
+                            self.visit_expr(target);
+                        }
+                        _ => self.collected.namespace_escapes = true,
+                    }
+                }
+            }
             Stmt::Assign(assign) => {
                 if let [Expr::Name(target)] = assign.targets.as_slice()
                     && self.constructs_self(&assign.value)
@@ -842,6 +951,68 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
 
     fn visit_expr(&mut self, expression: &'a Expr) {
         match expression {
+            Expr::Subscript(subscript) if self.is_namespace(&subscript.value) => {
+                if subscript.ctx == ExprContext::Load {
+                    self.collected.namespace.reads = true;
+                } else {
+                    self.namespace_write();
+                }
+
+                self.visit_expr(&subscript.slice);
+            }
+            Expr::Call(call) if matches!(call.func.as_ref(), Expr::Attribute(method) if self.is_namespace(&method.value)) =>
+            {
+                let Expr::Attribute(method) = call.func.as_ref() else {
+                    return;
+                };
+
+                match method.attr.as_str() {
+                    "get" | "values" | "items" | "keys" | "copy" | "__contains__"
+                    | "__getitem__" => {
+                        self.collected.namespace.reads = true;
+                    }
+                    "update" | "setdefault" | "pop" | "popitem" | "clear" | "__setitem__"
+                    | "__delitem__" => self.namespace_write(),
+                    _ => self.collected.namespace_escapes = true,
+                }
+
+                self.collected.calls = true;
+
+                for argument in &call.arguments.args {
+                    self.visit_expr(argument);
+                }
+
+                for keyword in &call.arguments.keywords {
+                    self.visit_expr(&keyword.value);
+                }
+            }
+            Expr::Compare(compare)
+                if compare
+                    .operands
+                    .iter()
+                    .any(|operand| self.is_namespace(operand))
+                    && compare
+                        .ops
+                        .iter()
+                        .all(|op| matches!(op, ast::CmpOp::In | ast::CmpOp::NotIn)) =>
+            {
+                self.collected.namespace.reads = true;
+
+                for operand in &compare.operands {
+                    if !self.is_namespace(operand) {
+                        self.visit_expr(operand);
+                    }
+                }
+            }
+            Expr::Call(_) if self.is_namespace(expression) => {
+                self.collected.namespace_escapes = true;
+            }
+            Expr::Name(name)
+                if name.ctx == ExprContext::Load
+                    && self.namespace_aliases.contains(name.id.as_str()) =>
+            {
+                self.collected.namespace_escapes = true;
+            }
             Expr::Name(name) => match name.ctx {
                 ExprContext::Load => {
                     self.collected.uses.insert(Use {
@@ -900,28 +1071,16 @@ impl<'a> Visitor<'a> for Collector<'_, '_> {
 }
 
 fn fallback_cause(module: &ModModule) -> Option<FallbackCause> {
-    let mut cause = None;
+    let mut finder = FallbackFinder::default();
 
-    for statement in &module.body {
-        let lazy_attributes = matches!(
-            statement,
-            Stmt::FunctionDef(function) if LAZY_ATTRIBUTE_FUNCTIONS.contains(&function.name.as_str())
-        );
-        let mut finder = FallbackFinder {
-            cause: None,
-            lazy_attributes,
-        };
+    finder.visit_body(&module.body);
 
-        finder.visit_stmt(statement);
-        cause = cause.or(finder.cause);
-    }
-
-    cause
+    finder.cause
 }
 
+#[derive(Default)]
 struct FallbackFinder {
     cause: Option<FallbackCause>,
-    lazy_attributes: bool,
 }
 
 impl<'a> Visitor<'a> for FallbackFinder {
@@ -941,10 +1100,12 @@ impl<'a> Visitor<'a> for FallbackFinder {
         {
             let callee = callee.id.as_str();
 
-            if EXECUTING_FUNCTIONS.contains(&callee) {
+            let own_namespace = call.arguments.args.get(1).is_none_or(|namespace| {
+                matches!(namespace, Expr::Call(inner) if matches!(inner.func.as_ref(), Expr::Name(name) if NAMESPACE_CALLS.contains(&name.id.as_str())))
+            });
+
+            if EXECUTING_FUNCTIONS.contains(&callee) && own_namespace {
                 self.cause.get_or_insert(FallbackCause::Exec);
-            } else if callee == NAMESPACE_FUNCTION && !self.lazy_attributes {
-                self.cause.get_or_insert(FallbackCause::Namespace);
             }
         }
 
@@ -1249,4 +1410,192 @@ fn ranges_without(range: LineRange, taken: &[LineRange]) -> Vec<LineRange> {
     }
 
     ranges
+}
+
+#[cfg(test)]
+mod tests {
+    use ruff_python_ast::PySourceType;
+    use ruff_python_parser::parse_unchecked_source;
+
+    use super::*;
+    use crate::pytest::items::pytest_items;
+
+    fn extract(path: &str, source: &str, others: &[&str]) -> Result<ModuleSymbols, FallbackCause> {
+        let path = RepoPath::new(path).unwrap();
+        let mut repo_files: Vec<RepoPath> = others
+            .iter()
+            .map(|other| RepoPath::new(*other).unwrap())
+            .collect();
+
+        repo_files.push(path.clone());
+
+        let index = ModuleIndex::new(&repo_files, &|_| None);
+        let parsed = parse_unchecked_source(source, PySourceType::Python);
+        let items = pytest_items(parsed.syntax(), source);
+
+        extract_symbols(parsed.syntax(), source, &path, &index, &items)
+    }
+
+    fn symbol<'m>(module: &'m ModuleSymbols, name: &str) -> &'m LocalSymbol {
+        module
+            .symbols
+            .iter()
+            .find(|symbol| symbol.name == name)
+            .unwrap_or_else(|| panic!("no symbol {name}"))
+    }
+
+    #[test]
+    fn load_time_code_definitions_and_members_become_symbols() {
+        let module = extract(
+            "app/shapes.py",
+            "import os\nfrom typing import TYPE_CHECKING\n\nif TYPE_CHECKING:\n    from app.other import Other\n\nLIMIT = 3\nCACHE = os.getenv(\"CACHE\")\n\n\ndef area(side):\n    return side * LIMIT\n\n\nclass Square:\n    sides = 4\n\n    def perimeter(self):\n        return self.side * self.sides\n\n\nprint(area(2))\n\nif __name__ == \"__main__\":\n    area(1)\n",
+            &["app/__init__.py", "app/other.py"],
+        )
+        .unwrap();
+        let kinds: Vec<(&str, SymbolKind)> = module
+            .symbols
+            .iter()
+            .map(|symbol| (symbol.name.as_str(), symbol.kind))
+            .collect();
+
+        assert_eq!(
+            kinds,
+            [
+                (MODULE_INIT_NAME, SymbolKind::ModuleInit),
+                ("LIMIT", SymbolKind::Variable),
+                ("CACHE", SymbolKind::Variable),
+                ("area", SymbolKind::Function),
+                ("Square", SymbolKind::Class),
+                ("Square.sides", SymbolKind::Member),
+                ("Square.perimeter", SymbolKind::Member),
+            ]
+        );
+        assert!(!symbol(&module, "LIMIT").calls_at_load);
+        assert!(symbol(&module, "CACHE").calls_at_load);
+        assert_eq!(
+            symbol(&module, "area").lines,
+            [LineRange { start: 11, end: 12 }]
+        );
+        assert!(
+            symbol(&module, MODULE_INIT_NAME)
+                .lines
+                .iter()
+                .all(|lines| !lines.contains(12))
+        );
+        assert!(symbol(&module, MODULE_INIT_NAME).uses.contains(&Use {
+            name: "area".to_owned(),
+            attributes: Vec::new(),
+        }));
+        assert!(!module.names.contains_key("Other"));
+        assert_eq!(
+            symbol(&module, "Square.perimeter").attributes.read_on_self,
+            BTreeSet::from(["side".to_owned(), "sides".to_owned()])
+        );
+    }
+
+    #[test]
+    fn names_are_bound_to_definitions_imports_submodules_and_star_sources() {
+        let module = extract(
+            "pkg/api.py",
+            "import pkg.core\nfrom pkg.core import run as start\nfrom . import tools\nfrom pkg.extra import *\n\n\ndef run():\n    return start()\n",
+            &[
+                "pkg/__init__.py",
+                "pkg/core.py",
+                "pkg/tools.py",
+                "pkg/extra.py",
+            ],
+        )
+        .unwrap();
+        let core = Target::Repo(RepoPath::new("pkg/core.py").unwrap());
+        let package = Target::Repo(RepoPath::new("pkg/__init__.py").unwrap());
+
+        assert_eq!(
+            module.names["pkg"],
+            [Binding::Import(Imported::Module(package.clone()))]
+        );
+        assert_eq!(
+            module.names["start"],
+            [Binding::Import(Imported::Name {
+                module: core,
+                name: "run".to_owned(),
+            })]
+        );
+        assert_eq!(
+            module.names["tools"],
+            [
+                Binding::Import(Imported::Name {
+                    module: package,
+                    name: "tools".to_owned(),
+                }),
+                Binding::Import(Imported::Module(Target::Repo(
+                    RepoPath::new("pkg/tools.py").unwrap()
+                ))),
+            ]
+        );
+        assert_eq!(
+            module.star_imports,
+            [Target::Repo(RepoPath::new("pkg/extra.py").unwrap())]
+        );
+        assert_eq!(module.names["run"], [Binding::Local(1)]);
+    }
+
+    #[test]
+    fn computed_attributes_are_told_apart_by_their_receiver() {
+        let module = extract(
+            "lib.py",
+            "class Box:\n    def get(self, name):\n        return getattr(self, name)\n\n    def __getattr__(self, name):\n        return getattr(self._inner, name)\n\n\ndef walk(cls, name):\n    return getattr(cls, name)\n\n\ndef fetch(obj, name):\n    return getattr(obj.inner, name), getattr(obj, \"size\")\n",
+            &[],
+        )
+        .unwrap();
+
+        assert!(symbol(&module, "Box.get").attributes.computed_on_self);
+        assert_eq!(
+            symbol(&module, "Box.__getattr__").attributes,
+            Attributes {
+                read_on_self: BTreeSet::from(["_inner".to_owned()]),
+                ..Attributes::default()
+            }
+        );
+        assert!(symbol(&module, "walk").attributes.computed_on_argument);
+        assert!(symbol(&module, "fetch").attributes.computed);
+        assert!(symbol(&module, "fetch").attributes.read.contains("size"));
+    }
+
+    #[test]
+    fn dynamic_namespaces_are_tracked_or_fall_back() {
+        let analysed = |source: &str| extract("names.py", source, &[]);
+
+        assert_eq!(
+            analysed("exec(\"x = 1\")\n").unwrap_err(),
+            FallbackCause::Exec
+        );
+        assert!(analysed("exec(\"x = 1\", {})\n").is_ok());
+        assert_eq!(
+            analysed("from registry import fill\n\nfill(globals())\n").unwrap_err(),
+            FallbackCause::Namespace
+        );
+        assert_eq!(
+            analysed("import sys\n\nsys.modules[__name__] = object()\n").unwrap_err(),
+            FallbackCause::Namespace
+        );
+
+        let writes = analysed("def make(name):\n    globals()[name] = 1\n").unwrap();
+        let reads = analysed("def names():\n    return list(globals().values())\n").unwrap();
+
+        assert!(symbol(&writes, "make").namespace.writes);
+        assert!(symbol(&reads, "names").namespace.reads);
+    }
+
+    #[test]
+    fn decorators_storing_their_function_are_told_apart_from_wrappers() {
+        let module = extract(
+            "decorators.py",
+            "import functools\n\nREGISTRY = {}\n\n\ndef register(name):\n    def decorate(function):\n        REGISTRY[name] = function\n        return function\n\n    return decorate\n\n\ndef logged(function):\n    @functools.wraps(function)\n    def wrapper(*args):\n        return function(*args)\n\n    wrapper.__logged__ = True\n    return wrapper\n",
+            &[],
+        )
+        .unwrap();
+
+        assert!(symbol(&module, "register").stores_argument);
+        assert!(!symbol(&module, "logged").stores_argument);
+    }
 }

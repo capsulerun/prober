@@ -1,6 +1,7 @@
 //! Links the symbols of every analysed module: names followed through imports, re-exports, submodules and star imports to the symbols defining them, the modules each symbol loads, the definitions load-time code holds, and whole-module uses where a name cannot be followed.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::rc::Rc;
 
 use prober_core::files::{FileId, RepoPath};
 use prober_core::graph::{EdgeKind, GraphBuilder};
@@ -24,6 +25,12 @@ const PYTEST_NAMES: [&str; 2] = ["pytest", "collect_ignore"];
 const MODULE_GETATTR: &str = "__getattr__";
 
 const STAR_NAMES: &str = "__all__";
+
+const NAME_HUB_THRESHOLD: usize = 8;
+
+const ATTRIBUTES_NODE: &str = "<attributes read by name>";
+
+const ANY_ATTRIBUTE: &str = "any attribute";
 
 const PLAIN_STANDARD_BASES: [&str; 7] = [
     "object",
@@ -50,6 +57,7 @@ pub(crate) struct Analysis<'a> {
     pub providers: &'a HashSet<RepoPath>,
     pub module_edges: &'a HashMap<RepoPath, Vec<ModuleEdge>>,
     pub dependencies: &'a dyn Fn(&ImportTarget) -> Vec<RepoPath>,
+    pub evaluator: &'a Evaluator<'a>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -62,6 +70,94 @@ enum Reached {
         path: RepoPath,
         cause: WholeModuleCause,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum Definer {
+    Symbol { module: usize, symbol: usize },
+    Name(String),
+    Any,
+}
+
+#[derive(Default)]
+struct Hubs {
+    file: Option<FileId>,
+    names: HashMap<String, SymbolId>,
+    any: Option<SymbolId>,
+}
+
+impl Hubs {
+    fn file(&mut self, graph: &mut GraphBuilder) -> FileId {
+        *self.file.get_or_insert_with(|| {
+            graph.add_file(RepoPath::new(ATTRIBUTES_NODE).expect("a valid node name"))
+        })
+    }
+
+    fn hub(&mut self, name: String, graph: &mut GraphBuilder) -> SymbolId {
+        let file = self.file(graph);
+
+        graph.add_symbol(Symbol {
+            file,
+            name,
+            kind: SymbolKind::Member,
+            lines: Vec::new(),
+            hash: 0,
+        })
+    }
+
+    fn symbol(
+        &mut self,
+        definer: &Definer,
+        members: &Members,
+        ids: &[Vec<SymbolId>],
+        graph: &mut GraphBuilder,
+    ) -> SymbolId {
+        let (key, definers): (Option<String>, Vec<(usize, usize)>) = match definer {
+            Definer::Symbol { module, symbol } => return ids[*module][*symbol],
+            Definer::Name(key) => {
+                if let Some(&hub) = self.names.get(key) {
+                    return hub;
+                }
+
+                let definers = members
+                    .defining(key)
+                    .iter()
+                    .chain(members.writing(key))
+                    .copied()
+                    .collect();
+
+                (Some(key.clone()), definers)
+            }
+            Definer::Any => {
+                if let Some(hub) = self.any {
+                    return hub;
+                }
+
+                (None, members.all.clone())
+            }
+        };
+        let hub = match &key {
+            Some(key) => self.hub(format!(".{key}"), graph),
+            None => self.hub(ANY_ATTRIBUTE.to_owned(), graph),
+        };
+
+        for (module, symbol) in definers {
+            graph.add_symbol_edge(SymbolEdge {
+                dependent: hub,
+                dependency: SymbolTarget::Symbol(ids[module][symbol]),
+                kind: EdgeKind::Import,
+            });
+        }
+
+        match key {
+            Some(key) => {
+                self.names.insert(key, hub);
+            }
+            None => self.any = Some(hub),
+        }
+
+        hub
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -79,8 +175,12 @@ struct Resolver<'a> {
     in_progress: HashSet<(usize, Vec<String>)>,
     registering: HashMap<(usize, usize), bool>,
     class_level: HashMap<(usize, usize), bool>,
+    hierarchies: HashMap<(usize, usize), Rc<HashSet<(usize, usize)>>>,
+    self_reads: HashMap<(usize, String), Rc<Vec<Definer>>>,
+    reads: HashMap<String, Rc<Vec<Definer>>>,
     members: Members,
     computed_names: HashMap<(usize, usize), Vec<Pattern>>,
+    writers: HashMap<usize, Vec<usize>>,
 }
 
 #[derive(Default)]
@@ -91,6 +191,7 @@ struct Members {
     of_class: HashMap<(usize, usize), Vec<usize>>,
     parents: HashMap<(usize, usize), Vec<(usize, usize)>>,
     children: HashMap<(usize, usize), Vec<(usize, usize)>>,
+    keys: Vec<String>,
 }
 
 impl Members {
@@ -132,6 +233,15 @@ impl Members {
                 }
             }
         }
+
+        members.keys = members
+            .definers
+            .keys()
+            .chain(members.writers.keys())
+            .cloned()
+            .collect();
+        members.keys.sort_unstable();
+        members.keys.dedup();
 
         for definers in members
             .definers
@@ -219,17 +329,45 @@ impl Analysis<'_> {
             in_progress: HashSet::new(),
             registering: HashMap::new(),
             class_level: HashMap::new(),
+            hierarchies: HashMap::new(),
+            self_reads: HashMap::new(),
+            reads: HashMap::new(),
             members: Members::default(),
             computed_names: HashMap::new(),
+            writers: HashMap::new(),
         };
 
+        let timer = std::time::Instant::now();
         resolver.members = Members::index(&resolver.modules, self.tests);
+        eprintln!("TIMING members {:?}", timer.elapsed());
         resolver.index_classes();
+        eprintln!("TIMING classes {:?}", timer.elapsed());
+        resolver.index_namespace_writers();
         resolver.computed_names = self.computed_names(&resolver.modules);
+        eprintln!("TIMING computed {:?}", timer.elapsed());
+
+        let mut hubs = Hubs::default();
+        let mut uses_time = std::time::Duration::ZERO;
+        let mut definers_time = std::time::Duration::ZERO;
 
         for module in 0..resolver.modules.len() {
-            self.add_edges(&mut resolver, module, &ids, &files, graph);
+            self.add_edges(
+                &mut resolver,
+                &mut hubs,
+                module,
+                &ids,
+                &files,
+                graph,
+                &mut uses_time,
+                &mut definers_time,
+            );
         }
+        eprintln!(
+            "TIMING edges {:?} uses {:?} definers {:?}",
+            timer.elapsed(),
+            uses_time,
+            definers_time
+        );
 
         for module in 0..resolver.modules.len() {
             self.add_changes(&mut resolver, module, &ids, &files, graph);
@@ -263,10 +401,13 @@ impl Analysis<'_> {
     fn add_edges(
         &self,
         resolver: &mut Resolver,
+        hubs: &mut Hubs,
         module: usize,
         ids: &[Vec<SymbolId>],
         files: &[FileId],
         graph: &mut GraphBuilder,
+        uses_time: &mut std::time::Duration,
+        definers_time: &mut std::time::Duration,
     ) {
         let Module {
             path,
@@ -279,14 +420,58 @@ impl Analysis<'_> {
         for (symbol, local) in symbols.symbols.iter().enumerate() {
             let dependent = ids[module][symbol];
 
+            let mut passes_to_reflection = false;
+            let uses_timer = std::time::Instant::now();
+
             for symbol_use in &local.uses {
                 for reached in resolver.resolve_use(module, symbol, symbol_use) {
+                    if let Reached::Symbol {
+                        module: used_module,
+                        symbol: used,
+                    } = reached
+                        && resolver.reflects_on_argument(used_module, used)
+                        && !resolver
+                            .decorators_of(module, symbol)
+                            .contains(&(used_module, used))
+                    {
+                        passes_to_reflection = true;
+                    }
+
                     edges.add(dependent, reached, ids, files, graph);
                 }
             }
 
-            for reached in resolver.attribute_definers(module, symbol) {
-                edges.add(dependent, reached, ids, files, graph);
+            if passes_to_reflection {
+                let any = hubs.symbol(&Definer::Any, &resolver.members, ids, graph);
+
+                edges.add_symbol(dependent, any);
+            }
+
+            if local.namespace.reads {
+                let whole = Reached::Whole {
+                    path: path.clone(),
+                    cause: WholeModuleCause::EscapingNamespace,
+                };
+
+                edges.add(dependent, whole, ids, files, graph);
+            }
+
+            for writer in resolver.namespace_writers(module) {
+                if writer != (Reached::Symbol { module, symbol }) {
+                    edges.add(dependent, writer, ids, files, graph);
+                }
+            }
+
+            *uses_time += uses_timer.elapsed();
+            let definers_timer = std::time::Instant::now();
+            let found = resolver.attribute_definers(module, symbol);
+            *definers_time += definers_timer.elapsed();
+            for definer in found.iter().flat_map(|definers| definers.iter()) {
+                let dependency = hubs.symbol(definer, &resolver.members, ids, graph);
+
+                if dependency != dependent {
+                    edges.add_symbol(dependent, dependency);
+                }
             }
 
             if let Some(member) = &local.member {
@@ -356,7 +541,7 @@ impl Analysis<'_> {
             let file = graph.add_file(module_edge.dependency.clone());
 
             if !edges.covered.contains(&file) {
-                edges.edges.insert(SymbolEdge {
+                edges.edges.push(SymbolEdge {
                     dependent: init,
                     dependency: SymbolTarget::Module {
                         file,
@@ -367,13 +552,16 @@ impl Analysis<'_> {
             }
         }
 
+        edges.edges.sort_unstable();
+        edges.edges.dedup();
+
         for edge in edges.edges {
             graph.add_symbol_edge(edge);
         }
     }
 
     fn computed_names(&self, modules: &[Module]) -> HashMap<(usize, usize), Vec<Pattern>> {
-        let evaluator = Evaluator::new(self.summaries, self.index);
+        let evaluator = self.evaluator;
         let mut computed_names: HashMap<(usize, usize), Vec<Pattern>> = HashMap::new();
 
         for (module, analysed) in modules.iter().enumerate() {
@@ -387,7 +575,10 @@ impl Analysis<'_> {
 
                 let attributes = &analysed.symbols.symbols[symbol].attributes;
 
-                if !attributes.computed && !attributes.computed_on_self {
+                if !attributes.computed
+                    && !attributes.computed_on_self
+                    && !attributes.computed_on_argument
+                {
                     continue;
                 }
 
@@ -522,11 +713,19 @@ impl Analysis<'_> {
 
 #[derive(Default)]
 struct Edges {
-    edges: BTreeSet<SymbolEdge>,
+    edges: Vec<SymbolEdge>,
     covered: HashSet<FileId>,
 }
 
 impl Edges {
+    fn add_symbol(&mut self, dependent: SymbolId, dependency: SymbolId) {
+        self.edges.push(SymbolEdge {
+            dependent,
+            dependency: SymbolTarget::Symbol(dependency),
+            kind: EdgeKind::Import,
+        });
+    }
+
     fn add(
         &mut self,
         dependent: SymbolId,
@@ -538,7 +737,7 @@ impl Edges {
         let (dependency, file) = target(reached, ids, files, graph);
 
         self.covered.insert(file);
-        self.edges.insert(SymbolEdge {
+        self.edges.push(SymbolEdge {
             dependent,
             dependency,
             kind: EdgeKind::Import,
@@ -627,53 +826,142 @@ impl Resolver<'_> {
             .unwrap_or(class)
     }
 
-    fn attribute_definers(&self, module: usize, symbol: usize) -> Vec<Reached> {
+    fn attribute_definers(&mut self, module: usize, symbol: usize) -> Vec<Rc<Vec<Definer>>> {
         let attributes = &self.modules[module].symbols.symbols[symbol].attributes;
-        let mut definers: Vec<(usize, usize)> = Vec::new();
+        let mut definers: Vec<Rc<Vec<Definer>>> = Vec::new();
 
-        if attributes.computed || attributes.computed_on_self {
+        if attributes.computed || attributes.computed_on_self || attributes.computed_on_argument {
             match self.computed_names.get(&(module, symbol)) {
                 Some(patterns) if patterns.iter().all(has_text) => {
-                    for (key, defining) in self.members.definers.iter().chain(&self.members.writers)
-                    {
-                        if patterns.iter().any(|pattern| name_matches(pattern, key)) {
-                            definers.extend(defining.iter().copied());
-                        }
+                    for key in self.matching_keys(patterns) {
+                        definers.push(self.reading(&key));
                     }
                 }
-                _ if attributes.computed => definers.extend(self.members.all.iter().copied()),
-                _ => definers.extend(self.hierarchy_members(module, symbol)),
+                _ if attributes.computed => definers.push(Rc::new(vec![Definer::Any])),
+                _ if attributes.computed_on_self => {
+                    definers.push(Rc::new(
+                        self.hierarchy_members(module, symbol)
+                            .into_iter()
+                            .map(|(module, symbol)| Definer::Symbol { module, symbol })
+                            .collect(),
+                    ));
+                }
+                _ => {}
             }
         }
 
+        let symbols = self.modules[module].symbols;
+        let attributes = &symbols.symbols[symbol].attributes;
+
         for read in &attributes.read {
-            definers.extend(self.members.defining(read).iter().copied());
-            definers.extend(self.members.writing(read).iter().copied());
+            definers.push(self.reading(read));
         }
 
         if !attributes.read_on_self.is_empty() {
-            let hierarchy: HashSet<(usize, usize)> =
-                self.hierarchy_members(module, symbol).into_iter().collect();
+            let hierarchy = self.hierarchy(module, symbol);
 
             for read in &attributes.read_on_self {
-                definers.extend(
-                    self.members
-                        .defining(read)
-                        .iter()
-                        .filter(|definer| hierarchy.contains(definer))
-                        .copied(),
-                );
-                definers.extend(self.members.writing(read).iter().copied());
+                let key = (Rc::as_ptr(&hierarchy) as usize, read.clone());
+                let found = match self.self_reads.get(&key) {
+                    Some(found) => Rc::clone(found),
+                    None => {
+                        let found = Rc::new(self.reading_in(&hierarchy, read));
+
+                        self.self_reads.insert(key, Rc::clone(&found));
+
+                        found
+                    }
+                };
+
+                definers.push(found);
             }
         }
 
-        definers.sort_unstable();
-        definers.dedup();
         definers
-            .into_iter()
-            .filter(|&definer| definer != (module, symbol))
-            .map(|(module, symbol)| Reached::Symbol { module, symbol })
+    }
+
+    fn reading_in(&self, hierarchy: &HashSet<(usize, usize)>, key: &str) -> Vec<Definer> {
+        let defining: Vec<(usize, usize)> = self
+            .members
+            .defining(key)
+            .iter()
+            .filter(|&&(module, member)| {
+                self.modules[module].symbols.symbols[member]
+                    .member
+                    .as_ref()
+                    .is_some_and(|member| hierarchy.contains(&(module, member.class)))
+            })
+            .copied()
+            .collect();
+        let writing = self.members.writing(key);
+
+        if defining.len() + writing.len() > NAME_HUB_THRESHOLD {
+            return vec![Definer::Name(key.to_owned())];
+        }
+
+        defining
+            .iter()
+            .chain(writing)
+            .map(|&(module, symbol)| Definer::Symbol { module, symbol })
             .collect()
+    }
+
+    fn reading(&mut self, key: &str) -> Rc<Vec<Definer>> {
+        if let Some(found) = self.reads.get(key) {
+            return Rc::clone(found);
+        }
+
+        let defining = self.members.defining(key);
+        let writing = self.members.writing(key);
+        let found = if defining.len() + writing.len() > NAME_HUB_THRESHOLD {
+            vec![Definer::Name(key.to_owned())]
+        } else {
+            defining
+                .iter()
+                .chain(writing)
+                .map(|&(module, symbol)| Definer::Symbol { module, symbol })
+                .collect()
+        };
+        let found = Rc::new(found);
+
+        self.reads.insert(key.to_owned(), Rc::clone(&found));
+
+        found
+    }
+
+    fn matching_keys(&self, patterns: &[Pattern]) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut scanned = Vec::new();
+
+        for pattern in patterns {
+            match pattern.0.as_slice() {
+                [Part::Text(text)] => keys.push(text.clone()),
+                _ => scanned.push(NamePattern::of(pattern)),
+            }
+        }
+
+        for pattern in &scanned {
+            let prefix = pattern.texts.first().filter(|_| !pattern.open_start);
+            let start = prefix.map_or(0, |prefix| {
+                self.members
+                    .keys
+                    .partition_point(|key| key.as_str() < *prefix)
+            });
+
+            for key in &self.members.keys[start..] {
+                if prefix.is_some_and(|prefix| !key.starts_with(prefix)) {
+                    break;
+                }
+
+                if pattern.matches(key) {
+                    keys.push(key.clone());
+                }
+            }
+        }
+
+        keys.sort_unstable();
+        keys.dedup();
+        keys
     }
 
     fn index_classes(&mut self) {
@@ -722,14 +1010,92 @@ impl Resolver<'_> {
         self.members.parents = parents;
     }
 
-    fn hierarchy_members(&self, module: usize, symbol: usize) -> Vec<(usize, usize)> {
-        let Some(member) = &self.modules[module].symbols.symbols[symbol].member else {
-            return self.members.all.clone();
-        };
-        let mut classes = vec![(module, member.class)];
-        let mut seen: HashSet<(usize, usize)> = classes.iter().copied().collect();
+    fn index_namespace_writers(&mut self) {
+        for module in 0..self.modules.len() {
+            let symbols = self.modules[module].symbols;
+            let mut writers = Vec::new();
 
-        while let Some(class) = classes.pop() {
+            for (symbol, local) in symbols.symbols.iter().enumerate() {
+                if local.namespace.writes {
+                    writers.push(symbol);
+                }
+
+                if local.namespace.writes_through_class
+                    && let Some(member) = &local.member
+                {
+                    writers.push(member.class);
+                    writers.extend(
+                        self.members
+                            .of_class
+                            .get(&(module, member.class))
+                            .into_iter()
+                            .flatten()
+                            .copied(),
+                    );
+                }
+            }
+
+            writers.sort_unstable();
+            writers.dedup();
+
+            if !writers.is_empty() {
+                self.writers.insert(module, writers);
+            }
+        }
+    }
+
+    fn namespace_writers(&self, module: usize) -> Vec<Reached> {
+        self.writers
+            .get(&module)
+            .into_iter()
+            .flatten()
+            .map(|&symbol| Reached::Symbol { module, symbol })
+            .collect()
+    }
+
+    fn reflects_on_argument(&self, module: usize, symbol: usize) -> bool {
+        let resolved = self
+            .computed_names
+            .get(&(module, symbol))
+            .is_some_and(|patterns| patterns.iter().all(has_text));
+
+        self.modules[module].symbols.symbols[symbol]
+            .attributes
+            .computed_on_argument
+            && !resolved
+    }
+
+    fn decorators_of(&mut self, module: usize, symbol: usize) -> Vec<(usize, usize)> {
+        let symbols = self.modules[module].symbols;
+        let mut decorators = Vec::new();
+
+        for decorator in symbols.symbols[symbol].decorators.iter().flatten() {
+            for binding in symbols.names.get(&decorator.name).into_iter().flatten() {
+                for reached in self.resolve_binding(module, binding, &decorator.attributes, 0) {
+                    if let Reached::Symbol { module, symbol } = reached {
+                        decorators.push((module, symbol));
+                    }
+                }
+            }
+        }
+
+        decorators
+    }
+
+    fn hierarchy(&mut self, module: usize, symbol: usize) -> Rc<HashSet<(usize, usize)>> {
+        let Some(member) = &self.modules[module].symbols.symbols[symbol].member else {
+            return Rc::default();
+        };
+        let root = (module, member.class);
+
+        if let Some(classes) = self.hierarchies.get(&root) {
+            return Rc::clone(classes);
+        }
+
+        let mut pending = vec![root];
+        let mut classes: HashSet<(usize, usize)> = HashSet::from([root]);
+
+        while let Some(class) = pending.pop() {
             let related = self
                 .members
                 .parents
@@ -739,14 +1105,27 @@ impl Resolver<'_> {
                 .flatten();
 
             for &next in related {
-                if seen.insert(next) {
-                    classes.push(next);
+                if classes.insert(next) {
+                    pending.push(next);
                 }
             }
         }
 
-        seen.into_iter()
-            .flat_map(|(module, class)| {
+        let classes = Rc::new(classes);
+
+        for &class in classes.iter() {
+            self.hierarchies.insert(class, Rc::clone(&classes));
+        }
+
+        classes
+    }
+
+    fn hierarchy_members(&mut self, module: usize, symbol: usize) -> Vec<(usize, usize)> {
+        let classes = self.hierarchy(module, symbol);
+
+        classes
+            .iter()
+            .flat_map(|&(module, class)| {
                 self.members
                     .of_class
                     .get(&(module, class))
@@ -838,6 +1217,10 @@ impl Resolver<'_> {
             Some(header) => {
                 header.keywords
                     || self.registers(module, class)
+                    || self
+                        .decorators_of(module, class)
+                        .into_iter()
+                        .any(|(module, symbol)| self.reflects_on_argument(module, symbol))
                     || header
                         .bases
                         .iter()
@@ -986,6 +1369,19 @@ impl Resolver<'_> {
     }
 
     fn find_attribute(
+        &mut self,
+        module: usize,
+        attributes: &[String],
+        depth: usize,
+    ) -> Vec<Reached> {
+        let mut reached = self.find_static_attribute(module, attributes, depth);
+
+        reached.extend(self.namespace_writers(module));
+
+        reached
+    }
+
+    fn find_static_attribute(
         &mut self,
         module: usize,
         attributes: &[String],
@@ -1168,38 +1564,51 @@ fn has_text(pattern: &Pattern) -> bool {
         .any(|part| matches!(part, Part::Text(text) if !text.is_empty()))
 }
 
-fn name_matches(pattern: &Pattern, name: &str) -> bool {
-    let texts: Vec<&str> = pattern
-        .0
-        .iter()
-        .filter_map(|part| match part {
-            Part::Text(text) => Some(text.as_str()),
-            Part::Root | Part::Hole(_) => None,
-        })
-        .collect();
-    let open_start = !matches!(pattern.0.first(), Some(Part::Text(_)));
-    let open_end = !matches!(pattern.0.last(), Some(Part::Text(_)));
-    let mut rest = name;
+struct NamePattern<'p> {
+    texts: Vec<&'p str>,
+    open_start: bool,
+    open_end: bool,
+}
 
-    for (position, text) in texts.iter().enumerate() {
-        if position == 0 && !open_start {
-            let Some(after) = rest.strip_prefix(text) else {
-                return false;
-            };
-
-            rest = after;
-        } else if position == texts.len() - 1 && !open_end {
-            return rest.ends_with(text);
-        } else {
-            let Some(found) = rest.find(text) else {
-                return false;
-            };
-
-            rest = &rest[found + text.len()..];
+impl<'p> NamePattern<'p> {
+    fn of(pattern: &'p Pattern) -> Self {
+        Self {
+            texts: pattern
+                .0
+                .iter()
+                .filter_map(|part| match part {
+                    Part::Text(text) => Some(text.as_str()),
+                    Part::Root | Part::Hole(_) => None,
+                })
+                .collect(),
+            open_start: !matches!(pattern.0.first(), Some(Part::Text(_))),
+            open_end: !matches!(pattern.0.last(), Some(Part::Text(_))),
         }
     }
 
-    open_end || rest.is_empty()
+    fn matches(&self, name: &str) -> bool {
+        let mut rest = name;
+
+        for (position, text) in self.texts.iter().enumerate() {
+            if position == 0 && !self.open_start {
+                let Some(after) = rest.strip_prefix(text) else {
+                    return false;
+                };
+
+                rest = after;
+            } else if position == self.texts.len() - 1 && !self.open_end {
+                return rest.ends_with(text);
+            } else {
+                let Some(found) = rest.find(text) else {
+                    return false;
+                };
+
+                rest = &rest[found + text.len()..];
+            }
+        }
+
+        self.open_end || rest.is_empty()
+    }
 }
 
 fn is_special(key: &str) -> bool {

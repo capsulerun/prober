@@ -239,7 +239,7 @@ Every inference is on by default. Switch one off to measure what it adds, or whe
 | `naming_families` | Tests paired with the modules they are named after |
 | `spawned_entrypoints` | Scripts and binaries that tests start as a process |
 | `build_mapping` | Build outputs (`dist/…`) mapped back to their sources |
-| `symbols` | For TypeScript, links followed through the functions and classes a test uses rather than whole files |
+| `symbols` | For TypeScript and Python, links followed through the functions, classes and methods a test uses rather than whole files |
 | `bindings` | Rust crates built into a Python or Node module (maturin, napi), linked to the code importing that module |
 
 #### `[aggressive]`, `[[defer]]` and `[protected]`

@@ -1,14 +1,14 @@
 //! Partial evaluation across modules: the strings, paths and modules a summarized expression can be, with parameters followed through every visible caller.
 
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 use prober_core::files::RepoPath;
 
 use crate::conventions::{PACKAGE_INIT, join_directory, parent_directory, split_path};
 use crate::modules::ModuleIndex;
-use crate::summary::{CallSite, Expr, FunctionIndex, ModuleRef, ModuleSummary, Site};
+use crate::summary::{CallSite, Expr, FunctionIndex, ModuleRef, ModuleSummary, Site, SiteKind};
 
 const MAX_ALTERNATIVES: usize = 32;
 
@@ -95,7 +95,10 @@ pub(crate) struct Evaluator<'s> {
     summaries: &'s HashMap<RepoPath, ModuleSummary>,
     index: &'s ModuleIndex,
     callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>>,
+    method_names: HashMap<FunctionRef<'s>, (&'s str, usize)>,
+    callers_by_name: HashMap<(&'s str, usize), Vec<CallerRef<'s>>>,
     escaping: HashSet<FunctionRef<'s>>,
+    escaping_by_name: HashSet<FunctionRef<'s>>,
     steps: Cell<usize>,
     site_steps: Cell<usize>,
 }
@@ -106,12 +109,16 @@ impl<'s> Evaluator<'s> {
             summaries,
             index,
             callers: HashMap::new(),
+            method_names: HashMap::new(),
+            callers_by_name: HashMap::new(),
             escaping: HashSet::new(),
+            escaping_by_name: HashSet::new(),
             steps: Cell::new(0),
             site_steps: Cell::new(0),
         };
         let mut callers: HashMap<FunctionRef<'s>, Vec<CallerRef<'s>>> = HashMap::new();
         let mut escaping = HashSet::new();
+        let mut escaping_by_name = HashSet::new();
         let unresolved_attributes: HashSet<&str> = summaries
             .values()
             .flat_map(|summary| &summary.unresolved_attributes)
@@ -122,21 +129,30 @@ impl<'s> Evaluator<'s> {
             .flat_map(|summary| &summary.referenced_attributes)
             .map(String::as_str)
             .collect();
-        let mut methods: HashMap<&str, Vec<(FunctionRef<'s>, usize)>> = HashMap::new();
+        let mut method_names: HashMap<FunctionRef<'s>, (&'s str, usize)> = HashMap::new();
+        let mut shifts: HashMap<&'s str, BTreeSet<usize>> = HashMap::new();
+        let mut callers_by_name: HashMap<(&'s str, usize), Vec<CallerRef<'s>>> = HashMap::new();
+        let mut modules: Vec<(&'s RepoPath, &'s ModuleSummary)> = summaries.iter().collect();
 
-        for (module, summary) in summaries {
+        modules.sort_by_key(|(module, _)| *module);
+
+        for &(module, summary) in &modules {
             for (index, function) in summary.functions.iter().enumerate() {
                 let name = function.name.as_str();
                 let reachable_by_attribute = unresolved_attributes.contains(name);
-                let escapes = match &function.class {
+                let escapes_by_name = match &function.class {
                     Some(_) => {
                         function.nested || referenced_attributes.contains(name) || is_special(name)
                     }
                     None => reachable_by_attribute,
                 };
 
-                if function.escapes || escapes {
+                if function.escapes || function.class.is_some() || reachable_by_attribute {
                     escaping.insert(FunctionRef { module, index });
+                }
+
+                if function.escapes || escapes_by_name {
+                    escaping_by_name.insert(FunctionRef { module, index });
                 }
 
                 if function.class.is_some() && !function.nested {
@@ -147,15 +163,13 @@ impl<'s> Evaluator<'s> {
                             .is_some_and(|first| RECEIVERS.contains(&first.as_str())),
                     );
 
-                    methods
-                        .entry(name)
-                        .or_default()
-                        .push((FunctionRef { module, index }, receiver_shift));
+                    method_names.insert(FunctionRef { module, index }, (name, receiver_shift));
+                    shifts.entry(name).or_default().insert(receiver_shift);
                 }
             }
         }
 
-        for (module, summary) in summaries {
+        for &(module, summary) in &modules {
             for call in &summary.calls {
                 if let Some((function, receiver_shift)) = evaluator.callee(module, &call.callee) {
                     callers.entry(function).or_default().push(CallerRef {
@@ -164,39 +178,52 @@ impl<'s> Evaluator<'s> {
                         receiver_shift,
                     });
                 }
+            }
 
-                if let Expr::Method { name, .. } = &call.callee {
-                    for &(method, receiver_shift) in
-                        methods.get(name.as_str()).into_iter().flatten()
-                    {
-                        callers.entry(method).or_default().push(CallerRef {
+            let named_calls = summary
+                .calls
+                .iter()
+                .filter_map(|call| match &call.callee {
+                    Expr::Method { name, .. } => Some((name.as_str(), call)),
+                    _ => None,
+                })
+                .chain(
+                    summary
+                        .method_calls
+                        .iter()
+                        .map(|(name, call)| (name.as_str(), call)),
+                );
+
+            for (name, call) in named_calls {
+                let Some((&name, method_shifts)) = shifts.get_key_value(name) else {
+                    continue;
+                };
+
+                for &receiver_shift in method_shifts {
+                    callers_by_name
+                        .entry((name, receiver_shift))
+                        .or_default()
+                        .push(CallerRef {
                             module,
                             call,
                             receiver_shift,
                         });
-                    }
-                }
-            }
-
-            for (name, call) in &summary.method_calls {
-                for &(method, receiver_shift) in methods.get(name.as_str()).into_iter().flatten() {
-                    callers.entry(method).or_default().push(CallerRef {
-                        module,
-                        call,
-                        receiver_shift,
-                    });
                 }
             }
 
             for escape in &summary.escapes {
                 if let Some((function, _)) = evaluator.callee(module, escape) {
                     escaping.insert(function);
+                    escaping_by_name.insert(function);
                 }
             }
         }
 
         evaluator.callers = callers;
+        evaluator.method_names = method_names;
+        evaluator.callers_by_name = callers_by_name;
         evaluator.escaping = escaping;
+        evaluator.escaping_by_name = escaping_by_name;
 
         evaluator
     }
@@ -268,12 +295,25 @@ impl<'s> Evaluator<'s> {
 
             return;
         };
-        let callers = self.callers.get(&function).map_or(&[][..], Vec::as_slice);
+        let by_attribute = site.kind == SiteKind::Attribute;
+        let escaping = if by_attribute {
+            &self.escaping_by_name
+        } else {
+            &self.escaping
+        };
+        let explicit = self.callers.get(&function).map_or(&[][..], Vec::as_slice);
+        let by_name = self
+            .method_names
+            .get(&function)
+            .filter(|_| by_attribute)
+            .and_then(|key| self.callers_by_name.get(key))
+            .map_or(&[][..], Vec::as_slice);
+        let caller_count = explicit.len() + by_name.len();
         let can_expand = chain.len() < MAX_CALLER_DEPTH
-            && !callers.is_empty()
-            && *expansions + callers.len() <= MAX_EXPANSIONS;
+            && caller_count > 0
+            && *expansions + caller_count <= MAX_EXPANSIONS;
 
-        if !can_expand || self.escaping.contains(&function) {
+        if !can_expand || escaping.contains(&function) {
             results.push(SiteValue { reader, value });
         }
 
@@ -281,7 +321,7 @@ impl<'s> Evaluator<'s> {
             return;
         }
 
-        for caller in callers {
+        for caller in explicit.iter().chain(by_name) {
             let mut extended = chain.clone();
 
             extended.push(caller);

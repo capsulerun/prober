@@ -305,7 +305,7 @@ fn a_function_level_import_links_the_function_to_what_it_imports() {
 }
 
 #[test]
-fn a_dynamic_namespace_is_analysed_at_file_level() {
+fn names_written_into_the_module_namespace_reach_their_readers() {
     let module = "def make(name):\n    globals()[name] = lambda: name\n\n\nmake(\"alpha\")\n\n\ndef beta():\n    return 2\n";
     let project = TestProject::new(&[
         ("names.py", module),
@@ -320,14 +320,105 @@ fn a_dynamic_namespace_is_analysed_at_file_level() {
             &project,
             "names.py",
             module,
-            &module.replace("return 2", "return 3")
+            &module.replace("lambda: name", "lambda: name.upper()")
         ),
         selected(&[(
             "tests/test_alpha.py",
             &[
                 "names.py (modified)",
-                "-> used whole at load by tests/test_alpha.py (analysed at file level: globals() or sys.modules)",
+                "-> make changed",
+                "-> make used at load by names.py",
+                "-> loaded by tests/test_alpha.py",
             ],
         )])
+    );
+}
+
+#[test]
+fn a_namespace_handed_to_other_code_is_analysed_at_file_level() {
+    let module = "from registry import fill\n\nfill(globals())\n\n\ndef beta():\n    return 2\n";
+    let project = TestProject::new(&[
+        (
+            "registry.py",
+            "def fill(namespace):\n    namespace[\"alpha\"] = 1\n",
+        ),
+        ("names.py", module),
+        (
+            "tests/test_beta.py",
+            "from names import beta\n\n\ndef test_beta():\n    assert beta() == 2\n",
+        ),
+    ]);
+
+    assert_eq!(
+        changed(
+            &project,
+            "names.py",
+            module,
+            &module.replace("return 2", "return 3")
+        ),
+        selected(&[(
+            "tests/test_beta.py",
+            &[
+                "names.py (modified)",
+                "-> used whole at load by tests/test_beta.py (analysed at file level: globals() or sys.modules)",
+            ],
+        )])
+    );
+}
+
+#[test]
+fn a_class_decorator_walking_its_class_makes_only_that_class_whole() {
+    let shapes = "def dispatch(cls):\n    for name in dir(cls):\n        getattr(cls, name)\n\n    return cls\n\n\n@dispatch\nclass Square:\n    def area(self):\n        return 4\n\n\nclass Circle:\n    def area(self):\n        return 3\n";
+    let project = TestProject::new(&[
+        ("shapes.py", shapes),
+        (
+            "tests/test_square.py",
+            "from shapes import Square\n\n\ndef test_square():\n    assert Square()\n",
+        ),
+        (
+            "tests/test_circle.py",
+            "from shapes import Circle\n\n\ndef test_circle():\n    assert Circle()\n",
+        ),
+    ]);
+
+    assert_eq!(
+        changed_tests(
+            &project,
+            "shapes.py",
+            shapes,
+            &shapes.replace("return 4", "return 5")
+        ),
+        ["tests/test_square.py"]
+    );
+    assert!(
+        changed_tests(
+            &project,
+            "shapes.py",
+            shapes,
+            &shapes.replace("return 3", "return 2")
+        )
+        .is_empty()
+    );
+}
+
+#[test]
+fn a_computed_name_passed_as_a_literal_by_the_callers_of_a_method_reaches_only_that_name() {
+    let library = "class Frame:\n    def write(self):\n        return 1\n\n\nclass Series:\n    def __init__(self, s):\n        self._s = s\n\n    def _comp(self, other, op):\n        return getattr(self._s, op)(other)\n\n    def __eq__(self, other):\n        return self._comp(other, \"eq\")\n";
+    let project = TestProject::new(&[
+        ("library.py", library),
+        (
+            "tests/test_series.py",
+            "from library import Series\n\n\ndef test_eq():\n    assert Series(1) == Series(1)\n",
+        ),
+    ]);
+
+    assert!(
+        changed_tests(
+            &project,
+            "library.py",
+            library,
+            &library.replace("return 1", "return 2")
+        )
+        .is_empty()
     );
 }

@@ -343,6 +343,54 @@ fn change_to_one_function_selects_the_tests_using_it_unless_symbols_are_switched
 }
 
 #[test]
+fn change_to_one_python_function_selects_the_tests_calling_it_unless_symbols_are_switched_off() {
+    let parsing = "def parse(text):\n    return text\n\n\ndef format(value):\n    return value\n";
+    let repository = TestRepository::with_files_on_main(&[
+        ("shop/__init__.py", "from shop.text import format, parse\n"),
+        ("shop/text.py", parsing),
+        (
+            "tests/test_parse.py",
+            "import shop\n\n\ndef test_parse():\n    assert shop.parse(\"a\") == \"a\"\n",
+        ),
+        (
+            "tests/test_format.py",
+            "from shop import format\n\n\ndef test_format():\n    assert format(\"a\") == \"a\"\n",
+        ),
+    ]);
+
+    repository.change_and_commit(
+        "shop/text.py",
+        &parsing.replace("return text", "return text.strip()"),
+    );
+
+    let symbol_level = repository
+        .prober(&["--base", "main", "--format", "json"])
+        .json();
+
+    repository.write("prober.toml", "[inference]\nsymbols = false\n");
+
+    let file_level = repository.prober(&["--base", "main"]);
+
+    assert_eq!(
+        symbol_level["targets"],
+        json!({ "python": ["tests/test_parse.py"] })
+    );
+    assert_eq!(
+        symbol_level["reasons"]["tests/test_parse.py"],
+        json!([
+            "shop/text.py (modified)",
+            "-> parse changed",
+            "-> parse used by test_parse in tests/test_parse.py",
+            "-> test_parse run by tests/test_parse.py",
+        ])
+    );
+    assert_eq!(
+        file_level.stdout,
+        "tests/test_format.py\ntests/test_parse.py\n"
+    );
+}
+
+#[test]
 fn comment_change_selects_nothing_and_top_level_code_selects_every_importer() {
     let repository = TestRepository::with_project_on_main();
 

@@ -18,6 +18,7 @@ use crate::conventions::{
     join_directory, parent_directory, split_path,
 };
 use crate::django::{installed_app_links, settings_modules};
+use crate::evaluator::Evaluator;
 use crate::families::naming_families;
 use crate::links::{LinkSettings, Linking};
 use crate::manifests::{DependencyChanges, PACKAGE_NODE_PREFIX};
@@ -118,7 +119,9 @@ impl PythonLinker {
 
     fn link(&self, change_set: &ChangeSet, graph: &mut GraphBuilder) -> Result<Vec<ModeReason>> {
         let repo_files = change_set.repo_files;
+        let link_timer = std::time::Instant::now();
         let summaries = self.summaries(repo_files)?;
+        eprintln!("TIMING summaries {:?}", link_timer.elapsed());
         let mut modules: Vec<&RepoPath> = summaries.keys().collect();
 
         modules.sort();
@@ -210,6 +213,8 @@ impl PythonLinker {
             }
         }
 
+        eprintln!("TIMING before links {:?}", link_timer.elapsed());
+        let evaluator = Evaluator::new(summaries, &self.index);
         let links = Linking {
             repo_root: &self.repo_root,
             repo_files,
@@ -221,9 +226,11 @@ impl PythonLinker {
                 plugin_folders: self.inference.plugin_folders,
                 files: self.inference.files,
             },
+            evaluator: &evaluator,
         }
         .links()?;
 
+        eprintln!("TIMING links {:?}", link_timer.elapsed());
         let app_links = installed_app_links(&settings, summaries, &self.index);
 
         for link in links.links.into_iter().chain(app_links) {
@@ -293,6 +300,7 @@ impl PythonLinker {
         if self.inference.symbols {
             let global_plugins = global_plugins(&self.configs, &self.index, repo_files, &read_head);
             let providers = self.providers(&modules, summaries, &global_plugins);
+            eprintln!("TIMING before analysis {:?}", link_timer.elapsed());
             let base_summaries = self.base_summaries(summaries, change_set)?;
             let dependencies =
                 |target: &ImportTarget| import_dependencies(target, &outside_packages);
@@ -304,9 +312,11 @@ impl PythonLinker {
                 providers: &providers,
                 module_edges: &module_edges,
                 dependencies: &dependencies,
+                evaluator: &evaluator,
             }
             .add_to(graph);
 
+            eprintln!("TIMING analysis {:?}", link_timer.elapsed());
             FixtureScopes {
                 summaries,
                 index: &self.index,

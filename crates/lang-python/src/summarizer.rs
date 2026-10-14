@@ -151,6 +151,7 @@ pub(crate) fn summarize(path: &RepoPath, source: &str, index: &ModuleIndex) -> M
     };
 
     collector.collect_body(&module.body, 0, None);
+    collector.collect_comprehensions(&module.body, 0);
 
     let summarizer = Summarizer {
         path,
@@ -388,8 +389,19 @@ impl<'a> Collector<'a, '_> {
         self.function_scopes
             .insert(definition.range().start(), (function_scope, function));
         self.collect_body(&definition.body, function_scope, None);
+        self.collect_comprehensions(&definition.body, function_scope);
 
         function
+    }
+
+    fn collect_comprehensions(&mut self, body: &'a [Stmt], scope: ScopeId) {
+        let mut finder = ComprehensionFinder::default();
+
+        finder.visit_body(body);
+
+        for (target, iterable) in finder.generators {
+            self.bind_elements(scope, target, iterable);
+        }
     }
 
     fn bind_target(&mut self, scope: ScopeId, target: &'a AstExpr, value: &'a AstExpr) {
@@ -1602,4 +1614,31 @@ fn line_starts(source: &str) -> Vec<usize> {
     );
 
     starts
+}
+
+#[derive(Default)]
+struct ComprehensionFinder<'a> {
+    generators: Vec<(&'a AstExpr, &'a AstExpr)>,
+}
+
+impl<'a> Visitor<'a> for ComprehensionFinder<'a> {
+    fn visit_stmt(&mut self, statement: &'a Stmt) {
+        if !matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+            visitor::walk_stmt(self, statement);
+        }
+    }
+
+    fn visit_expr(&mut self, expr: &'a AstExpr) {
+        if matches!(expr, AstExpr::Lambda(_)) {
+            return;
+        }
+
+        visitor::walk_expr(self, expr);
+    }
+
+    fn visit_comprehension(&mut self, comprehension: &'a ast::Comprehension) {
+        self.generators
+            .push((&comprehension.target, &comprehension.iter));
+        visitor::walk_comprehension(self, comprehension);
+    }
 }
