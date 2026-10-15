@@ -8,9 +8,11 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::GetSpan;
 use prober_core::files::RepoPath;
 use prober_core::graph::EdgeKind;
+
+use crate::components::parse_input;
 
 const MODULE_LOADING_METHODS: [(&str, &str); 8] = [
     ("vi", "mock"),
@@ -143,8 +145,8 @@ pub(crate) fn collect_imports(program: &Program, source_text: &str) -> ParsedImp
 
 pub fn string_literals(path: &RepoPath, source_text: &str) -> Vec<String> {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    let (source_type, source_text) = parse_input(path.as_str(), source_text);
+    let parsed = Parser::new(&allocator, &source_text, source_type).parse();
     let mut literal_collector = LiteralCollector::default();
 
     literal_collector.visit_program(&parsed.program);
@@ -572,10 +574,10 @@ mod tests {
 
     fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
         let allocator = Allocator::default();
-        let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-        let parsed = Parser::new(&allocator, source_text, source_type).parse();
+        let (source_type, source_text) = parse_input(path.as_str(), source_text);
+        let parsed = Parser::new(&allocator, &source_text, source_type).parse();
 
-        collect_imports(&parsed.program, source_text)
+        collect_imports(&parsed.program, &source_text)
     }
 
     fn imports_of(path: &str, source_text: &str) -> Vec<(String, EdgeKind)> {

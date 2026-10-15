@@ -69,7 +69,9 @@ const TEST_RUNNER_PACKAGES: &[&str] = &[
 
 const TEST_RUNNER_PACKAGE_PREFIXES: [&str; 4] = ["@jest/", "@vitest/coverage-", "jest-", "karma-"];
 
-const SOURCE_EXTENSIONS: [&str; 8] = ["ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs"];
+const SOURCE_EXTENSIONS: [&str; 10] = [
+    "ts", "tsx", "mts", "cts", "js", "jsx", "mjs", "cjs", "vue", "svelte",
+];
 
 const DECLARATION_FILE_SUFFIXES: [&str; 3] = [".d.ts", ".d.mts", ".d.cts"];
 

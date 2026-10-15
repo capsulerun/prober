@@ -7,13 +7,14 @@ use oxc_ast::ast::{
     AssignmentTarget, BindingPattern, Declaration, Expression, ImportOrExportKind, Statement,
 };
 use oxc_parser::Parser;
-use oxc_span::SourceType;
 use prober_core::files::RepoPath;
+
+use crate::components::parse_input;
 
 pub(crate) fn export_signature(path: &RepoPath, source_text: &str) -> Option<BTreeSet<String>> {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    let (source_type, source_text) = parse_input(path.as_str(), source_text);
+    let parsed = Parser::new(&allocator, &source_text, source_type).parse();
 
     if parsed.panicked || parsed.diagnostics.has_errors() {
         return None;

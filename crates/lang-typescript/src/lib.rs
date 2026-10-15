@@ -1,5 +1,6 @@
 mod bindings;
 mod build_mapping;
+mod components;
 mod conventions;
 mod dynamic;
 mod families;

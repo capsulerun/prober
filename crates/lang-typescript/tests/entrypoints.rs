@@ -343,3 +343,43 @@ fn spawned_entrypoints_switch_off_on_their_own() {
         [("dist/entry.js", EdgeKind::Build)]
     );
 }
+
+#[test]
+fn a_component_change_reaches_the_tests_of_the_components_using_it() {
+    let base_input = "<template>\n  <textarea placeholder=\"Ask\" />\n</template>\n<script setup lang=\"ts\">\nconst props = defineProps<{ value: string }>();\n</script>\n";
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "devDependencies": { "vitest": "^3" } }"#,
+        ),
+        ("src/components/ChatInput/ChatInput.vue", base_input),
+        (
+            "src/components/ChatInput/index.ts",
+            "export { default } from './ChatInput.vue';",
+        ),
+        (
+            "src/components/AskAssistantChat/AskAssistantChat.vue",
+            "<template>\n  <ChatInput />\n</template>\n<script setup lang=\"ts\">\nimport ChatInput from '../ChatInput';\n</script>\n",
+        ),
+        (
+            "src/components/AskAssistantChat/AskAssistantChat.test.ts",
+            "import AskAssistantChat from './AskAssistantChat.vue';\n",
+        ),
+        ("src/components/Other/Other.test.ts", "export {};"),
+    ]);
+
+    project.write(
+        "src/components/ChatInput/ChatInput.vue",
+        &base_input.replace("Ask", "Ask a question"),
+    );
+
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/components/ChatInput/ChatInput.vue", base_input)],
+                &[modified("src/components/ChatInput/ChatInput.vue")]
+            )
+            .selected_paths(),
+        ["src/components/AskAssistantChat/AskAssistantChat.test.ts"]
+    );
+}

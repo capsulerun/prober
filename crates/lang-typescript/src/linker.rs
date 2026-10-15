@@ -18,6 +18,7 @@ use rayon::prelude::*;
 
 use crate::bindings::{BindingLink, NapiPackages, loads_the_addon};
 use crate::build_mapping::BuildMapping;
+use crate::components::{is_component, parse_input};
 use crate::conventions::{
     ALWAYS_ALL_DEFAULTS, LANGUAGE, MANIFEST_DEFAULTS, is_asset_file, is_module_file,
     is_source_file, is_test_file, is_test_support_file,
@@ -623,9 +624,9 @@ impl TypeScriptLinker {
     ) -> Result<LinkedFile> {
         let source_bytes = fs::read(self.repo_root.join(path.as_str()))
             .with_context(|| format!("cannot read {path}"))?;
-        let source_text = String::from_utf8_lossy(&source_bytes);
+        let file_text = String::from_utf8_lossy(&source_bytes);
+        let (source_type, source_text) = parse_input(path.as_str(), &file_text);
         let allocator = Allocator::default();
-        let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
         let parsed = Parser::new(&allocator, &source_text, source_type)
             .with_config(RuntimeParserConfig::new(self.symbol_analysis))
             .parse();
@@ -679,7 +680,9 @@ impl TypeScriptLinker {
         }
 
         let symbols = self.symbol_analysis.then(|| {
-            let module = if parsed.panicked || parsed.diagnostics.has_errors() {
+            let module = if is_component(path.as_str()) {
+                Err(FallbackCause::Template)
+            } else if parsed.panicked || parsed.diagnostics.has_errors() {
                 Err(FallbackCause::ParseError)
             } else {
                 extract_symbols(&parsed.program, &source_text, &parsed.tokens)
@@ -807,6 +810,10 @@ fn base_modules(
 }
 
 fn module_symbols_of(path: &RepoPath, source_text: &str) -> Option<ModuleSymbols> {
+    if is_component(path.as_str()) {
+        return None;
+    }
+
     let allocator = Allocator::default();
     let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
     let parsed = Parser::new(&allocator, source_text, source_type)
