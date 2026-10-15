@@ -20,11 +20,14 @@ use crate::conventions::{
 use crate::django::{installed_app_links, settings_modules};
 use crate::families::naming_families;
 use crate::links::{LinkSettings, Linking};
-use crate::manifests::{DependencyChanges, PACKAGE_NODE_PREFIX};
+use crate::manifests::{
+    DependencyChanges, PACKAGE_NODE_PREFIX, ProjectChange, project_directories,
+};
 use crate::modules::{ImportTarget, ModuleIndex};
 use crate::pytest::configs::{PytestConfigs, is_within};
 use crate::pytest::fixtures::{FixtureScopes, ModuleEdge};
 use crate::pytest::{ConfigChanges, global_plugins, scoped_requests};
+use crate::sessions::session_changes;
 use crate::summarizer::summarize;
 use crate::summary::ModuleSummary;
 use crate::symbols::Analysis;
@@ -44,6 +47,7 @@ pub struct PythonLinker {
     django: bool,
     summaries: OnceLock<HashMap<RepoPath, ModuleSummary>>,
     dependency_changes: DependencyChanges,
+    session_changes: Vec<ProjectChange>,
 }
 
 impl PythonLinker {
@@ -64,6 +68,7 @@ impl PythonLinker {
             django: true,
             summaries: OnceLock::new(),
             dependency_changes: DependencyChanges::default(),
+            session_changes: Vec::new(),
         })
     }
 
@@ -314,6 +319,42 @@ impl PythonLinker {
             );
         }
 
+        for session in &self.session_changes {
+            let in_session = |path: &&RepoPath| {
+                session.directory.is_empty()
+                    || path
+                        .as_str()
+                        .starts_with(&format!("{}/", session.directory))
+            };
+
+            for test in repo_files
+                .iter()
+                .filter(in_session)
+                .filter(|path| is_source_file(path) && self.is_test(path))
+            {
+                graph.add_changed_part(
+                    session.change_path.clone(),
+                    test.clone(),
+                    session.description.clone(),
+                );
+            }
+        }
+
+        for project in self.dependency_changes.projects() {
+            let prefix = format!("{}/", project.directory);
+
+            for file in repo_files
+                .iter()
+                .filter(|path| path.as_str().starts_with(&prefix) && is_source_file(path))
+            {
+                graph.add_changed_part(
+                    project.change_path.clone(),
+                    file.clone(),
+                    project.description.clone(),
+                );
+            }
+        }
+
         if !self.pytest {
             return Ok(Vec::new());
         }
@@ -458,6 +499,19 @@ impl Frontend for PythonLinker {
     }
 
     fn diff_manifests(&mut self, change_set: &ChangeSet) -> Result<Vec<ModeReason>> {
+        let repo_root = &self.repo_root;
+        let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
+        let project_directories = project_directories(change_set.repo_files);
+        let is_test = |path: &RepoPath| is_source_file(path) && self.is_test(path);
+
+        self.session_changes = session_changes(
+            &read_head,
+            change_set.changes,
+            change_set.base,
+            &project_directories,
+            &is_test,
+        )?;
+
         if !self.inference.manifests {
             return Ok(Vec::new());
         }
@@ -471,14 +525,12 @@ impl Frontend for PythonLinker {
                 _ => None,
             })
             .collect();
-        let repo_root = &self.repo_root;
-        let read_head = |path: &RepoPath| fs::read_to_string(repo_root.join(path.as_str())).ok();
-
         self.dependency_changes = DependencyChanges::between(
             &read_head,
             change_set.changes,
             change_set.base,
             &imported,
+            &project_directories,
             self.pytest,
         )?;
 

@@ -136,10 +136,18 @@ pub(crate) struct PackageChange {
     pub description: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProjectChange {
+    pub change_path: RepoPath,
+    pub directory: String,
+    pub description: String,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct DependencyChanges {
     global_reasons: Vec<ModeReason>,
     packages: Vec<PackageChange>,
+    projects: Vec<ProjectChange>,
 }
 
 struct ChangedDistribution {
@@ -155,6 +163,7 @@ impl DependencyChanges {
         changes: &[FileChange],
         base: &dyn BaseRevision,
         imported: &HashSet<String>,
+        project_directories: &BTreeSet<String>,
         pytest: bool,
     ) -> Result<Self> {
         let mut dependency_changes = DependencyChanges::default();
@@ -188,12 +197,7 @@ impl DependencyChanges {
             match diffed {
                 Ok(diff) => {
                     for field in diff.global_fields {
-                        dependency_changes
-                            .global_reasons
-                            .push(ModeReason::GlobalField {
-                                change: change.clone(),
-                                field,
-                            });
+                        dependency_changes.add_field(change, field, project_directories);
                     }
 
                     distributions.extend(diff.distributions.into_iter().map(
@@ -250,15 +254,12 @@ impl DependencyChanges {
             }
 
             if !accounted {
-                dependency_changes
-                    .global_reasons
-                    .push(ModeReason::GlobalField {
-                        change: distribution.change.clone(),
-                        field: format!(
-                            "{} ({}), which no module imports by a known name",
-                            distribution.name, distribution.detail
-                        ),
-                    });
+                let field = format!(
+                    "{} ({}), which no module imports by a known name",
+                    distribution.name, distribution.detail
+                );
+
+                dependency_changes.add_field(&distribution.change, field, project_directories);
             }
         }
 
@@ -269,7 +270,28 @@ impl DependencyChanges {
             later.change_path == earlier.change_path && later.import_name == earlier.import_name
         });
 
+        dependency_changes.projects.dedup();
+
         Ok(dependency_changes)
+    }
+
+    fn add_field(
+        &mut self,
+        change: &FileChange,
+        field: String,
+        project_directories: &BTreeSet<String>,
+    ) {
+        match project_of(&change.path, project_directories) {
+            Some(directory) => self.projects.push(ProjectChange {
+                change_path: change.path.clone(),
+                directory: directory.to_owned(),
+                description: format!("changes \"{field}\" in the project {directory}"),
+            }),
+            None => self.global_reasons.push(ModeReason::GlobalField {
+                change: change.clone(),
+                field,
+            }),
+        }
     }
 
     pub fn global_reasons(&self) -> &[ModeReason] {
@@ -279,6 +301,36 @@ impl DependencyChanges {
     pub fn packages(&self) -> &[PackageChange] {
         &self.packages
     }
+
+    pub fn projects(&self) -> &[ProjectChange] {
+        &self.projects
+    }
+}
+
+pub(crate) fn project_of<'d>(
+    path: &RepoPath,
+    project_directories: &'d BTreeSet<String>,
+) -> Option<&'d str> {
+    let mut directory = split_path(path.as_str()).0;
+
+    while !directory.is_empty() {
+        if let Some(project) = project_directories.get(directory) {
+            return Some(project);
+        }
+
+        directory = split_path(directory).0;
+    }
+
+    None
+}
+
+pub(crate) fn project_directories(repo_files: &[RepoPath]) -> BTreeSet<String> {
+    repo_files
+        .iter()
+        .map(|path| split_path(path.as_str()))
+        .filter(|(directory, name)| *name == PROJECT_MANIFEST && !directory.is_empty())
+        .map(|(directory, _)| directory.to_owned())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -823,6 +875,7 @@ mod tests {
             &[modified(path)],
             &Base(vec![(path, base)]),
             &imported,
+            &BTreeSet::from(["libs/partners/openai".to_owned()]),
             false,
         )
         .unwrap()

@@ -246,15 +246,92 @@ fn setup_files_and_what_only_they_reach_run_every_test() {
 }
 
 #[test]
-fn shared_module_imported_by_a_setup_file_selects_only_its_importers() {
+fn a_shared_module_reaches_every_test_only_through_what_the_setup_file_runs() {
     let project = vitest_project();
 
     assert_eq!(
-        project.outcome_of(&[], &[modified("src/log.ts")]),
+        project
+            .outcome_of(&[], &[modified("src/log.ts")])
+            .selected_paths(),
+        [
+            "src/log.test.ts",
+            "src/fast/a.test.ts",
+            "src/fast/b.test.ts",
+            "src/fast/c.test.ts"
+        ]
+    );
+
+    project.write(
+        "src/log.ts",
+        "export const warn = () => { console.warn(1); };",
+    );
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("src/log.ts", "export const warn = () => {};")],
+            &[modified("src/log.ts")]
+        ),
         selected(&[(
             "src/log.test.ts",
-            &["src/log.ts (modified)", "-> imported by src/log.test.ts"],
+            &[
+                "src/log.ts (modified)",
+                "-> paired by name with src/log.test.ts"
+            ],
         )])
+    );
+}
+
+#[test]
+fn a_change_to_what_a_setup_file_runs_selects_every_test() {
+    let base_handlers = "export const handlers = [\"flows\"];";
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "devDependencies": { "vitest": "^3" } }"#,
+        ),
+        (
+            "vite.config.ts",
+            r#"export default { test: { setupFiles: "./tests/setup.ts" } };"#,
+        ),
+        (
+            "tests/setup.ts",
+            r#"
+                import { beforeAll } from "vitest";
+                import { server } from "./utils";
+
+                beforeAll(() => server.listen());
+            "#,
+        ),
+        (
+            "tests/utils/index.ts",
+            r#"
+                import { setupServer } from "msw/node";
+                import { handlers } from "./handlers";
+
+                export const server = setupServer(...handlers);
+            "#,
+        ),
+        ("tests/utils/handlers.ts", base_handlers),
+        ("tests/api/service.test.ts", "export {};"),
+        (
+            "tests/flows.test.ts",
+            r#"import { server } from "./utils"; server.resetHandlers();"#,
+        ),
+    ]);
+
+    project.write(
+        "tests/utils/handlers.ts",
+        "export const handlers = [\"flows\", \"paginate\"];",
+    );
+
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("tests/utils/handlers.ts", base_handlers)],
+                &[modified("tests/utils/handlers.ts")]
+            )
+            .selected_paths(),
+        ["tests/flows.test.ts", "tests/api/service.test.ts"]
     );
 }
 

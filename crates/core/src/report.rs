@@ -954,6 +954,10 @@ fn describe_hop(graph: &Graph, hop: &Hop) -> String {
             }
         }
         Link::Edge {
+            kind: EdgeKind::Setup,
+            ..
+        } => format!("-> run before {dependent} as a setup file of its test runner"),
+        Link::Edge {
             kind: kind @ (EdgeKind::Reads | EdgeKind::Lists | EdgeKind::Dynamic | EdgeKind::Spawn),
             dependency,
         } => {

@@ -330,6 +330,22 @@ impl TypeScriptLinker {
             });
         }
 
+        for group in &groups {
+            for setup_file in &group.setup_files {
+                let setup_file = graph.add_file(setup_file.clone());
+
+                for test in tests.iter().filter(|test| group.covers(test)) {
+                    let test = graph.add_file(test.clone());
+
+                    graph.add_edge(Edge {
+                        dependent: test,
+                        dependency: setup_file,
+                        kind: EdgeKind::Setup,
+                    });
+                }
+            }
+        }
+
         for linked_file in &linked_files {
             self.add_linked_file(linked_file, manifest_changes, graph);
         }
