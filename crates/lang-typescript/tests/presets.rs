@@ -246,43 +246,20 @@ fn setup_files_and_what_only_they_reach_run_every_test() {
 }
 
 #[test]
-fn a_shared_module_reaches_every_test_only_through_what_the_setup_file_runs() {
+fn shared_source_module_imported_by_a_setup_file_selects_only_its_importers() {
     let project = vitest_project();
 
     assert_eq!(
-        project
-            .outcome_of(&[], &[modified("src/log.ts")])
-            .selected_paths(),
-        [
-            "src/log.test.ts",
-            "src/fast/a.test.ts",
-            "src/fast/b.test.ts",
-            "src/fast/c.test.ts"
-        ]
-    );
-
-    project.write(
-        "src/log.ts",
-        "export const warn = () => { console.warn(1); };",
-    );
-
-    assert_eq!(
-        project.symbol_outcome_of(
-            &[("src/log.ts", "export const warn = () => {};")],
-            &[modified("src/log.ts")]
-        ),
+        project.outcome_of(&[], &[modified("src/log.ts")]),
         selected(&[(
             "src/log.test.ts",
-            &[
-                "src/log.ts (modified)",
-                "-> paired by name with src/log.test.ts"
-            ],
+            &["src/log.ts (modified)", "-> imported by src/log.test.ts"],
         )])
     );
 }
 
 #[test]
-fn a_change_to_what_a_setup_file_runs_selects_every_test() {
+fn test_support_a_setup_file_reaches_runs_every_test_even_when_tests_import_it() {
     let base_handlers = "export const handlers = [\"flows\"];";
     let project = TestProject::new(&[
         (
@@ -325,13 +302,11 @@ fn a_change_to_what_a_setup_file_runs_selects_every_test() {
     );
 
     assert_eq!(
-        project
-            .symbol_outcome_of(
-                &[("tests/utils/handlers.ts", base_handlers)],
-                &[modified("tests/utils/handlers.ts")]
-            )
-            .selected_paths(),
-        ["tests/flows.test.ts", "tests/api/service.test.ts"]
+        project.symbol_outcome_of(
+            &[("tests/utils/handlers.ts", base_handlers)],
+            &[modified("tests/utils/handlers.ts")]
+        ),
+        all(&["tests/utils/handlers.ts (modified) is loaded before every test"])
     );
 }
 

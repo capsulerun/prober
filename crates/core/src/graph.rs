@@ -22,7 +22,6 @@ pub enum EdgeKind {
     Build,
     Binding,
     Rule,
-    Setup,
 }
 
 impl EdgeKind {
@@ -38,8 +37,7 @@ impl EdgeKind {
             | EdgeKind::Spawn
             | EdgeKind::Build
             | EdgeKind::Binding
-            | EdgeKind::Rule
-            | EdgeKind::Setup => true,
+            | EdgeKind::Rule => true,
             EdgeKind::TypeOnly => false,
         }
     }

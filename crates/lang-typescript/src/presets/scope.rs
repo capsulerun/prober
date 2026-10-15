@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use prober_core::files::RepoPath;
 
-use crate::conventions::{is_runner_config, is_source_file};
+use crate::conventions::{is_runner_config, is_source_file, is_test_support_file};
 use crate::workspaces::parent_directory;
 
 const PACKAGE_NODE_PREFIX: &str = "node_modules/";
@@ -15,7 +15,6 @@ pub(crate) struct RunnerGroup {
     pub configs: BTreeSet<RepoPath>,
     pub config_scope: BTreeSet<RepoPath>,
     pub setup_scope: BTreeSet<RepoPath>,
-    pub setup_files: BTreeSet<RepoPath>,
     pub packages: BTreeSet<String>,
 }
 
@@ -152,11 +151,14 @@ fn group_with_setup(
     setup_seeds: BTreeSet<RepoPath>,
 ) -> RunnerGroup {
     let mut setup_scope = setup_seeds.clone();
-    let mut files_to_visit: VecDeque<RepoPath> = setup_seeds.iter().cloned().collect();
+    let mut files_to_visit: VecDeque<RepoPath> = setup_seeds.into_iter().collect();
 
     while let Some(file) = files_to_visit.pop_front() {
         for dependency in inputs.repo_dependencies(&file) {
-            if !reached_by_tests.contains(dependency) && setup_scope.insert(dependency.clone()) {
+            let runs_for_every_test =
+                !reached_by_tests.contains(dependency) || is_test_support_file(dependency);
+
+            if runs_for_every_test && setup_scope.insert(dependency.clone()) {
                 files_to_visit.push_back(dependency.clone());
             }
         }
@@ -175,7 +177,6 @@ fn group_with_setup(
         configs,
         config_scope,
         setup_scope,
-        setup_files: setup_seeds,
         packages,
     }
 }
@@ -345,7 +346,6 @@ mod tests {
                     "vitest.config.ts",
                 ]),
                 setup_scope: paths(&["test/setup.shared.ts", "test/setup.ts"]),
-                setup_files: paths(&["test/setup.ts"]),
                 packages: BTreeSet::from([
                     "@vitejs/plugin-vue".to_owned(),
                     "fake-indexeddb".to_owned()
