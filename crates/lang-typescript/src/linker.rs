@@ -38,10 +38,10 @@ use crate::presets::patterns::join_directory;
 use crate::presets::{RunnerGroup, RunnerPresets, ScopeInputs, imports_node_test, runner_groups};
 use crate::resolver::{ModuleResolver, package_node};
 use crate::root_scope::RootScopeEffects;
-use crate::symbols::{ModuleSymbols, SymbolAnalysis, add_symbols, extract_symbols};
+use crate::symbols::{ExportTarget, ModuleSymbols, SymbolAnalysis, add_symbols, extract_symbols};
 use crate::test_links::TestLinks;
 use crate::workspaces::{
-    PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest, parent_directory,
+    LocalDependency, PACKAGE_MANIFEST, discover_workspace, is_workspace_manifest, parent_directory,
 };
 
 pub(crate) const PACKAGE_NODE_PREFIX: &str = "node_modules/";
@@ -53,6 +53,7 @@ const CASE_FOLDER: &str = "case folder named after the test";
 pub struct TypeScriptLinker {
     repo_root: PathBuf,
     packages: BTreeMap<String, String>,
+    local_dependencies: Vec<LocalDependency>,
     build_mapping: Arc<BuildMapping>,
     programs: Programs,
     resolver: ModuleResolver,
@@ -117,12 +118,19 @@ impl TypeScriptLinker {
             Some((manifest, document))
         }));
         let packages = workspace.packages;
+        let local_dependencies = workspace.local_dependencies;
         let build_mapping = Arc::new(BuildMapping::new(&repo_root, repo_files));
-        let resolver = head_resolver(&repo_root, &packages, Some(Arc::clone(&build_mapping)));
+        let resolver = head_resolver(
+            &repo_root,
+            &packages,
+            &local_dependencies,
+            Some(Arc::clone(&build_mapping)),
+        );
         let napi_packages = NapiPackages::read(repo_files, &read_head);
         let linker = Self {
             repo_root,
             packages,
+            local_dependencies,
             build_mapping,
             programs,
             resolver,
@@ -140,7 +148,12 @@ impl TypeScriptLinker {
         let resolver = if inference.build_mapping {
             self.resolver
         } else {
-            head_resolver(&self.repo_root, &self.packages, None)
+            head_resolver(
+                &self.repo_root,
+                &self.packages,
+                &self.local_dependencies,
+                None,
+            )
         };
 
         Self {
@@ -338,6 +351,7 @@ impl TypeScriptLinker {
             add_build_edges(
                 &self.build_mapping,
                 build_output_candidates(&linked_files, &dynamic_inference),
+                &reexported_modules(&linked_files),
                 graph,
             );
         }
@@ -560,13 +574,18 @@ impl TypeScriptLinker {
             .chain(base_configs.keys().copied())
             .filter(|path| is_workspace_manifest(path))
             .collect();
-        let packages = discover_workspace(manifest_paths, &read_base).packages;
+        let workspace = discover_workspace(manifest_paths, &read_base);
+        let packages = workspace.packages;
         let overlay = manifest_changes
             .base_configs()
             .iter()
             .map(|(path, bytes)| (self.repo_root.join(path.as_str()), bytes.clone()));
         let file_system = RepoFileSystem::at(&self.repo_root)
             .with_links(package_links(&self.repo_root, &packages))
+            .with_package_links(local_dependency_links(
+                &self.repo_root,
+                &workspace.local_dependencies,
+            ))
             .with_overlay(overlay)
             .with_build_mapping(self.build_outputs());
 
@@ -855,10 +874,12 @@ fn package_directories(repo_files: &[RepoPath]) -> BTreeSet<String> {
 fn head_resolver(
     repo_root: &Path,
     packages: &BTreeMap<String, String>,
+    local_dependencies: &[LocalDependency],
     build_mapping: Option<Arc<BuildMapping>>,
 ) -> ModuleResolver {
     let file_system = RepoFileSystem::at(repo_root)
         .with_links(package_links(repo_root, packages))
+        .with_package_links(local_dependency_links(repo_root, local_dependencies))
         .with_build_mapping(build_mapping);
 
     ModuleResolver::new(repo_root, file_system, packages.keys().cloned().collect())
@@ -884,21 +905,74 @@ fn build_output_candidates<'l>(
 fn add_build_edges(
     build_mapping: &BuildMapping,
     candidates: BTreeSet<&RepoPath>,
+    reexported: &HashMap<&RepoPath, Vec<&RepoPath>>,
     graph: &mut GraphBuilder,
 ) {
     for output in candidates {
         for build_source in build_mapping.sources_of(output.as_str()) {
             let output_file = graph.add_file(output.clone());
-            let source_file = graph.add_file(build_source.path);
-            let build_edge = Edge {
-                dependent: output_file,
-                dependency: source_file,
-                kind: EdgeKind::Build,
-            };
 
-            graph.add_inferred_edge(build_edge, build_source.inference);
+            for source in exposed_modules(&build_source.path, reexported) {
+                let source_file = graph.add_file(source);
+                let build_edge = Edge {
+                    dependent: output_file,
+                    dependency: source_file,
+                    kind: EdgeKind::Build,
+                };
+
+                graph.add_inferred_edge(build_edge, build_source.inference.clone());
+            }
         }
     }
+}
+
+fn reexported_modules(linked_files: &[LinkedFile]) -> HashMap<&RepoPath, Vec<&RepoPath>> {
+    linked_files
+        .iter()
+        .filter_map(|linked_file| {
+            let analysis = linked_file.symbols.as_ref()?;
+            let module = analysis.module.as_ref().ok()?;
+            let exported_imports = module
+                .exports
+                .iter()
+                .filter_map(|(_, target)| match target {
+                    ExportTarget::Reexport { specifier, .. }
+                    | ExportTarget::Namespace(specifier) => Some(specifier.as_str()),
+                    ExportTarget::Import(binding) => module
+                        .imports
+                        .get(*binding)
+                        .map(|import| import.specifier.as_str()),
+                    ExportTarget::Local(_) => None,
+                });
+            let specifiers = exported_imports.chain(module.star_exports.iter().map(String::as_str));
+            let modules: Vec<&RepoPath> = specifiers
+                .filter_map(|specifier| analysis.targets.get(specifier))
+                .flatten()
+                .collect();
+
+            (!modules.is_empty()).then_some((&linked_file.path, modules))
+        })
+        .collect()
+}
+
+fn exposed_modules(
+    source: &RepoPath,
+    reexported: &HashMap<&RepoPath, Vec<&RepoPath>>,
+) -> Vec<RepoPath> {
+    let mut exposed = vec![source.clone()];
+    let mut visited: HashSet<&RepoPath> = HashSet::from([source]);
+    let mut pending: Vec<&RepoPath> = vec![source];
+
+    while let Some(module) = pending.pop() {
+        for &target in reexported.get(module).into_iter().flatten() {
+            if visited.insert(target) {
+                exposed.push(target.clone());
+                pending.push(target);
+            }
+        }
+    }
+
+    exposed
 }
 
 fn add_binding_links(binding_links: Vec<BindingLink>, graph: &mut GraphBuilder) {
@@ -913,6 +987,22 @@ fn add_binding_links(binding_links: Vec<BindingLink>, graph: &mut GraphBuilder) 
 
         graph.add_inferred_edge(binding_edge, binding_link.inference);
     }
+}
+
+fn local_dependency_links(
+    repo_root: &Path,
+    local_dependencies: &[LocalDependency],
+) -> Vec<(PathBuf, String, PathBuf)> {
+    local_dependencies
+        .iter()
+        .map(|dependency| {
+            (
+                repo_root.join(&dependency.package_directory),
+                dependency.name.clone(),
+                repo_root.join(&dependency.target_directory),
+            )
+        })
+        .collect()
 }
 
 fn package_links(repo_root: &Path, packages: &BTreeMap<String, String>) -> Vec<(String, PathBuf)> {

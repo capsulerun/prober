@@ -65,6 +65,7 @@ struct BuildEntry {
 #[derive(Debug, Default)]
 pub(crate) struct BuildMapping {
     files: HashSet<String>,
+    directories: HashSet<String>,
     rules: HashMap<String, Vec<SourceRule>>,
     entries: HashMap<String, Vec<BuildEntry>>,
 }
@@ -87,12 +88,12 @@ impl BuildMapping {
                 .collect(),
             ..Self::default()
         };
-        let directories: HashSet<&str> = repo_files
+        let directories: HashSet<String> = repo_files
             .iter()
             .flat_map(|path| {
                 path.as_str()
                     .match_indices('/')
-                    .map(|(offset, _)| &path.as_str()[..offset])
+                    .map(|(offset, _)| path.as_str()[..offset].to_owned())
             })
             .collect();
         let is_output_directory = |directory: &str| !directories.contains(directory);
@@ -121,7 +122,28 @@ impl BuildMapping {
             }
         }
 
+        mapping.directories = directories;
+
         mapping
+    }
+
+    pub fn is_output_directory(&self, path: &str) -> bool {
+        if self.directories.contains(path) {
+            return false;
+        }
+
+        if self.rules.contains_key(path) {
+            return true;
+        }
+
+        self.matching_rules(path).any(|(directory, rules)| {
+            let relative_directory = &path[directory.len() + 1..];
+
+            rules.iter().any(|rule| {
+                join_directory(&rule.source_directory, relative_directory)
+                    .is_some_and(|source_directory| self.directories.contains(&source_directory))
+            })
+        })
     }
 
     pub fn is_output(&self, path: &str) -> bool {
@@ -313,7 +335,7 @@ impl BuildMapping {
     fn add_convention(
         &mut self,
         package_directory: &str,
-        directories: &HashSet<&str>,
+        directories: &HashSet<String>,
         is_output_directory: &dyn Fn(&str) -> bool,
     ) {
         let Some(output_directory) = join_directory(package_directory, DEFAULT_OUTPUT_DIRECTORY)
@@ -326,9 +348,7 @@ impl BuildMapping {
         }
 
         for source_directory in package_source_directories(package_directory) {
-            if source_directory != package_directory
-                && !directories.contains(source_directory.as_str())
-            {
+            if source_directory != package_directory && !directories.contains(&source_directory) {
                 continue;
             }
 

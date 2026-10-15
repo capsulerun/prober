@@ -31,9 +31,9 @@ Prober outputs the tests a change can affect, each with the reason it was select
 ### In GitHub Actions
 
 ```yaml
-- uses: actions/checkout@v7
 - uses: capsulerun/prober@v0
   id: prober
+
 - run: xargs -r npx vitest run < "$TESTS"
   env:
     TESTS: ${{ steps.prober.outputs.typescript-file }}
