@@ -19,7 +19,7 @@ use crate::dynamic::value::Value;
 use crate::manifests::documents::{parse_json, parse_jsonc, parse_yaml};
 use crate::presets::configs::{
     ProjectReading, json_to_value, read_cypress, read_jest, read_mocha, read_playwright,
-    read_vitest,
+    read_rstest, read_vitest,
 };
 use crate::presets::patterns::{TestPattern, relative_globs};
 use crate::workspaces::{PACKAGE_MANIFEST, parent_directory};
@@ -35,6 +35,14 @@ pub(crate) const JEST_DEFAULT_TEST_MATCH: &[&str] = &[
     "**/?(*.)+(spec|test).?([mc])[jt]s?(x)",
 ];
 
+pub(crate) const RSTEST_DEFAULT_INCLUDE: &[&str] = &["**/*.{test,spec}.?(c|m)[jt]s?(x)"];
+
+pub(crate) const RSTEST_DEFAULT_EXCLUDE: &[&str] = &[
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/.{idea,git,cache,output,temp}/**",
+];
+
 const CYPRESS_DEFAULT_SPEC: &str = "**/*.cy.{js,jsx,ts,tsx,mjs,cjs}";
 
 const NODE_TEST_MODULE: &str = "node:test";
@@ -48,17 +56,19 @@ pub(crate) enum Preset {
     Mocha,
     NodeTest,
     Playwright,
+    Rstest,
     Vite,
     Vitest,
 }
 
 impl Preset {
-    const ALL: [Preset; 7] = [
+    const ALL: [Preset; 8] = [
         Preset::Cypress,
         Preset::Jest,
         Preset::Mocha,
         Preset::NodeTest,
         Preset::Playwright,
+        Preset::Rstest,
         Preset::Vite,
         Preset::Vitest,
     ];
@@ -70,6 +80,7 @@ impl Preset {
             Preset::Mocha => "mocha",
             Preset::NodeTest => "node-test",
             Preset::Playwright => "playwright",
+            Preset::Rstest => "rstest",
             Preset::Vite => "vite",
             Preset::Vitest => "vitest",
         }
@@ -82,6 +93,7 @@ impl Preset {
             Preset::Mocha => &["mocha"],
             Preset::NodeTest => &[],
             Preset::Playwright => &["@playwright/test", "playwright"],
+            Preset::Rstest => &["@rstest/core", "rstack"],
             Preset::Vite => &["vite"],
             Preset::Vitest => &["vitest"],
         }
@@ -94,6 +106,7 @@ impl Preset {
             Preset::Mocha => &[".mocharc."],
             Preset::NodeTest => &[],
             Preset::Playwright => &["playwright.config."],
+            Preset::Rstest => &["rstest.config.", "rstack.config."],
             Preset::Vite => &["vite.config."],
             Preset::Vitest => &["vitest.config.", "vitest.workspace."],
         }
@@ -102,6 +115,7 @@ impl Preset {
     fn global_config_patterns(self) -> &'static [&'static str] {
         match self {
             Preset::Jest => &["**/jest.*"],
+            Preset::Rstest => &["**/rstest.config.*"],
             Preset::Vite => &["**/vite.config.*"],
             Preset::Vitest => &["**/vitest.*"],
             Preset::Cypress | Preset::Mocha | Preset::NodeTest | Preset::Playwright => &[],
@@ -139,7 +153,7 @@ impl RunnerPresets {
 
         presets.runner_configs = repo_files
             .iter()
-            .filter(|path| is_runner_config(path) && presets.reads_config(path))
+            .filter(|path| is_runner_config(path) && presets.reads_config(path, evaluator))
             .cloned()
             .collect();
         presets.read_configs(repo_root, repo_files, &manifests, evaluator);
@@ -212,8 +226,17 @@ impl RunnerPresets {
             && matching_readings.all(|reading| reading.renders_assets == Some(false))
     }
 
-    fn reads_config(&self, path: &RepoPath) -> bool {
+    fn reads_config(&self, path: &RepoPath, evaluator: &Evaluator) -> bool {
         let file_name = file_name(path);
+
+        if file_name.starts_with("rstest.config.") {
+            return self.uses(Preset::Rstest);
+        }
+
+        if file_name.starts_with("rstack.config.") {
+            return self.uses(Preset::Rstest)
+                && evaluator.evaluate_registered_config(path).is_some();
+        }
 
         if file_name.starts_with("vitest.") {
             return self.uses(Preset::Vitest);
@@ -274,6 +297,17 @@ impl RunnerPresets {
             }
 
             self.jest_manifests = jest_manifests.into_iter().map(|(path, _)| path).collect();
+        }
+
+        if self.uses(Preset::Rstest) {
+            for config in self
+                .runner_configs
+                .iter()
+                .filter(|path| has_prefix(path, Preset::Rstest))
+            {
+                self.readings
+                    .extend(read_rstest(evaluator, config, &self.runner_configs));
+            }
         }
 
         if self.uses(Preset::Playwright) {
@@ -362,6 +396,10 @@ pub(crate) fn is_vitest_config(path: &RepoPath) -> bool {
     file_name.starts_with("vitest.config.")
         || file_name.starts_with("vitest.workspace.")
         || file_name.starts_with("vite.config.")
+}
+
+pub(crate) fn is_rstest_config(path: &RepoPath) -> bool {
+    has_prefix(path, Preset::Rstest)
 }
 
 pub(crate) fn is_jest_config(path: &RepoPath) -> bool {

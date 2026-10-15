@@ -24,7 +24,7 @@ Prober outputs the tests a change can affect, each with the reason it was select
 
 
 > [!NOTE]
-> Works with TypeScript/JavaScript (Vitest, Jest, Mocha, `node:test`, Playwright, Cypress, Vite), Python (pytest, Django) and Rust (Cargo workspaces), in one run when a repository mixes them, including through the Python and Node modules built from Rust (maturin, napi).
+> Works with TypeScript/JavaScript, Python and Rust, in one run when a repository mixes them, including through the Python and Node modules built from Rust.
 
 ## Getting started
 
@@ -204,7 +204,7 @@ Paths are relative to the root of the repository. In patterns, `*` matches withi
 
 #### `presets`
 
-The test runners and frameworks whose conventions apply: test file names, setup files, config files and how their changes are compared. `"auto"`, the default, detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `vite`, `vitest`.
+The test runners and frameworks whose conventions apply: test file names, setup files, config files and how their changes are compared. `"auto"`, the default, detects them from the repository; a list forces or restricts them. Known presets: `cargo`, `cypress`, `django`, `jest`, `mocha`, `node-test`, `playwright`, `pytest`, `rstest`, `vite`, `vitest`.
 
 #### `[always_all]`
 

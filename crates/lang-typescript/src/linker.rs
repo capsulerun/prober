@@ -178,7 +178,8 @@ impl TypeScriptLinker {
 
     pub fn with_presets(self, presets: &Presets, repo_files: &[RepoPath]) -> Self {
         let importers = HashMap::new();
-        let evaluator = Evaluator::new(&self.repo_root, &self.resolver, &importers);
+        let evaluator =
+            Evaluator::new(&self.repo_root, &self.resolver, &importers).with_config_spreads();
         let presets = RunnerPresets::read(presets, &self.repo_root, repo_files, &evaluator);
 
         Self { presets, ..self }

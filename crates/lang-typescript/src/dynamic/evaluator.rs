@@ -48,6 +48,8 @@ const LOADING_BUILTIN_MODULES: [&str; 8] = [
 
 const NODE_EXECUTABLE: &str = "node";
 
+const RESOLVE_FROM_FILE: &str = "index.js";
+
 pub(crate) struct Load {
     pub specifier: Value,
     pub base: LoadBase,
@@ -174,6 +176,12 @@ impl<'e> Evaluator<'e> {
         }
     }
 
+    pub fn with_config_spreads(self) -> Self {
+        self.evaluates_spreads.set(true);
+
+        self
+    }
+
     pub fn with_load_scope(self, load_scope: LoadScope) -> Self {
         Self { load_scope, ..self }
     }
@@ -268,6 +276,41 @@ impl<'e> Evaluator<'e> {
                 vec![config],
             ),
         }
+    }
+
+    pub fn evaluate_registered_config(&self, module: &RepoPath) -> Option<Value> {
+        self.steps.set(0);
+
+        let summary = self.summary(module)?;
+        let context = Context::top(module);
+
+        summary
+            .effects
+            .iter()
+            .filter(|effect| effect.unit.is_none())
+            .find_map(|effect| {
+                let Action::Call { callee, arguments } = &effect.action else {
+                    return None;
+                };
+
+                if self.evaluate_callee(&context, callee)
+                    != Value::Builtin(Builtin::RegisterTestConfig)
+                {
+                    return None;
+                }
+
+                let config = arguments
+                    .first()
+                    .map_or_else(Value::runtime_value, |argument| {
+                        self.evaluate(&context, argument)
+                    });
+
+                Some(self.call(
+                    &context,
+                    Value::Builtin(Builtin::DefineConfig),
+                    vec![config],
+                ))
+            })
     }
 
     pub fn file_access(
@@ -857,9 +900,14 @@ impl<'e> Evaluator<'e> {
             Value::Builtin(Builtin::GlobModule) => glob_member(property),
             Value::Builtin(Builtin::Process) => match property {
                 "cwd" => Value::Builtin(Builtin::ProcessCwd),
+                "env" => Value::Builtin(Builtin::ProcessEnv),
                 "execPath" | "argv0" => Value::text(NODE_EXECUTABLE),
                 _ => Value::runtime_value(),
             },
+            Value::Builtin(Builtin::ProcessEnv) => Value::Unknown(Unknown::environment_variable()),
+            Value::Builtin(Builtin::ConfigRegistry) if property == "test" => {
+                Value::Builtin(Builtin::RegisterTestConfig)
+            }
             Value::Builtin(Builtin::ChildProcessModule) => child_process_member(property),
             Value::Builtin(Builtin::Spawn(kind)) if property == "sync" => {
                 Value::Builtin(Builtin::Spawn(kind))
@@ -913,7 +961,21 @@ impl<'e> Evaluator<'e> {
                 Value::Require(file_url_to_path(&first_argument).patterns())
             }
             Value::Builtin(Builtin::RequireResolve(bases)) => {
-                require_resolve(&first_argument, &bases)
+                let bases = match arguments
+                    .get(1)
+                    .map(|options| self.member(options.clone(), "paths"))
+                {
+                    Some(Value::Array(directories)) => directories
+                        .into_iter()
+                        .flat_map(|directory| {
+                            path_join(&[directory, Value::text(RESOLVE_FROM_FILE)]).patterns()
+                        })
+                        .collect(),
+                    _ => bases,
+                };
+
+                self.resolve_package(&first_argument, &bases)
+                    .unwrap_or_else(|| require_resolve(&first_argument, &bases))
             }
             Value::Builtin(Builtin::ObjectKeys | Builtin::ObjectValues)
                 if is_open_object(&first_argument) =>
@@ -1022,6 +1084,23 @@ impl<'e> Evaluator<'e> {
         }
 
         self.nested(|| alternatives(self.evaluate_all(&callee_context, returns)))
+    }
+
+    fn resolve_package(&self, specifier: &Value, bases: &[Pattern]) -> Option<Value> {
+        let specifier = specifier.single_literal()?;
+
+        if specifier.starts_with('.') || specifier.starts_with('/') || specifier.contains(':') {
+            return None;
+        }
+
+        bases
+            .iter()
+            .find_map(|base| match self.resolve(&repo_module(base)?, &specifier) {
+                Resolution::RepoFile(module) => {
+                    Some(Value::Strings(vec![Pattern::repo_path(module.as_str())]))
+                }
+                Resolution::Outside | Resolution::Missing => None,
+            })
     }
 
     fn required_module(&self, bases: &[Pattern], specifier: &Value) -> Value {
@@ -1148,8 +1227,10 @@ fn builtin_import(specifier: &str, name: &ImportedName) -> Option<Value> {
         ("jiti", None | Some("createJiti" | "default")) => {
             Some(Value::Builtin(Builtin::CreateRequire))
         }
+        ("rstack", Some("define")) => Some(Value::Builtin(Builtin::ConfigRegistry)),
         (
-            "vitest/config" | "vitest" | "vite" | "vitest/node" | "@playwright/test" | "cypress",
+            "vitest/config" | "vitest" | "vite" | "vitest/node" | "@playwright/test" | "cypress"
+            | "@rstest/core" | "rstack/test",
             Some(member),
         ) => runner_config_member(member),
         _ => None,

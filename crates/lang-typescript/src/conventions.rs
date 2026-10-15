@@ -30,10 +30,17 @@ pub const MANIFEST_DEFAULTS: &[&str] = &[
     "**/jsconfig*.json",
 ];
 
-const RUNNER_CONFIG_PREFIXES: [&str; 3] = ["vitest.", "vite.config.", "jest.config."];
+const RUNNER_CONFIG_PREFIXES: [&str; 5] = [
+    "vitest.",
+    "vite.config.",
+    "jest.config.",
+    "rstest.config.",
+    "rstack.config.",
+];
 
 const TEST_RUNNER_PACKAGES: &[&str] = &[
     "@playwright/test",
+    "@rstest/core",
     "@swc/jest",
     "@vitest/browser",
     "@vitest/ui",
@@ -48,6 +55,8 @@ const TEST_RUNNER_PACKAGES: &[&str] = &[
     "mocha",
     "playwright",
     "playwright-core",
+    "rstack",
+    "rstest",
     "tap",
     "ts-jest",
     "ts-node",
@@ -371,6 +380,8 @@ mod tests {
             "test/vitest.unit-paths.mjs",
             "jest.config.js",
             "app/vite.config.mts",
+            "tests/rstest.config.ts",
+            "rstack.config.mts",
         ] {
             assert!(
                 is_runner_config(&repo_path(runner_config)),
