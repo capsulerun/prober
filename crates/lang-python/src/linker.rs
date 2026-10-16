@@ -21,7 +21,8 @@ use crate::django::{installed_app_links, settings_modules};
 use crate::families::naming_families;
 use crate::links::{LinkSettings, Linking};
 use crate::manifests::{
-    DependencyChanges, PACKAGE_NODE_PREFIX, ProjectChange, project_directories,
+    DependencyChanges, PACKAGE_NODE_PREFIX, PackageChange, ProjectChange, project_directories,
+    project_of,
 };
 use crate::modules::{ImportTarget, ModuleIndex};
 use crate::pytest::configs::{PytestConfigs, is_within};
@@ -148,6 +149,7 @@ impl PythonLinker {
             .map(|path| (*path).clone())
             .collect();
         let outside_packages = modules_outside_packages(&modules, &self.index);
+        let environments = Environments::new(repo_files, self.dependency_changes.packages());
         let mut module_edges: HashMap<RepoPath, Vec<ModuleEdge>> = HashMap::new();
 
         for &module in &modules {
@@ -163,9 +165,10 @@ impl PythonLinker {
                 } else {
                     EdgeKind::Import
                 };
-                for dependency in import_dependencies(&import.target, &outside_packages)
-                    .into_iter()
-                    .filter(|dependency| dependency != module)
+                for dependency in
+                    import_dependencies(module, &import.target, &outside_packages, &environments)
+                        .into_iter()
+                        .filter(|dependency| dependency != module)
                 {
                     module_edges
                         .entry(module.clone())
@@ -312,9 +315,14 @@ impl PythonLinker {
         }
 
         for package in self.dependency_changes.packages() {
+            let node = match &package.project {
+                Some(project) => environment_package_node(project, &package.import_name),
+                None => package_node(&package.import_name),
+            };
+
             graph.add_changed_part(
                 package.change_path.clone(),
-                package_node(&package.import_name),
+                node,
                 package.description.clone(),
             );
         }
@@ -363,8 +371,9 @@ impl PythonLinker {
             let global_plugins = global_plugins(&self.configs, &self.index, repo_files, &read_head);
             let providers = self.providers(&modules, summaries, &global_plugins);
             let base_summaries = self.base_summaries(summaries, change_set)?;
-            let dependencies =
-                |target: &ImportTarget| import_dependencies(target, &outside_packages);
+            let dependencies = |importer: &RepoPath, target: &ImportTarget| {
+                import_dependencies(importer, target, &outside_packages, &environments)
+            };
             let analysed = Analysis {
                 summaries,
                 base_summaries: &base_summaries,
@@ -554,14 +563,63 @@ fn package_node(import_name: &str) -> RepoPath {
     .expect("import names are valid path segments")
 }
 
+fn environment_package_node(project: &str, import_name: &str) -> RepoPath {
+    RepoPath::new(format!(
+        "{PACKAGE_NODE_PREFIX}{project}/{}",
+        import_name.to_ascii_lowercase()
+    ))
+    .expect("project directories and import names are valid path segments")
+}
+
+struct Environments {
+    project_directories: BTreeSet<String>,
+    scoped_packages: HashSet<(String, String)>,
+}
+
+impl Environments {
+    fn new(repo_files: &[RepoPath], packages: &[PackageChange]) -> Self {
+        let scoped_packages: HashSet<(String, String)> = packages
+            .iter()
+            .filter_map(|package| {
+                let project = package.project.clone()?;
+
+                Some((project, package.import_name.to_ascii_lowercase()))
+            })
+            .collect();
+        let project_directories = if scoped_packages.is_empty() {
+            BTreeSet::new()
+        } else {
+            project_directories(repo_files)
+        };
+
+        Self {
+            project_directories,
+            scoped_packages,
+        }
+    }
+
+    fn package_node(&self, importer: &RepoPath, name: &str) -> Option<RepoPath> {
+        let project = project_of(importer, &self.project_directories)?;
+        let key = (project.to_owned(), name.to_ascii_lowercase());
+
+        self.scoped_packages
+            .contains(&key)
+            .then(|| environment_package_node(project, name))
+    }
+}
+
 fn import_dependencies(
+    importer: &RepoPath,
     target: &ImportTarget,
     outside_packages: &HashMap<&str, Vec<RepoPath>>,
+    environments: &Environments,
 ) -> Vec<RepoPath> {
     match target {
         ImportTarget::Repo(files) => files.clone(),
         ImportTarget::External(name) => {
             let mut dependencies = vec![package_node(name)];
+
+            dependencies.extend(environments.package_node(importer, name));
 
             dependencies.extend(
                 outside_packages

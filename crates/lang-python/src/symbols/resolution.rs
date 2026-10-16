@@ -39,7 +39,7 @@ pub(crate) struct Analysis<'a> {
     pub tests: &'a BTreeSet<RepoPath>,
     pub providers: &'a HashSet<RepoPath>,
     pub module_edges: &'a HashMap<RepoPath, Vec<ModuleEdge>>,
-    pub dependencies: &'a dyn Fn(&ImportTarget) -> Vec<RepoPath>,
+    pub dependencies: &'a dyn Fn(&RepoPath, &ImportTarget) -> Vec<RepoPath>,
     pub attribute_paths: &'a [AttributePath],
 }
 
@@ -235,7 +235,7 @@ impl Analysis<'_> {
         for import in summary.imports.iter().filter(|import| !import.type_only) {
             let loader = ids[module][symbols.symbol_at(import.line)];
 
-            for dependency in (self.dependencies)(&import.target)
+            for dependency in (self.dependencies)(path, &import.target)
                 .into_iter()
                 .filter(|dependency| dependency != path)
             {
@@ -394,8 +394,8 @@ impl Analysis<'_> {
             return;
         };
         let base_summary = &self.base_summaries[path];
-        let base_loads = self.init_loads(base, base_summary);
-        let head_loads = self.init_loads(head, summary);
+        let base_loads = self.init_loads(path, base, base_summary);
+        let head_loads = self.init_loads(path, head, summary);
         let mut symbol_changes = Vec::new();
 
         for changed in module_changes(base, &base_loads, head, &head_loads) {
@@ -438,14 +438,19 @@ impl Analysis<'_> {
         graph.add_module_changes(file, symbol_changes);
     }
 
-    fn init_loads(&self, symbols: &ModuleSymbols, summary: &ModuleSummary) -> BTreeSet<String> {
+    fn init_loads(
+        &self,
+        path: &RepoPath,
+        symbols: &ModuleSymbols,
+        summary: &ModuleSummary,
+    ) -> BTreeSet<String> {
         summary
             .imports
             .iter()
             .filter(|import| {
                 !import.type_only && symbols.symbol_at(import.line) == ModuleSymbols::INIT
             })
-            .flat_map(|import| (self.dependencies)(&import.target))
+            .flat_map(|import| (self.dependencies)(path, &import.target))
             .map(|dependency| dependency.to_string())
             .collect()
     }
