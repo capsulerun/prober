@@ -134,6 +134,7 @@ pub(crate) struct PackageChange {
     pub change_path: RepoPath,
     pub import_name: String,
     pub description: String,
+    pub project: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -221,6 +222,7 @@ impl DependencyChanges {
         }
 
         for distribution in distributions {
+            let project = project_of(&distribution.change.path, project_directories);
             let mut accounted = DISTRIBUTIONS_WITHOUT_EFFECT.contains(&distribution.name.as_str())
                 || distribution.name.starts_with("types_")
                 || distribution.name.ends_with("_stubs");
@@ -243,12 +245,17 @@ impl DependencyChanges {
                             distribution.detail
                         ),
                     };
+                    let description = match project {
+                        Some(project) => format!("{description} in the environment of {project}"),
+                        None => description,
+                    };
 
                     accounted = true;
                     dependency_changes.packages.push(PackageChange {
                         change_path: distribution.change.path.clone(),
                         import_name,
                         description,
+                        project: project.map(str::to_owned),
                     });
                 }
             }

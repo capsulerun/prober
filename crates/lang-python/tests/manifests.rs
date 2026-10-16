@@ -146,6 +146,64 @@ fn a_project_manifest_runs_the_tests_of_its_project_and_of_its_importers() {
 }
 
 #[test]
+fn a_project_lockfile_reaches_only_the_importers_in_its_environment() {
+    let lockfile = |urllib3: &str| {
+        format!(
+            "[[package]]\nname = \"langsmith\"\nversion = \"0.4.0\"\ndependencies = [{{ name = \"urllib3\" }}]\n\n[[package]]\nname = \"urllib3\"\nversion = \"{urllib3}\"\n"
+        )
+    };
+    let project = TestProject::new(&[
+        (
+            "libs/core/pyproject.toml",
+            "[project]\nname = \"acme-core\"\nversion = \"1.0\"\ndependencies = [\"langsmith\"]\n",
+        ),
+        ("libs/core/uv.lock", &lockfile("2.6.0")),
+        ("libs/core/acme_core/__init__.py", ""),
+        ("libs/core/acme_core/tracing.py", "import langsmith\n"),
+        (
+            "libs/core/tests/test_tracing.py",
+            "from acme_core import tracing\n",
+        ),
+        (
+            "libs/partners/nomic/pyproject.toml",
+            "[project]\nname = \"acme-nomic\"\nversion = \"1.0\"\ndependencies = [\"acme-core\", \"langsmith\"]\n",
+        ),
+        ("libs/partners/nomic/uv.lock", &lockfile("2.7.0")),
+        ("libs/partners/nomic/acme_nomic/__init__.py", ""),
+        (
+            "libs/partners/nomic/acme_nomic/embeddings.py",
+            "import langsmith\nfrom acme_core import tracing\n",
+        ),
+        (
+            "libs/partners/nomic/tests/test_embeddings.py",
+            "from acme_nomic import embeddings\n",
+        ),
+    ]);
+
+    assert_eq!(
+        project
+            .outcome_of(
+                &[("libs/partners/nomic/uv.lock", &lockfile("2.6.0"))],
+                &[modified("libs/partners/nomic/uv.lock")]
+            )
+            .selected_paths(),
+        ["libs/partners/nomic/tests/test_embeddings.py"]
+    );
+    assert_eq!(
+        project
+            .outcome_of(
+                &[("libs/core/uv.lock", &lockfile("2.5.0"))],
+                &[modified("libs/core/uv.lock")]
+            )
+            .selected_paths(),
+        [
+            "libs/core/tests/test_tracing.py",
+            "libs/partners/nomic/tests/test_embeddings.py"
+        ]
+    );
+}
+
+#[test]
 fn a_root_manifest_still_runs_every_test() {
     let project = monorepo();
 
