@@ -210,6 +210,104 @@ fn an_impl_reaches_the_users_of_its_type() {
 }
 
 #[test]
+fn an_impl_of_a_type_named_through_a_glob_reaches_the_users_of_its_type() {
+    let project = workspace(&[
+        (
+            "crates/store/src/prelude.rs",
+            "pub use crate::records::Record;\n",
+        ),
+        (
+            "crates/store/src/hashing.rs",
+            "use crate::prelude::*;\n\nimpl<T> Record<T>\nwhere\n    T: Clone,\n{\n    pub fn hash(&self) {}\n}\n",
+        ),
+        (
+            "crates/store/src/ordering.rs",
+            "use crate::records::*;\n\nimpl<T> PartialEq for Record<T> {\n    fn eq(&self, _: &Self) -> bool { true }\n}\n",
+        ),
+    ]);
+
+    project.write(
+        "crates/store/src/lib.rs",
+        "pub mod cache;\npub mod disk;\npub mod prelude;\nmod records;\nmod hashing;\nmod ordering;\n\npub use records::Record;\n",
+    );
+    project.write("crates/store/src/records.rs", "pub struct Record<T>(T);\n");
+
+    assert_eq!(
+        project.selected_by("crates/store/src/hashing.rs"),
+        ["store", "api"]
+    );
+    assert_eq!(
+        project.selected_by("crates/store/src/ordering.rs"),
+        ["store", "api"]
+    );
+}
+
+#[test]
+fn an_associated_item_of_a_type_named_through_a_glob_reaches_the_type() {
+    let project = workspace(&[
+        (
+            "crates/store/src/expressions/mod.rs",
+            "mod ternary;\n\npub(crate) use ternary::*;\n",
+        ),
+        (
+            "crates/store/src/expressions/ternary.rs",
+            "pub struct TernaryExpr;\n\nimpl TernaryExpr {\n    pub fn new() -> Self { TernaryExpr }\n}\n",
+        ),
+        (
+            "crates/store/src/planner.rs",
+            "use crate::expressions::*;\n\npub fn plan() {\n    TernaryExpr::new();\n}\n",
+        ),
+        (
+            "crates/api/src/handlers.rs",
+            "use store::cache;\n\npub fn handle() {\n    cache::get();\n    store::planner::plan();\n}\n",
+        ),
+    ]);
+
+    project.write(
+        "crates/store/src/lib.rs",
+        "pub mod cache;\npub mod disk;\npub mod planner;\nmod expressions;\nmod records;\n\npub use records::Record;\n",
+    );
+
+    assert_eq!(
+        project.selected_by("crates/store/src/expressions/ternary.rs"),
+        ["store", "api"]
+    );
+}
+
+#[test]
+fn a_path_through_a_re_exported_module_reaches_the_module_it_names() {
+    let project = workspace(&[
+        ("crates/store/src/compilation/mod.rs", "pub mod graph;\n"),
+        (
+            "crates/store/src/compilation/graph/mod.rs",
+            "pub(crate) mod splitter;\n",
+        ),
+        (
+            "crates/store/src/compilation/graph/splitter.rs",
+            "pub struct Splitter;\n",
+        ),
+        (
+            "crates/store/src/artifact.rs",
+            "use crate::graph::splitter::Splitter;\n\npub fn split(_: Splitter) {}\n",
+        ),
+        (
+            "crates/api/src/handlers.rs",
+            "use store::cache;\n\npub fn handle() {\n    cache::get();\n    store::artifact::split(todo!());\n}\n",
+        ),
+    ]);
+
+    project.write(
+        "crates/store/src/lib.rs",
+        "pub mod cache;\npub mod disk;\npub mod artifact;\nmod compilation;\nmod records;\n\npub use compilation::*;\npub use records::Record;\n",
+    );
+
+    assert_eq!(
+        project.selected_by("crates/store/src/compilation/graph/splitter.rs"),
+        ["store", "api"]
+    );
+}
+
+#[test]
 fn included_files_and_integration_tests_belong_to_their_crate() {
     let project = workspace(&[
         (

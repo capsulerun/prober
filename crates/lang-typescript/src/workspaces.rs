@@ -10,6 +10,17 @@ pub(crate) const PACKAGE_MANIFEST: &str = "package.json";
 
 pub(crate) const PNPM_WORKSPACE: &str = "pnpm-workspace.yaml";
 
+const LOCAL_DEPENDENCY_PROTOCOLS: [&str; 2] = ["file:", "link:"];
+
+const DEPENDENCY_FIELDS: [&str; 4] = [
+    "dependencies",
+    "devDependencies",
+    "optionalDependencies",
+    "peerDependencies",
+];
+
+const ARCHIVE_EXTENSIONS: [&str; 2] = [".tgz", ".tar.gz"];
+
 struct WorkspaceRoot {
     directory: String,
     members: GlobSet,
@@ -34,6 +45,14 @@ impl WorkspaceRoot {
 pub(crate) struct Workspace {
     pub member_directories: BTreeSet<String>,
     pub packages: BTreeMap<String, String>,
+    pub local_dependencies: Vec<LocalDependency>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LocalDependency {
+    pub package_directory: String,
+    pub name: String,
+    pub target_directory: String,
 }
 
 pub(crate) fn discover_workspace<'p>(
@@ -84,6 +103,12 @@ pub(crate) fn discover_workspace<'p>(
     let mut workspace = Workspace::default();
 
     for (path, manifest) in &package_manifests {
+        workspace
+            .local_dependencies
+            .extend(local_dependencies(manifest, parent_directory(path)));
+    }
+
+    for (path, manifest) in &package_manifests {
         let directory = parent_directory(path);
 
         if !roots.iter().any(|root| root.contains(directory)) {
@@ -101,6 +126,51 @@ pub(crate) fn discover_workspace<'p>(
     }
 
     workspace
+}
+
+fn local_dependencies(manifest: &Value, package_directory: &str) -> Vec<LocalDependency> {
+    DEPENDENCY_FIELDS
+        .iter()
+        .filter_map(|field| manifest.get(field)?.as_object())
+        .flatten()
+        .filter_map(|(name, specification)| {
+            let target = LOCAL_DEPENDENCY_PROTOCOLS
+                .iter()
+                .find_map(|protocol| specification.as_str()?.strip_prefix(protocol))?;
+
+            if ARCHIVE_EXTENSIONS
+                .iter()
+                .any(|extension| target.ends_with(extension))
+            {
+                return None;
+            }
+
+            Some(LocalDependency {
+                package_directory: package_directory.to_owned(),
+                name: name.clone(),
+                target_directory: joined_directory(package_directory, target)?,
+            })
+        })
+        .collect()
+}
+
+fn joined_directory(directory: &str, relative: &str) -> Option<String> {
+    let mut segments: Vec<&str> = directory
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+
+    for segment in relative.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                segments.pop()?;
+            }
+            segment => segments.push(segment),
+        }
+    }
+
+    Some(segments.join("/"))
 }
 
 fn workspace_root(manifest_path: &RepoPath, patterns: Option<&Value>) -> Option<WorkspaceRoot> {
@@ -258,6 +328,27 @@ mod tests {
         assert_eq!(
             workspace.member_directories,
             BTreeSet::from(["".to_owned(), "packages/vue".to_owned()])
+        );
+    }
+
+    #[test]
+    fn file_and_link_dependencies_name_the_directory_they_point_to() {
+        let workspace = workspace_of(&[
+            (
+                "nodejs/examples/package.json",
+                r#"{ "dependencies": { "@acme/db": "file:../dist", "left-pad": "^1.0.0" }, "devDependencies": { "tools": "link:../../tools", "packed": "file:./packed.tgz" } }"#,
+            ),
+            ("nodejs/package.json", r#"{ "name": "@acme/db" }"#),
+        ]);
+        let local = |name: &str, target_directory: &str| LocalDependency {
+            package_directory: "nodejs/examples".to_owned(),
+            name: name.to_owned(),
+            target_directory: target_directory.to_owned(),
+        };
+
+        assert_eq!(
+            workspace.local_dependencies,
+            [local("@acme/db", "nodejs/dist"), local("tools", "tools")]
         );
     }
 

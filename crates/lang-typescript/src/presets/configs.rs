@@ -4,15 +4,18 @@ use prober_core::files::RepoPath;
 use serde_json::Value as JsonValue;
 
 use crate::dynamic::evaluator::Evaluator;
-use crate::dynamic::value::{Part, Value, is_open_object, merge_config, property};
+use crate::dynamic::value::{Part, Pattern, Value, is_open_object, merge_config, property};
 use crate::presets::patterns::{TestPattern, join_directory, relative_globs};
 use crate::presets::{
-    JEST_DEFAULT_TEST_MATCH, VITEST_DEFAULT_EXCLUDE, VITEST_DEFAULT_INCLUDE, is_jest_config,
+    JEST_DEFAULT_TEST_MATCH, RSTEST_DEFAULT_EXCLUDE, RSTEST_DEFAULT_INCLUDE,
+    VITEST_DEFAULT_EXCLUDE, VITEST_DEFAULT_INCLUDE, is_jest_config, is_rstest_config,
     is_vitest_config,
 };
 use crate::workspaces::parent_directory;
 
 const JEST_DEFAULT_IGNORED_PATHS: &str = "/node_modules/";
+
+const RSTACK_CONFIG_PREFIX: &str = "rstack.config.";
 
 const MOCHA_DEFAULT_EXTENSIONS: [&str; 3] = ["js", "cjs", "mjs"];
 
@@ -86,6 +89,32 @@ fn literal_texts(value: &Value) -> Option<Vec<String>> {
     match value {
         Value::Array(items) => items.iter().map(Value::single_literal).collect(),
         value => Some(vec![value.single_literal()?]),
+    }
+}
+
+fn possible_texts(value: &Value) -> Option<Vec<String>> {
+    match value {
+        Value::Array(items) | Value::Alternatives(items) => Some(
+            items
+                .iter()
+                .map(possible_texts)
+                .collect::<Option<Vec<_>>>()?
+                .concat(),
+        ),
+        Value::Strings(patterns) => patterns.iter().map(Pattern::literal_text).collect(),
+        _ => None,
+    }
+}
+
+fn with_field(object: Value, key: &str, value: Value) -> Value {
+    match object {
+        Value::Object(mut properties) => {
+            properties.retain(|(property_key, _)| property_key != key);
+            properties.push((key.to_owned(), value));
+
+            Value::Object(properties)
+        }
+        object => object,
     }
 }
 
@@ -237,6 +266,126 @@ fn known_texts_or(value: &Value, keys: &[&str], defaults: &[&str]) -> Option<Vec
         Field::Absent => Some(texts(defaults)),
         Field::Known(known) => literal_texts(&known),
         Field::Unknown => None,
+    }
+}
+
+pub(crate) fn read_rstest(
+    evaluator: &Evaluator,
+    config: &RepoPath,
+    runner_configs: &[RepoPath],
+) -> Vec<ProjectReading> {
+    let is_registered = config
+        .as_str()
+        .rsplit('/')
+        .next()
+        .is_some_and(|file_name| file_name.starts_with(RSTACK_CONFIG_PREFIX));
+    let value = if is_registered {
+        evaluator
+            .evaluate_registered_config(config)
+            .unwrap_or_else(Value::runtime_value)
+    } else {
+        evaluated_config(evaluator, config)
+    };
+    let Some(root) = rstest_root(&value, parent_directory(config)) else {
+        return vec![ProjectReading::unknown()];
+    };
+
+    match field(&value, "projects") {
+        Field::Absent => vec![read_rstest_project(&value, &root)],
+        Field::Known(Value::Array(entries)) => entries
+            .iter()
+            .flat_map(|entry| {
+                read_rstest_project_entry(evaluator, config, entry, &root, runner_configs)
+            })
+            .collect(),
+        Field::Known(_) | Field::Unknown => vec![ProjectReading::unknown()],
+    }
+}
+
+fn rstest_root(value: &Value, directory: &str) -> Option<String> {
+    match field(value, "root") {
+        Field::Absent => Some(directory.to_owned()),
+        Field::Known(root) => config_path(&root, directory),
+        Field::Unknown => None,
+    }
+}
+
+fn read_rstest_project_entry(
+    evaluator: &Evaluator,
+    config: &RepoPath,
+    entry: &Value,
+    root: &str,
+    runner_configs: &[RepoPath],
+) -> Vec<ProjectReading> {
+    match entry {
+        Value::Object(_) => {
+            let project = match (field(entry, "extends"), field(entry, "exclude")) {
+                (Field::Absent, _) => entry.clone(),
+                (Field::Known(base @ Value::Object(_)), Field::Known(exclude)) => {
+                    with_field(merge_config(base, entry.clone()), "exclude", exclude)
+                }
+                (Field::Known(base @ Value::Object(_)), _) => merge_config(base, entry.clone()),
+                (Field::Known(_) | Field::Unknown, _) => return vec![ProjectReading::unknown()],
+            };
+
+            vec![
+                rstest_root(&project, root).map_or_else(ProjectReading::unknown, |project_root| {
+                    read_rstest_project(&project, &project_root)
+                }),
+            ]
+        }
+        Value::Strings(_) => {
+            let Some(project_matcher) = entry
+                .single_literal()
+                .and_then(|literal| relative_globs(root, &literal))
+                .and_then(|project_glob| TestPattern::builder().include(project_glob).build())
+            else {
+                return vec![ProjectReading::unknown()];
+            };
+            let project_configs: Vec<&RepoPath> = runner_configs
+                .iter()
+                .filter(|path| is_rstest_config(path) && *path != config)
+                .filter(|path| {
+                    project_matcher.matches(path)
+                        || RepoPath::new(parent_directory(path))
+                            .is_ok_and(|directory| project_matcher.matches(&directory))
+                })
+                .collect();
+
+            if project_configs.is_empty() {
+                return vec![ProjectReading::unknown()];
+            }
+
+            project_configs
+                .into_iter()
+                .flat_map(|project_config| read_rstest(evaluator, project_config, &[]))
+                .collect()
+        }
+        _ => vec![ProjectReading::unknown()],
+    }
+}
+
+fn read_rstest_project(value: &Value, root: &str) -> ProjectReading {
+    let possible_texts_or = |key: &str, defaults: &[&str]| match field(value, key) {
+        Field::Absent => Some(texts(defaults)),
+        Field::Known(known) => possible_texts(&known),
+        Field::Unknown => None,
+    };
+    let include = possible_texts_or("include", RSTEST_DEFAULT_INCLUDE);
+    let include_source = possible_texts_or("includeSource", &[]);
+    let exclude = known_texts_or(value, &["exclude"], RSTEST_DEFAULT_EXCLUDE);
+    let tests = (|| {
+        let include: Vec<String> = include?.into_iter().chain(include_source?).collect();
+
+        TestPattern::builder()
+            .include(globs_in(root, &include)?)
+            .exclude(globs_in(root, &exclude?)?)
+            .build()
+    })();
+
+    ProjectReading {
+        tests,
+        renders_assets: Some(true),
     }
 }
 

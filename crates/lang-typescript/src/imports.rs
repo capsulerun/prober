@@ -8,11 +8,14 @@ use oxc_ast::ast::{
 };
 use oxc_ast_visit::{Visit, walk};
 use oxc_parser::Parser;
-use oxc_span::{GetSpan, SourceType};
+use oxc_span::GetSpan;
 use prober_core::files::RepoPath;
 use prober_core::graph::EdgeKind;
 
-const MODULE_LOADING_METHODS: [(&str, &str); 8] = [
+use crate::components::parse_input;
+
+const MODULE_LOADING_METHODS: [(&str, &str); 9] = [
+    ("module", "require"),
     ("vi", "mock"),
     ("vi", "doMock"),
     ("vi", "importActual"),
@@ -143,8 +146,8 @@ pub(crate) fn collect_imports(program: &Program, source_text: &str) -> ParsedImp
 
 pub fn string_literals(path: &RepoPath, source_text: &str) -> Vec<String> {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    let (source_type, source_text) = parse_input(path.as_str(), source_text);
+    let parsed = Parser::new(&allocator, &source_text, source_type).parse();
     let mut literal_collector = LiteralCollector::default();
 
     literal_collector.visit_program(&parsed.program);
@@ -543,7 +546,14 @@ fn line_starts(source_text: &str) -> Vec<usize> {
 }
 
 pub(crate) fn is_require(callee: &Expression) -> bool {
-    matches!(callee.get_inner_expression(), Expression::Identifier(function) if function.name == "require")
+    match callee.get_inner_expression() {
+        Expression::Identifier(function) => function.name == "require",
+        Expression::StaticMemberExpression(method) => {
+            method.property.name == "require"
+                && matches!(&method.object, Expression::Identifier(object) if object.name == "module")
+        }
+        _ => false,
+    }
 }
 
 fn creates_require(callee: &Expression) -> bool {
@@ -572,10 +582,10 @@ mod tests {
 
     fn parse_imports(path: &RepoPath, source_text: &str) -> ParsedImports {
         let allocator = Allocator::default();
-        let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-        let parsed = Parser::new(&allocator, source_text, source_type).parse();
+        let (source_type, source_text) = parse_input(path.as_str(), source_text);
+        let parsed = Parser::new(&allocator, &source_text, source_type).parse();
 
-        collect_imports(&parsed.program, source_text)
+        collect_imports(&parsed.program, &source_text)
     }
 
     fn imports_of(path: &str, source_text: &str) -> Vec<(String, EdgeKind)> {
@@ -750,6 +760,20 @@ mod tests {
                 runtime("./logger"),
                 runtime("./clock")
             ]
+        );
+    }
+
+    #[test]
+    fn module_require_is_a_runtime_import() {
+        let source_text = r#"
+            import type { TimezoneSelectorProps } from "./index";
+
+            const loadComponent = () => module.require("./index").default;
+        "#;
+
+        assert_eq!(
+            imports_of("src/TimezoneSelector.test.tsx", source_text),
+            [type_only("./index"), runtime("./index")]
         );
     }
 

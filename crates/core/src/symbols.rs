@@ -110,6 +110,7 @@ pub enum FallbackCause {
     Exec,
     Namespace,
     ParseError,
+    Template,
 }
 
 impl FallbackCause {
@@ -121,6 +122,7 @@ impl FallbackCause {
             FallbackCause::Exec => "exec",
             FallbackCause::Namespace => "namespace",
             FallbackCause::ParseError => "parse_error",
+            FallbackCause::Template => "template",
         }
     }
 
@@ -132,6 +134,7 @@ impl FallbackCause {
             FallbackCause::Exec => "exec() or eval()",
             FallbackCause::Namespace => "globals() or sys.modules",
             FallbackCause::ParseError => "parse error",
+            FallbackCause::Template => "a component whose template the script does not hold",
         }
     }
 }

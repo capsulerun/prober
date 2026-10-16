@@ -8,6 +8,7 @@ mod links;
 mod manifests;
 mod modules;
 mod pytest;
+mod sessions;
 mod summarizer;
 mod summary;
 mod symbols;

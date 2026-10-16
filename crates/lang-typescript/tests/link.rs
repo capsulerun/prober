@@ -99,6 +99,63 @@ fn tsconfig_paths_resolve_with_the_nearest_tsconfig() {
     );
 }
 
+#[test]
+fn tsconfig_base_url_resolves_bare_specifiers_beside_paths_and_references() {
+    let project = TestProject::new(&[
+        (
+            "web/tsconfig.json",
+            r#"{
+                "compilerOptions": {
+                    "composite": true,
+                    "baseUrl": ".",
+                    "paths": { "@acme/core": ["./packages/core/src"] }
+                },
+                "include": ["./src/**/*", "./spec/**/*", "./plugins/**/*"],
+                "references": [{ "path": "./packages/core" }]
+            }"#,
+        ),
+        (
+            "web/packages/core/tsconfig.json",
+            r#"{ "extends": "../../tsconfig.json", "compilerOptions": { "baseUrl": "../.." }, "include": ["src/**/*"] }"#,
+        ),
+        ("web/packages/core/src/index.ts", "export const core = 1;"),
+        (
+            "web/plugins/chart/tsconfig.json",
+            r#"{
+                "extends": "../../tsconfig.json",
+                "compilerOptions": {
+                    // keeps the parent's path mappings
+                    "baseUrl": "../..",
+                    "rootDir": "src"
+                },
+                "include": ["src/**/*.ts", "src/**/*.tsx"],
+                "exclude": ["src/**/*.test.*"]
+            }"#,
+        ),
+        (
+            "web/spec/helpers/testing-library.tsx",
+            "export const render = () => null;",
+        ),
+        (
+            "web/src/App.test.tsx",
+            r#"import { render } from "spec/helpers/testing-library";"#,
+        ),
+        (
+            "web/plugins/chart/test/chart.test.tsx",
+            r#"import { render } from "spec/helpers/testing-library";"#,
+        ),
+    ]);
+    let graph = project.link();
+
+    assert_eq!(
+        dependents(&graph, "web/spec/helpers/testing-library.tsx"),
+        [
+            ("web/plugins/chart/test/chart.test.tsx", EdgeKind::Import),
+            ("web/src/App.test.tsx", EdgeKind::Import)
+        ]
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn workspace_package_exports_resolve_through_node_modules() {

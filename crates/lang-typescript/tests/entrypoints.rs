@@ -66,6 +66,51 @@ fn e2e_test_spawning_the_built_cli_reaches_the_command_sources() {
 }
 
 #[test]
+fn a_file_dependency_on_a_build_output_resolves_through_its_sources() {
+    let project = TestProject::new(&[
+        (
+            "nodejs/package.json",
+            r#"{ "name": "@acme/db", "main": "dist/index.js", "types": "dist/index.d.ts" }"#,
+        ),
+        (
+            "nodejs/tsconfig.json",
+            r#"{ "include": ["db"], "compilerOptions": { "outDir": "./dist", "rootDir": "./db" } }"#,
+        ),
+        (
+            "nodejs/db/index.ts",
+            r#"export { connect } from "./connection";"#,
+        ),
+        ("nodejs/db/connection.ts", "export const connect = 1;"),
+        ("nodejs/db/embedding/index.ts", "export const registry = 1;"),
+        (
+            "nodejs/examples/package.json",
+            r#"{ "name": "examples", "dependencies": { "@acme/db": "file:../dist" } }"#,
+        ),
+        (
+            "nodejs/examples/basic.test.ts",
+            r#"import { connect } from "@acme/db"; connect;"#,
+        ),
+        (
+            "nodejs/examples/embedding.test.ts",
+            r#"import { registry } from "@acme/db/embedding"; registry;"#,
+        ),
+        (
+            "test/fixtures/package.json",
+            r#"{ "name": "fixture", "dependencies": { "@acme/db": "file:./local" } }"#,
+        ),
+    ]);
+
+    assert_eq!(
+        selected_tests(&project.link(), &[modified("nodejs/db/connection.ts")]),
+        ["nodejs/examples/basic.test.ts"]
+    );
+    assert_eq!(
+        selected_tests(&project.link(), &[modified("nodejs/db/embedding/index.ts")]),
+        ["nodejs/examples/embedding.test.ts"]
+    );
+}
+
+#[test]
 fn imports_of_build_outputs_resolve_through_their_sources() {
     let project = TestProject::new(&[
         (
@@ -296,5 +341,45 @@ fn spawned_entrypoints_switch_off_on_their_own() {
     assert_eq!(
         dependents(&graph, "src/entry.ts"),
         [("dist/entry.js", EdgeKind::Build)]
+    );
+}
+
+#[test]
+fn a_component_change_reaches_the_tests_of_the_components_using_it() {
+    let base_input = "<template>\n  <textarea placeholder=\"Ask\" />\n</template>\n<script setup lang=\"ts\">\nconst props = defineProps<{ value: string }>();\n</script>\n";
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "devDependencies": { "vitest": "^3" } }"#,
+        ),
+        ("src/components/ChatInput/ChatInput.vue", base_input),
+        (
+            "src/components/ChatInput/index.ts",
+            "export { default } from './ChatInput.vue';",
+        ),
+        (
+            "src/components/AskAssistantChat/AskAssistantChat.vue",
+            "<template>\n  <ChatInput />\n</template>\n<script setup lang=\"ts\">\nimport ChatInput from '../ChatInput';\n</script>\n",
+        ),
+        (
+            "src/components/AskAssistantChat/AskAssistantChat.test.ts",
+            "import AskAssistantChat from './AskAssistantChat.vue';\n",
+        ),
+        ("src/components/Other/Other.test.ts", "export {};"),
+    ]);
+
+    project.write(
+        "src/components/ChatInput/ChatInput.vue",
+        &base_input.replace("Ask", "Ask a question"),
+    );
+
+    assert_eq!(
+        project
+            .symbol_outcome_of(
+                &[("src/components/ChatInput/ChatInput.vue", base_input)],
+                &[modified("src/components/ChatInput/ChatInput.vue")]
+            )
+            .selected_paths(),
+        ["src/components/AskAssistantChat/AskAssistantChat.test.ts"]
     );
 }

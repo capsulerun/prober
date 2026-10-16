@@ -22,6 +22,7 @@ pub(crate) struct Unknown {
     pub cause: UnresolvedCause,
     pub parameter_of: Option<FunctionRef>,
     pub is_working_directory: bool,
+    pub is_environment_variable: bool,
 }
 
 impl Unknown {
@@ -30,6 +31,7 @@ impl Unknown {
             cause: UnresolvedCause::RuntimeValue,
             parameter_of: None,
             is_working_directory: false,
+            is_environment_variable: false,
         }
     }
 
@@ -38,6 +40,7 @@ impl Unknown {
             cause: UnresolvedCause::Parameter,
             parameter_of: Some(function),
             is_working_directory: false,
+            is_environment_variable: false,
         }
     }
 
@@ -46,6 +49,17 @@ impl Unknown {
             is_working_directory: true,
             ..Self::runtime_value()
         }
+    }
+
+    pub fn environment_variable() -> Self {
+        Self {
+            is_environment_variable: true,
+            ..Self::runtime_value()
+        }
+    }
+
+    fn is_text(&self) -> bool {
+        self.is_working_directory || self.is_environment_variable
     }
 }
 
@@ -102,6 +116,11 @@ impl Pattern {
             Part::Hole(unknown) => Some(unknown),
             _ => None,
         })
+    }
+
+    fn is_text(&self) -> bool {
+        self.0.iter().any(|part| !matches!(part, Part::Hole(_)))
+            || self.unknowns().all(Unknown::is_text)
     }
 
     pub fn literal_text(&self) -> Option<String> {
@@ -335,10 +354,13 @@ pub(crate) enum Builtin {
     ObjectValues,
     DefineConfig,
     MergeConfig,
+    ConfigRegistry,
+    RegisterTestConfig,
     FsModule,
     GlobModule,
     FileAccess(AccessKind),
     Process,
+    ProcessEnv,
     ProcessCwd,
     ChildProcessModule,
     Spawn(SpawnKind),
@@ -420,10 +442,11 @@ pub(crate) fn merge_objects(values: Vec<Value>) -> Value {
                     set_property(&mut properties, key, value);
                 }
             }
+            value if spreads_no_keys(&value) => {}
             Value::Alternatives(choices)
-                if choices
-                    .iter()
-                    .all(|choice| matches!(choice, Value::Object(_))) =>
+                if choices.iter().all(|choice| {
+                    matches!(choice, Value::Object(_)) || spreads_no_keys(choice)
+                }) =>
             {
                 let mut keys: Vec<String> = Vec::new();
 
@@ -462,6 +485,15 @@ pub(crate) fn merge_objects(values: Vec<Value>) -> Value {
     }
 
     Value::Object(properties)
+}
+
+fn spreads_no_keys(value: &Value) -> bool {
+    match value {
+        Value::Boolean(_) => true,
+        Value::Strings(patterns) => patterns.iter().all(Pattern::is_text),
+        Value::Unknown(unknown) => unknown.is_text(),
+        _ => false,
+    }
 }
 
 pub(crate) fn merge_config(defaults: Value, overrides: Value) -> Value {

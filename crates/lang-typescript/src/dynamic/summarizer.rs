@@ -14,9 +14,10 @@ use oxc_ast::ast::{
 };
 use oxc_parser::Parser;
 use oxc_semantic::{AstNode, AstNodes, NodeId, Scoping, Semantic, SemanticBuilder, SymbolId};
-use oxc_span::{GetSpan, SourceType, Span};
+use oxc_span::{GetSpan, Span};
 use prober_core::files::RepoPath;
 
+use crate::components::parse_input;
 use crate::dynamic::summary::{
     Access, Action, Comparison, Effect, Expr, FunctionIndex, FunctionSummary, ImportUse,
     ImportedName, ModuleSummary, Reach, UseKind,
@@ -89,10 +90,10 @@ pub(crate) fn summarize_module(
     scope: SummaryScope,
 ) -> ModuleSummary {
     let allocator = Allocator::default();
-    let source_type = SourceType::from_path(path.as_str()).unwrap_or_default();
-    let parsed = Parser::new(&allocator, source_text, source_type).parse();
+    let (source_type, source_text) = parse_input(path.as_str(), source_text);
+    let parsed = Parser::new(&allocator, &source_text, source_type).parse();
 
-    summarize_program(&parsed.program, source_text, scope)
+    summarize_program(&parsed.program, &source_text, scope)
 }
 
 pub(crate) fn summarize_program<'a>(

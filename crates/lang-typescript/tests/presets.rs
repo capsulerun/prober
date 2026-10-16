@@ -65,6 +65,118 @@ fn runner_configs_add_the_tests_their_patterns_include() {
 }
 
 #[test]
+fn rstest_configs_add_the_tests_their_projects_include() {
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "workspaces": ["tests/*", "packages/*"], "devDependencies": { "rstack": "^1" } }"#,
+        ),
+        (
+            "rstack.config.mts",
+            r#"
+                import { define } from "rstack";
+
+                define.lint(() => [{ ignores: ["**/tests/**"] }]);
+            "#,
+        ),
+        ("tests/suite/package.json", r#"{ "name": "suite" }"#),
+        (
+            "tests/suite/rstack.config.mts",
+            r#"
+                import path from "node:path";
+                import { define } from "rstack";
+                import { defineProject } from "rstack/test";
+
+                define.test(() => {
+                    const wasmConfig = process.env.WASM && defineProject({ exclude: ["Hot*.test.mjs"] });
+                    const sharedConfig = defineProject({
+                        include: ["*.test.{js,mjs}"],
+                        testTimeout: process.env.CI ? 60000 : 30000,
+                        env: { __ROOT_PATH__: path.resolve(import.meta.dirname, "../../") },
+                        ...(wasmConfig || {}),
+                    });
+
+                    return {
+                        name: "suite",
+                        projects: [
+                            { extends: sharedConfig, name: "base", exclude: ["Watcher*.test.mjs"] },
+                            {
+                                extends: sharedConfig,
+                                name: "hot",
+                                include: process.env.WASM ? [] : ["<rootDir>/*.hottest.{js,mjs}"],
+                                exclude: ["Watcher*.test.mjs"],
+                            },
+                        ],
+                    };
+                });
+            "#,
+        ),
+        ("tests/suite/Compiler.test.mjs", ""),
+        ("tests/suite/HotSnapshot.hottest.mjs", ""),
+        ("tests/suite/helpers/hot.mjs", ""),
+        ("packages/cli/package.json", r#"{ "name": "cli" }"#),
+        (
+            "packages/cli/rstest.config.ts",
+            r#"
+                import { defineConfig } from "@rstest/core";
+
+                export default defineConfig({ include: ["tests/**/*.ts"], exclude: ["tests/fixtures/**"] });
+            "#,
+        ),
+        ("packages/cli/tests/build.ts", ""),
+        ("packages/cli/tests/fixtures/app.ts", ""),
+    ]);
+
+    assert_eq!(
+        test_paths(&project),
+        [
+            "packages/cli/tests/build.ts",
+            "tests/suite/Compiler.test.mjs",
+            "tests/suite/HotSnapshot.hottest.mjs",
+        ]
+    );
+}
+
+#[test]
+fn rstest_config_change_runs_the_tests_of_its_package() {
+    let base_config = r#"
+        import { defineConfig } from "@rstest/core";
+
+        export default defineConfig({ include: ["*.hottest.mjs"], testTimeout: 1000 });
+    "#;
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "workspaces": ["tests/*", "packages/*"] }"#,
+        ),
+        ("tests/suite/package.json", r#"{ "name": "suite" }"#),
+        ("tests/suite/rstest.config.ts", base_config),
+        ("tests/suite/HotSnapshot.hottest.mjs", ""),
+        ("packages/cli/package.json", r#"{ "name": "cli" }"#),
+        ("packages/cli/src/build.test.ts", ""),
+    ]);
+
+    project.write(
+        "tests/suite/rstest.config.ts",
+        &base_config.replace("testTimeout: 1000", "testTimeout: 5000"),
+    );
+
+    assert_eq!(
+        project.outcome_of(
+            &[("tests/suite/rstest.config.ts", base_config)],
+            &[modified("tests/suite/rstest.config.ts")]
+        ),
+        selected(&[(
+            "tests/suite/HotSnapshot.hottest.mjs",
+            &[
+                "tests/suite/rstest.config.ts (modified)",
+                "-> tests/suite/HotSnapshot.hottest.mjs runs with this config",
+            ],
+        )])
+    );
+}
+
+#[test]
 fn files_importing_node_test_are_tests_when_scripts_run_node_test() {
     let files = [
         ("test/api.mjs", r#"import test from "node:test";"#),
@@ -134,7 +246,7 @@ fn setup_files_and_what_only_they_reach_run_every_test() {
 }
 
 #[test]
-fn shared_module_imported_by_a_setup_file_selects_only_its_importers() {
+fn shared_source_module_imported_by_a_setup_file_selects_only_its_importers() {
     let project = vitest_project();
 
     assert_eq!(
@@ -143,6 +255,58 @@ fn shared_module_imported_by_a_setup_file_selects_only_its_importers() {
             "src/log.test.ts",
             &["src/log.ts (modified)", "-> imported by src/log.test.ts"],
         )])
+    );
+}
+
+#[test]
+fn test_support_a_setup_file_reaches_runs_every_test_even_when_tests_import_it() {
+    let base_handlers = "export const handlers = [\"flows\"];";
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "devDependencies": { "vitest": "^3" } }"#,
+        ),
+        (
+            "vite.config.ts",
+            r#"export default { test: { setupFiles: "./tests/setup.ts" } };"#,
+        ),
+        (
+            "tests/setup.ts",
+            r#"
+                import { beforeAll } from "vitest";
+                import { server } from "./utils";
+
+                beforeAll(() => server.listen());
+            "#,
+        ),
+        (
+            "tests/utils/index.ts",
+            r#"
+                import { setupServer } from "msw/node";
+                import { handlers } from "./handlers";
+
+                export const server = setupServer(...handlers);
+            "#,
+        ),
+        ("tests/utils/handlers.ts", base_handlers),
+        ("tests/api/service.test.ts", "export {};"),
+        (
+            "tests/flows.test.ts",
+            r#"import { server } from "./utils"; server.resetHandlers();"#,
+        ),
+    ]);
+
+    project.write(
+        "tests/utils/handlers.ts",
+        "export const handlers = [\"flows\", \"paginate\"];",
+    );
+
+    assert_eq!(
+        project.symbol_outcome_of(
+            &[("tests/utils/handlers.ts", base_handlers)],
+            &[modified("tests/utils/handlers.ts")]
+        ),
+        all(&["tests/utils/handlers.ts (modified) is loaded before every test"])
     );
 }
 

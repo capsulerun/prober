@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use prober_core::files::RepoPath;
 
-use crate::conventions::{is_runner_config, is_source_file};
+use crate::conventions::{is_runner_config, is_source_file, is_test_support_file};
 use crate::workspaces::parent_directory;
 
 const PACKAGE_NODE_PREFIX: &str = "node_modules/";
@@ -155,7 +155,10 @@ fn group_with_setup(
 
     while let Some(file) = files_to_visit.pop_front() {
         for dependency in inputs.repo_dependencies(&file) {
-            if !reached_by_tests.contains(dependency) && setup_scope.insert(dependency.clone()) {
+            let runs_for_every_test =
+                !reached_by_tests.contains(dependency) || is_test_support_file(dependency);
+
+            if runs_for_every_test && setup_scope.insert(dependency.clone()) {
                 files_to_visit.push_back(dependency.clone());
             }
         }

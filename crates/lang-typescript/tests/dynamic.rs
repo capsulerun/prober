@@ -460,6 +460,47 @@ fn require_factories_resolve_from_their_base() {
 }
 
 #[test]
+fn require_resolve_finds_workspace_packages_from_the_paths_it_is_given() {
+    let project = TestProject::new(&[
+        (
+            "package.json",
+            r#"{ "workspaces": ["packages/*", "tests/*"] }"#,
+        ),
+        (
+            "packages/core/package.json",
+            r#"{ "name": "@acme/core", "exports": { ".": "./dist/index.js", "./package.json": "./package.json" }, "dependencies": { "@acme/binding": "workspace:*" } }"#,
+        ),
+        (
+            "packages/binding/package.json",
+            r#"{ "name": "@acme/binding", "main": "binding.js" }"#,
+        ),
+        ("packages/binding/binding.js", "module.exports = {};"),
+        ("tests/suite/package.json", r#"{ "name": "suite" }"#),
+        (
+            "tests/suite/watcher.test.mjs",
+            r#"
+                import path from "node:path";
+                import { createRequire } from "node:module";
+
+                const require = createRequire(import.meta.url);
+                const coreDirectory = path.dirname(require.resolve("@acme/core/package.json"));
+                const bindingPath = require.resolve("@acme/binding", { paths: [coreDirectory] });
+                const binding = require(bindingPath);
+            "#,
+        ),
+    ]);
+    let graph = project.link();
+
+    assert_eq!(
+        loaded_by(&graph, "packages/binding/binding.js"),
+        [loaded(
+            "tests/suite/watcher.test.mjs:8",
+            "inferred path packages/binding/binding.js"
+        )]
+    );
+}
+
+#[test]
 fn plugin_folders_with_a_manifest_link_every_file_of_the_folder() {
     let project = TestProject::new(&[
         (

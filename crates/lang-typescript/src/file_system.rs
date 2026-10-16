@@ -4,6 +4,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::iter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -14,12 +15,15 @@ use crate::build_mapping::BuildMapping;
 use crate::manifests::documents::parse_jsonc;
 use crate::resolver::package_name;
 
+const NODE_MODULES: &str = "node_modules";
+
 #[derive(Debug, Default)]
 pub(crate) struct RepoFileSystem {
     overlay: HashMap<PathBuf, Option<Vec<u8>>>,
     links: HashMap<PathBuf, PathBuf>,
     link_directories: HashSet<PathBuf>,
     links_root: PathBuf,
+    package_links_roots: Vec<PathBuf>,
     repo_root: PathBuf,
     build_mapping: Option<Arc<BuildMapping>>,
 }
@@ -35,7 +39,7 @@ enum Entry<'f> {
 impl RepoFileSystem {
     pub fn at(repo_root: &Path) -> Self {
         Self {
-            links_root: repo_root.join("node_modules"),
+            links_root: repo_root.join(NODE_MODULES),
             repo_root: repo_root.to_path_buf(),
             ..Self::default()
         }
@@ -49,26 +53,49 @@ impl RepoFileSystem {
     }
 
     pub fn with_links(mut self, links: impl IntoIterator<Item = (String, PathBuf)>) -> Self {
+        let links_root = self.links_root.clone();
+
         for (package_name, target) in links {
-            let link = self.links_root.join(&package_name);
-
-            if fs::symlink_metadata(&link).is_ok() || self.links.contains_key(&link) {
-                continue;
-            }
-
-            let missing_directories = link
-                .ancestors()
-                .skip(1)
-                .take_while(|directory| directory.starts_with(&self.links_root))
-                .filter(|directory| fs::symlink_metadata(directory).is_err())
-                .map(Path::to_path_buf)
-                .collect::<Vec<_>>();
-
-            self.link_directories.extend(missing_directories);
-            self.links.insert(link, target);
+            self.add_link(&links_root, &package_name, target);
         }
 
         self
+    }
+
+    pub fn with_package_links(
+        mut self,
+        links: impl IntoIterator<Item = (PathBuf, String, PathBuf)>,
+    ) -> Self {
+        for (package_directory, package_name, target) in links {
+            let links_root = package_directory.join(NODE_MODULES);
+
+            self.add_link(&links_root, &package_name, target);
+
+            if !self.package_links_roots.contains(&links_root) {
+                self.package_links_roots.push(links_root);
+            }
+        }
+
+        self
+    }
+
+    fn add_link(&mut self, links_root: &Path, package_name: &str, target: PathBuf) {
+        let link = links_root.join(package_name);
+
+        if fs::symlink_metadata(&link).is_ok() || self.links.contains_key(&link) {
+            return;
+        }
+
+        let missing_directories = link
+            .ancestors()
+            .skip(1)
+            .take_while(|directory| directory.starts_with(links_root))
+            .filter(|directory| fs::symlink_metadata(directory).is_err())
+            .map(Path::to_path_buf)
+            .collect::<Vec<_>>();
+
+        self.link_directories.extend(missing_directories);
+        self.links.insert(link, target);
     }
 
     pub fn with_overlay(
@@ -99,23 +126,39 @@ impl RepoFileSystem {
             return Entry::BuildOutput;
         }
 
+        if self.is_build_output_directory(&path) {
+            return Entry::LinkDirectory;
+        }
+
         Entry::Disk(path)
     }
 
     fn is_build_output(&self, path: &Path) -> bool {
-        let Some(build_mapping) = &self.build_mapping else {
-            return false;
-        };
+        self.repo_relative(path).is_some_and(|relative_path| {
+            self.build_mapping
+                .as_ref()
+                .is_some_and(|build_mapping| build_mapping.is_output(&relative_path))
+        })
+    }
 
-        let Ok(relative_path) = path.strip_prefix(&self.repo_root) else {
-            return false;
-        };
+    fn is_build_output_directory(&self, path: &Path) -> bool {
+        self.repo_relative(path).is_some_and(|relative_path| {
+            self.build_mapping
+                .as_ref()
+                .is_some_and(|build_mapping| build_mapping.is_output_directory(&relative_path))
+        })
+    }
+
+    fn repo_relative(&self, path: &Path) -> Option<String> {
+        self.build_mapping.as_ref()?;
+
+        let relative_path = path.strip_prefix(&self.repo_root).ok()?;
         let components: Option<Vec<&str>> = relative_path
             .components()
             .map(|component| component.as_os_str().to_str())
             .collect();
 
-        components.is_some_and(|components| build_mapping.is_output(&components.join("/")))
+        components.map(|components| components.join("/"))
     }
 
     fn overlay_content(&self, path: &Path) -> Option<Option<&[u8]>> {
@@ -194,14 +237,20 @@ impl RepoFileSystem {
     }
 
     fn follow_links<'p>(&self, path: &'p Path) -> Cow<'p, Path> {
-        if self.links.is_empty() || !path.starts_with(&self.links_root) {
+        if self.links.is_empty() {
             return Cow::Borrowed(path);
         }
 
+        let Some(links_root) = iter::once(&self.links_root)
+            .chain(&self.package_links_roots)
+            .find(|links_root| path.starts_with(links_root))
+        else {
+            return Cow::Borrowed(path);
+        };
         let linked_ancestor = path
             .ancestors()
             .skip(1)
-            .take_while(|ancestor| ancestor.starts_with(&self.links_root))
+            .take_while(|ancestor| ancestor.starts_with(links_root))
             .find_map(|ancestor| Some((ancestor, self.links.get(ancestor)?)));
 
         match linked_ancestor {
@@ -269,7 +318,8 @@ impl FileSystem for RepoFileSystem {
                 Ok(FileMetadata::new(true, false, false))
             }
             Entry::Overlay(None) => Err(not_found()),
-            Entry::Link(target) => FileSystemOs::metadata(target),
+            Entry::Link(target) => FileSystemOs::metadata(target)
+                .or_else(|_| Ok(FileMetadata::new(false, true, false))),
             Entry::LinkDirectory => Ok(FileMetadata::new(false, true, false)),
             Entry::Disk(path) => FileSystemOs::metadata(&path),
         }
@@ -299,10 +349,14 @@ impl FileSystem for RepoFileSystem {
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         match self.entry(path) {
-            Entry::Link(target) => dunce::canonicalize(target),
+            Entry::Link(target) => {
+                dunce::canonicalize(target).or_else(|_| Ok(target.to_path_buf()))
+            }
             Entry::Disk(path) => dunce::canonicalize(path),
             Entry::Overlay(Some(_)) | Entry::LinkDirectory | Entry::BuildOutput => {
-                dunce::canonicalize(path).or_else(|_| Ok(path.to_path_buf()))
+                let followed = self.follow_links(path);
+
+                dunce::canonicalize(&followed).or_else(|_| Ok(followed.into_owned()))
             }
             Entry::Overlay(None) => Err(not_found()),
         }
