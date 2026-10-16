@@ -14,7 +14,8 @@ use prober_core::graph::EdgeKind;
 
 use crate::components::parse_input;
 
-const MODULE_LOADING_METHODS: [(&str, &str); 8] = [
+const MODULE_LOADING_METHODS: [(&str, &str); 9] = [
+    ("module", "require"),
     ("vi", "mock"),
     ("vi", "doMock"),
     ("vi", "importActual"),
@@ -545,7 +546,14 @@ fn line_starts(source_text: &str) -> Vec<usize> {
 }
 
 pub(crate) fn is_require(callee: &Expression) -> bool {
-    matches!(callee.get_inner_expression(), Expression::Identifier(function) if function.name == "require")
+    match callee.get_inner_expression() {
+        Expression::Identifier(function) => function.name == "require",
+        Expression::StaticMemberExpression(method) => {
+            method.property.name == "require"
+                && matches!(&method.object, Expression::Identifier(object) if object.name == "module")
+        }
+        _ => false,
+    }
 }
 
 fn creates_require(callee: &Expression) -> bool {
@@ -752,6 +760,20 @@ mod tests {
                 runtime("./logger"),
                 runtime("./clock")
             ]
+        );
+    }
+
+    #[test]
+    fn module_require_is_a_runtime_import() {
+        let source_text = r#"
+            import type { TimezoneSelectorProps } from "./index";
+
+            const loadComponent = () => module.require("./index").default;
+        "#;
+
+        assert_eq!(
+            imports_of("src/TimezoneSelector.test.tsx", source_text),
+            [type_only("./index"), runtime("./index")]
         );
     }
 
